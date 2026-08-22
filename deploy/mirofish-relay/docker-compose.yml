@@ -1,72 +1,40 @@
 services:
-  mihomo-config:
-    build:
-      context: ../..
-      dockerfile: deploy/mirofish-relay/Dockerfile
-    environment:
-      # Choose one source: the remote URL or a local file mounted at /input.
-      MIROFISH_PROXY_SUBSCRIPTION_URL: ${MIROFISH_PROXY_SUBSCRIPTION_URL:-}
-      MIROFISH_PROXY_SUBSCRIPTION_FILE: ${MIROFISH_PROXY_SUBSCRIPTION_FILE:-}
-      MIROFISH_PROXY_REFRESH_SECONDS: ${MIROFISH_PROXY_REFRESH_SECONDS:-600}
-      MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT: ${MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT:-mihomo/1.19.0}
-      MIROFISH_MIHOMO_SELECTOR: ${MIROFISH_MIHOMO_SELECTOR:-MirofishPool}
-      MIROFISH_MIHOMO_PROVIDER: ${MIROFISH_MIHOMO_PROVIDER:-mirofish}
-      # Slot listeners give each account an independent exit; keep these two in
-      # sync with the mirofish-relay service below.
-      MIROFISH_MIHOMO_SLOTS: ${MIROFISH_MIHOMO_SLOTS:-8}
-      MIROFISH_MIHOMO_SLOT_BASE_PORT: ${MIROFISH_MIHOMO_SLOT_BASE_PORT:-7891}
-    volumes:
-      - mihomo-data:/config
-      - ./mihomo-input:/input:ro
-    command: ["python3", "-m", "mirofish", "--data-dir", "/data", "mihomo-config", "--output", "/config/config.yaml"]
-    user: "0:0"
-    restart: "no"
-
-  mihomo:
-    image: metacubex/mihomo:v1.19.29
-    depends_on:
-      mihomo-config:
-        condition: service_completed_successfully
-    volumes:
-      - mihomo-data:/config
-    command: ["-d", "/config"]
-    restart: unless-stopped
-
-  mirofish-relay:
+  mirofish:
     build:
       context: ../..
       dockerfile: deploy/mirofish-relay/Dockerfile
     container_name: mirofish-relay
-    depends_on:
-      mihomo:
-        condition: service_started
+    # Docker's init (tini) as PID 1 reaps the mihomo + relay child processes.
+    init: true
     ports:
-      - "127.0.0.1:8787:8787"
+      # Public exposure requested. Anyone who can reach this port needs the
+      # local proxy key; put TLS + extra auth in front for production.
+      - "0.0.0.0:8787:8787"
     environment:
       # 必填：加密 secrets.enc 的主密钥，至少 16 字符。生产建议用 secret 文件。
       MIROFISH_MASTER_KEY: ${MIROFISH_MASTER_KEY:?set MIROFISH_MASTER_KEY (>=16 chars)}
       # 可选：默认账号别名
       MIROFISH_DEFAULT_ACCOUNT: ${MIROFISH_DEFAULT_ACCOUNT:-}
-      # .env 中的订阅优先于 WebUI 里曾保存的地址。
+      # 代理订阅：远程 URL 或挂载到 /input 的本地文件，二选一；留空则纯直连（不启动 mihomo）。
       MIROFISH_PROXY_SUBSCRIPTION_URL: ${MIROFISH_PROXY_SUBSCRIPTION_URL:-}
+      MIROFISH_PROXY_SUBSCRIPTION_FILE: ${MIROFISH_PROXY_SUBSCRIPTION_FILE:-}
       MIROFISH_PROXY_REFRESH_SECONDS: ${MIROFISH_PROXY_REFRESH_SECONDS:-600}
       MIROFISH_PROXY_FETCH_TIMEOUT: ${MIROFISH_PROXY_FETCH_TIMEOUT:-10}
       MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT: ${MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT:-mihomo/1.19.0}
       MIROFISH_PROXY_FAILURE_THRESHOLD: ${MIROFISH_PROXY_FAILURE_THRESHOLD:-2}
-      # Mihomo handles SS/VMess/VLESS/Trojan and exposes internal HTTP proxies.
-      MIROFISH_MIHOMO_CONTROLLER: http://mihomo:9090
-      MIROFISH_MIHOMO_PROXY: http://mihomo:7890
-      # Controller requests are short control-plane operations; do not let one
-      # stuck provider refresh hold a request open indefinitely.
+      # Controller/proxy endpoints are wired to loopback by the entrypoint; the
+      # engine now lives in this same container.
       MIROFISH_MIHOMO_CONTROLLER_TIMEOUT: ${MIROFISH_MIHOMO_CONTROLLER_TIMEOUT:-5}
       MIROFISH_MIHOMO_SELECTOR: ${MIROFISH_MIHOMO_SELECTOR:-MirofishPool}
       MIROFISH_MIHOMO_PROVIDER: ${MIROFISH_MIHOMO_PROVIDER:-mirofish}
+      # 每个账号独立出口的槽位数量与起始端口（并发能力）。
       MIROFISH_MIHOMO_SLOTS: ${MIROFISH_MIHOMO_SLOTS:-8}
       MIROFISH_MIHOMO_SLOT_BASE_PORT: ${MIROFISH_MIHOMO_SLOT_BASE_PORT:-7891}
     volumes:
       - mirofish-data:/data
+      # Optional static subscription source (MIROFISH_PROXY_SUBSCRIPTION_FILE=/input/...).
+      - ./mihomo-input:/input:ro
     restart: unless-stopped
 
 volumes:
   mirofish-data:
-  mihomo-data:

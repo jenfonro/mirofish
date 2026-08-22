@@ -7,7 +7,7 @@ COPY webui/ ./
 # vite outDir is ../mirofish/static, i.e. /build/mirofish/static
 RUN npm run build
 
-# Stage 2: Python runtime
+# Stage 2: Python runtime + bundled Mihomo (single self-contained container)
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -15,11 +15,18 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     MIROFISH_IN_DOCKER=1 \
     MIROFISH_CRED_BACKEND=file
 
+# Bundle the Mihomo proxy engine so one container serves both the relay and the
+# subscription-native proxy pool instead of a separate sidecar + init container.
+COPY --from=metacubex/mihomo:v1.19.29 /mihomo /usr/local/bin/mihomo
+
 WORKDIR /app
 COPY pyproject.toml /app/
 COPY mirofish/ /app/mirofish/
 COPY --from=webui /build/mirofish/static /app/mirofish/static
 RUN pip install --no-cache-dir /app && rm -rf /root/.cache
+
+COPY deploy/mirofish-relay/docker-entrypoint.sh /usr/local/bin/mirofish-entrypoint
+RUN chmod +x /usr/local/bin/mirofish-entrypoint /usr/local/bin/mihomo
 
 RUN useradd -r -u 10001 -m mirofish \
     && mkdir -p /data \
@@ -29,4 +36,5 @@ USER mirofish
 EXPOSE 8787
 VOLUME ["/data"]
 
-CMD ["python3", "-m", "mirofish", "--data-dir", "/data", "serve", "--host", "0.0.0.0", "--port", "8787"]
+# The entrypoint starts mihomo (when a subscription is set) then the relay.
+CMD ["/usr/local/bin/mirofish-entrypoint"]
