@@ -97,7 +97,11 @@ def write_mihomo_config(output_path: pathlib.Path, settings: Settings) -> None:
         "proxy-providers": {settings.mihomo_provider: provider},
         "proxy-groups": groups,
         "listeners": listeners,
-        "rules": [f"MATCH,{settings.mihomo_selector}"],
+        # Provider pulls follow the rules; MATCH,DIRECT keeps the subscription
+        # download off the pool (routing it through a dead cached node would
+        # deadlock the refresh). Relay traffic enters via the slot listeners,
+        # each pinned to its own selector group, so it never hits the rules.
+        "rules": ["MATCH,DIRECT"],
     }
     _write_private(output_path,
                    yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode("utf-8"))
