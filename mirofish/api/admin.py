@@ -60,9 +60,8 @@ async def login_start(request: Request) -> dict[str, Any]:
     payload = await read_json_body(request)
     alias = alias_value(str(payload.get("alias", "")))
     email = email_value(str(payload.get("email", "")))
-    proxy = await state.pool.pending_proxy(alias)
-    await state.with_fixed_proxy(
-        alias, proxy, lambda url: state.accounts.start_login(alias, email, proxy_url=url))
+    proxy, _ = await state.with_pending_proxy(
+        alias, lambda url: state.accounts.start_login(alias, email, proxy_url=url))
     state.put_pending_login(alias, email,
                             proxy.get("id") if isinstance(proxy, dict) else None)
     return {"sent": True, "alias": alias}

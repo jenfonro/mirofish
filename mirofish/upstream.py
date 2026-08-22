@@ -80,7 +80,7 @@ class Upstream:
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
                              {"proxy_network": bool(proxy_url),
-                              "reason": str(exc)[:200]}) from exc
+                              "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
         return response.status_code, _lower_headers(response), _parse_body(response)
 
     # --- token refresh (single-flight per alias) ------------------------------
@@ -148,7 +148,7 @@ class Upstream:
             except httpx.HTTPError as exc:
                 raise RelayError("relay network error", 502,
                                  {"proxy_network": bool(proxy_url),
-                                  "reason": str(exc)[:200]}) from exc
+                                  "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
             if response.status_code == 401 and attempt == 0:
                 access = await self.refresh_access(alias, access, proxy_url)
                 continue
@@ -178,7 +178,7 @@ class Upstream:
             except httpx.HTTPError as exc:
                 raise RelayError("relay network error", 502,
                                  {"proxy_network": bool(proxy_url),
-                                  "reason": str(exc)[:200]}) from exc
+                                  "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
             if response.status_code == 401 and attempt == 0:
                 await response.aread()
                 await response.aclose()

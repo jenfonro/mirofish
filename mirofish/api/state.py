@@ -129,6 +129,34 @@ class AppState:
         async with self.pool.route(alias, proxy) as proxy_url:
             return await op(proxy_url)
 
+    @staticmethod
+    def _is_non_api_response(exc: RelayError) -> bool:
+        """The upstream body was not JSON (e.g. an HTML block page from a bad exit)."""
+        return exc.status >= 400 and isinstance(exc.data, dict) and "_raw" in exc.data
+
+    async def with_pending_proxy(
+            self, alias: str, op: Callable[[Optional[str]], Awaitable[Any]],
+            attempts: int = 3) -> tuple[Optional[dict[str, Any]], Any]:
+        """Run a pre-login operation, failing over to another node when the
+        picked one cannot reach the upstream (network error or a non-API
+        response such as an HTML block page). Returns (proxy, result)."""
+        for attempt in range(attempts):
+            proxy = await self.pool.pending_proxy(alias)
+            if proxy is None:
+                return None, await op(None)
+            try:
+                async with self.pool.route(alias, proxy) as proxy_url:
+                    result = await op(proxy_url)
+                self.pool.success(proxy)
+                return proxy, result
+            except RelayError as exc:
+                retriable = (self._is_proxy_network_failure(exc)
+                             or self._is_non_api_response(exc))
+                if not retriable or attempt + 1 >= attempts:
+                    raise
+                self.store.mark_proxy_failure(str(proxy["id"]), str(exc)[:200])
+        raise RelayError("proxy request failed", 502)
+
     async def open_messages_stream(
             self, alias: str,
             payload: dict[str, Any]) -> tuple[httpx.Response, AsyncExitStack]:

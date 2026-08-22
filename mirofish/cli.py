@@ -62,9 +62,8 @@ def _print(value: Any) -> None:
 
 
 async def _cmd_add(state: AppState, alias: str, email: str) -> None:
-    proxy = await state.pool.pending_proxy(alias)
-    await state.with_fixed_proxy(
-        alias, proxy, lambda url: state.accounts.start_login(alias, email, proxy_url=url))
+    proxy, _ = await state.with_pending_proxy(
+        alias, lambda url: state.accounts.start_login(alias, email, proxy_url=url))
     print("验证码已发送。")
     code = getpass.getpass("输入 6 位验证码（不会回显）：").strip()
     result = await state.with_fixed_proxy(

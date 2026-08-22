@@ -214,3 +214,30 @@ async def test_delete_account(client, state, auth_headers):
 async def test_usage_endpoint_validation(client, auth_headers):
     response = await client.get("/api/usage?hours=0", headers=auth_headers)
     assert response.status_code == 400
+
+
+@respx.mock
+async def test_login_start_fails_over_dead_node(client, state, auth_headers):
+    import time as time_module
+
+    from mirofish.proxy.parse import proxy_identity
+
+    # Two direct-mode nodes; pretend the subscription was already refreshed.
+    for name, host in [("node-a", "a.example"), ("node-b", "b.example")]:
+        config = {"name": name, "scheme": "http", "host": host, "port": 8080,
+                  "username": "", "password": ""}
+        node_id = proxy_identity(config)
+        state.pool.configs[node_id] = {**config, "id": node_id}
+        state.store.upsert_proxy(node_id, config)
+    state.pool.subscription_url = "https://sub.test/nodes"
+    state.pool.last_refresh = time_module.time()
+
+    respx.post(AUTH_BASE + "/auth/code").mock(side_effect=[
+        httpx.ConnectError("dead exit"),
+        httpx.Response(200, json={"sent": True}),
+    ])
+    response = await client.post("/api/login/start", headers=auth_headers,
+                                 json={"alias": "work", "email": "x@example.com"})
+    assert response.status_code == 200 and response.json()["sent"] is True
+    failures = [int(row["failure_count"]) for row in state.store.proxy_rows()]
+    assert sorted(failures) == [0, 1]  # the dead node was marked and skipped
