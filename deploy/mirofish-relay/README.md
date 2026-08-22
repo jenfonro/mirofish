@@ -4,6 +4,10 @@
 按账号固定 Mihomo 节点（多槽位并发出口）、Anthropic-compatible `/v1/messages` 真流式中转、
 OpenAI-compatible `/v1/chat/completions` 翻译（含 tool calls / 图片 / 流式），以及内置 Vue 管理 WebUI。
 
+relay 与 Mihomo 代理引擎打包在**同一个容器**里，由入口脚本先生成 Mihomo 配置并启动引擎，
+再启动 relay（未配置订阅时跳过 Mihomo，纯直连）；任一进程退出即整体重启。不再有独立的
+sidecar 与 init 容器。
+
 ## 快速开始
 
     cd deploy/mirofish-relay
@@ -17,13 +21,14 @@ OpenAI-compatible `/v1/chat/completions` 翻译（含 tool calls / 图片 / 流�
     http://127.0.0.1:8787/
 
 首次启动的容器日志会打印本地代理密钥（只显示一次）。密钥也保存在数据卷
-`/data/proxy.key`：
+`/data/proxy.key`（compose 服务名为 `mirofish`）：
 
-    docker compose exec mirofish-relay cat /data/proxy.key
+    docker compose exec mirofish cat /data/proxy.key
 
 在 WebUI 中输入密钥后即可：配置代理订阅、添加账号（发送邮箱验证码 → 输入验证码 → 完成登录）、
-查看每个账号绑定的节点、plan / 配额利用率、近 24 小时用量图表、流式测试调用模型、删除本地账号。
-WebUI 支持浅色 / 深色主题。
+查看每个账号绑定的节点、plan / 配额利用率、**用量额度卡片**（来自上游 `/v1/limits` 的
+5 小时 / 7 天 / 30 天窗口：已用百分比、匀速线平均参照、超前 / 落后、剩余额度、重置倒计时；
+不消耗额度）、近 24 小时用量图表、流式测试调用模型、删除本地账号。WebUI 支持浅色 / 深色主题。
 
 ## 凭证存储
 
@@ -41,8 +46,10 @@ token 一样只进入加密凭证存储，不写入 SQLite 或日志。
 
 ## 代理池
 
-Docker Compose 会启动一个 Mihomo sidecar。订阅由 Mihomo 自身下载、解析和建立连接，
-因此 SS、VMess、VLESS、Trojan、Hysteria、TUIC 等 Mihomo 支持的节点都可以使用。
+容器内置的 Mihomo 引擎负责订阅的下载、解析和建立连接，因此 SS、VMess、VLESS、Trojan、
+Hysteria、TUIC 等 Mihomo 支持的节点都可以使用。配置与 provider 缓存保存在数据卷的
+`/data/mihomo/` 下，relay 通过容器内回环地址 `127.0.0.1:9090`（控制器）/ `127.0.0.1:7890`（代理）
+与引擎通信。
 
 订阅地址由 `.env` 的 `MIROFISH_PROXY_SUBSCRIPTION_URL` 配置；它优先于 WebUI 曾保存的地址。
 服务会定期读取 Mihomo 的节点列表，并把每个账号选中的节点 ID 写入 SQLite，因此同一账号会持续
@@ -50,12 +57,12 @@ Docker Compose 会启动一个 Mihomo sidecar。订阅由 Mihomo 自身下载、
 
 ### 多槽位并发出口
 
-init 容器为 Mihomo 生成 `MIROFISH_MIHOMO_SLOTS`（默认 8）个独立的槽位监听端口
+入口脚本为 Mihomo 生成 `MIROFISH_MIHOMO_SLOTS`（默认 8）个独立的槽位监听端口
 （从 `MIROFISH_MIHOMO_SLOT_BASE_PORT`，默认 7891 起），每个槽位有自己的选择器组。
 relay 把每个账号固定到一个槽位，不同账号的上游请求经由各自槽位并发出站，
 互不阻塞（旧版为全局选择器 + 全局锁，所有请求串行）。账号数超过槽位数时，
 共享同一槽位的账号会在切换节点时短暂串行，以保证账号与出口 IP 的对应关系。
-若 relay 检测到 sidecar 还在运行不含槽位组的旧配置，会自动退回单选择器兼容模式，
+若引擎仍在运行不含槽位组的旧配置，relay 会自动退回单选择器兼容模式，
 重新 `docker compose up -d --build` 后即启用槽位。
 
 订阅请求默认使用 `mihomo/1.19.0` 的 User-Agent；如果你的订阅服务要求特定客户端标识，
@@ -64,8 +71,8 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
 如果服务器无法访问订阅站，可改用静态文件：在能够下载订阅的机器保存原始订阅内容，上传到
 `deploy/mirofish-relay/mihomo-input/subscription.yaml`，然后在 `.env` 清空
 `MIROFISH_PROXY_SUBSCRIPTION_URL` 并设置 `MIROFISH_PROXY_SUBSCRIPTION_FILE=/input/subscription.yaml`。
-初始化容器会把它复制到 Mihomo 允许读取的 `/config` 数据卷。该文件含节点凭据，应设置为仅自己
-可读且不要提交到版本库；静态文件模式需要手动更新该文件后重建 Mihomo。
+入口脚本会把它复制到 Mihomo 允许读取的 `/data/mihomo/` 下。该文件含节点凭据，应设置为仅自己
+可读且不要提交到版本库；静态文件模式需要手动更新该文件后重启容器。
 
 相关接口：
 
@@ -73,9 +80,10 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
     POST /api/proxies/subscription   # {"url":"https://..."}，保存并刷新（仅直连模式）
     POST /api/proxies/refresh        # 请求 Mihomo 主动更新订阅并读取节点，失败会返回 502/503
 
-如果该接口返回 `503 Mihomo controller request timed out`，说明 relay 到 Mihomo
-sidecar 的控制端口 `mihomo:9090` 无响应；先执行 `docker compose logs mihomo` 检查订阅下载和
-配置错误。`MIROFISH_MIHOMO_CONTROLLER_TIMEOUT` 默认 5 秒，可在 `.env` 中按需调整。
+如果该接口返回 `503 Mihomo controller request timed out`，说明 relay 到容器内 Mihomo
+引擎的控制端口 `127.0.0.1:9090` 无响应；执行 `docker compose logs mirofish` 检查订阅下载和
+配置错误（Mihomo 与 relay 的日志都汇入同一容器 stdout）。`MIROFISH_MIHOMO_CONTROLLER_TIMEOUT`
+默认 5 秒，可在 `.env` 中按需调整。
 
 ## API
 
@@ -85,6 +93,8 @@ sidecar 的控制端口 `mihomo:9090` 无响应；先执行 `docker compose logs
     GET    /health
     GET    /accounts
     GET    /accounts/<alias>/status[?probe=1]   # probe=1 发送 1-token 探测，计费
+    GET    /accounts/<alias>/limits    # 单账号用量额度窗口（上游 /v1/limits，不计费）
+    GET    /api/limits                 # 全部账号并发拉取用量额度（不计费）
     GET    /proxies
     GET    /v1/models                # 按账号缓存 5 分钟
     POST   /v1/messages              # Anthropic Messages；"stream":true 为真 SSE 透传
@@ -113,7 +123,9 @@ sidecar 的控制端口 `mihomo:9090` 无响应；先执行 `docker compose logs
 
 ## 注意
 
-- compose 默认只绑定 127.0.0.1；如需对外暴露，请自行加反向代理与鉴权。
+- compose 当前把 `8787` 绑定到 `0.0.0.0`（公网可达）。任何能访问该端口的人只需本地代理密钥即可调用；
+  公网部署强烈建议在前面加 TLS 与额外鉴权（反向代理 / Cloudflare Access）。改回仅本机：把 ports 设为
+  `127.0.0.1:8787:8787`。
 - Mirofish 没有精确余额接口；WebUI 显示 plan、用量日志与 relay 返回的 7 天配额利用率。
 - `/v1/models` 和模型请求会先申请设备 ticket；如果升级上游协议，可通过
   `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识。
