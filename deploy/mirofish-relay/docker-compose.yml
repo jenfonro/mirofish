@@ -1,0 +1,66 @@
+services:
+  mihomo-config:
+    build:
+      context: ../..
+      dockerfile: deploy/mirofish-relay/Dockerfile
+    environment:
+      # Choose one source: the remote URL or a local file mounted at /input.
+      MIROFISH_PROXY_SUBSCRIPTION_URL: ${MIROFISH_PROXY_SUBSCRIPTION_URL:-}
+      MIROFISH_PROXY_SUBSCRIPTION_FILE: ${MIROFISH_PROXY_SUBSCRIPTION_FILE:-}
+      MIROFISH_PROXY_REFRESH_SECONDS: ${MIROFISH_PROXY_REFRESH_SECONDS:-600}
+      MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT: ${MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT:-mihomo/1.19.0}
+      MIROFISH_MIHOMO_SELECTOR: ${MIROFISH_MIHOMO_SELECTOR:-MirofishPool}
+      MIROFISH_MIHOMO_PROVIDER: ${MIROFISH_MIHOMO_PROVIDER:-mirofish}
+    volumes:
+      - mihomo-data:/config
+      - ./mihomo-input:/input:ro
+    command: ["python3", "/app/mirofish_relay.py", "--data-dir", "/data", "mihomo-config", "--output", "/config/config.yaml"]
+    user: "0:0"
+    restart: "no"
+
+  mihomo:
+    image: metacubex/mihomo:v1.19.29
+    depends_on:
+      mihomo-config:
+        condition: service_completed_successfully
+    volumes:
+      - mihomo-data:/config
+    command: ["-d", "/config"]
+    restart: unless-stopped
+
+  mirofish-relay:
+    build:
+      context: ../..
+      dockerfile: deploy/mirofish-relay/Dockerfile
+    container_name: mirofish-relay
+    depends_on:
+      mihomo:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      # 必填：加密 secrets.enc 的主密钥，至少 16 字符。生产建议用 secret 文件。
+      MIROFISH_MASTER_KEY: ${MIROFISH_MASTER_KEY:?set MIROFISH_MASTER_KEY (>=16 chars)}
+      # 可选：默认账号别名
+      MIROFISH_DEFAULT_ACCOUNT: ${MIROFISH_DEFAULT_ACCOUNT:-}
+      # .env 中的订阅优先于 WebUI 里曾保存的地址。
+      MIROFISH_PROXY_SUBSCRIPTION_URL: ${MIROFISH_PROXY_SUBSCRIPTION_URL:-}
+      MIROFISH_PROXY_REFRESH_SECONDS: ${MIROFISH_PROXY_REFRESH_SECONDS:-600}
+      MIROFISH_PROXY_FETCH_TIMEOUT: ${MIROFISH_PROXY_FETCH_TIMEOUT:-10}
+      MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT: ${MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT:-mihomo/1.19.0}
+      MIROFISH_PROXY_FAILURE_THRESHOLD: ${MIROFISH_PROXY_FAILURE_THRESHOLD:-2}
+      # Mihomo handles SS/VMess/VLESS/Trojan and exposes an internal HTTP proxy.
+      MIROFISH_MIHOMO_CONTROLLER: http://mihomo:9090
+      MIROFISH_MIHOMO_PROXY: http://mihomo:7890
+      # Controller requests are short control-plane operations; do not let one
+      # stuck provider refresh hold the HTTP handler open indefinitely.
+      MIROFISH_MIHOMO_CONTROLLER_TIMEOUT: ${MIROFISH_MIHOMO_CONTROLLER_TIMEOUT:-5}
+      MIROFISH_MIHOMO_SELECTOR: ${MIROFISH_MIHOMO_SELECTOR:-MirofishPool}
+      MIROFISH_MIHOMO_PROVIDER: ${MIROFISH_MIHOMO_PROVIDER:-mirofish}
+    volumes:
+      - mirofish-data:/data
+    restart: unless-stopped
+
+volumes:
+  mirofish-data:
+  mihomo-data:
