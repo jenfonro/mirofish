@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import { api } from "./api";
-import type { Account, Health, ProxySummary, UsageSummary } from "./types";
+import type { Account, Health, LimitsSummary, ProxySummary, UsageSummary } from "./types";
 
 interface Toast {
   id: number;
@@ -17,6 +17,8 @@ export const store = reactive({
   accounts: [] as Account[],
   proxies: null as ProxySummary | null,
   usage: null as UsageSummary | null,
+  limits: null as LimitsSummary | null,
+  limitsLoading: false,
   toasts: [] as Toast[],
 });
 
@@ -41,6 +43,16 @@ export async function loadUsage(hours = 24): Promise<void> {
   store.usage = await api<UsageSummary>(`/api/usage?hours=${hours}`);
 }
 
+/** Live per-window usage limits for every account (zero model cost). */
+export async function loadLimits(): Promise<void> {
+  store.limitsLoading = true;
+  try {
+    store.limits = await api<LimitsSummary>("/api/limits");
+  } finally {
+    store.limitsLoading = false;
+  }
+}
+
 /** Verify the key and hydrate every dashboard panel. */
 export async function connect(): Promise<boolean> {
   store.checking = true;
@@ -51,6 +63,7 @@ export async function connect(): Promise<boolean> {
       loadAccounts().catch(() => undefined),
       loadProxies().catch(() => undefined),
       loadUsage().catch(() => undefined),
+      loadLimits().catch(() => undefined),
     ]);
     return true;
   } catch {

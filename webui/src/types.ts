@@ -9,6 +9,24 @@ export interface ProxyInfo {
   last_error?: string | null;
 }
 
+export interface LimitWindow {
+  name: string;
+  label: string;
+  length: number | null;
+  used: number;
+  budget: number;
+  reset_at: number | null;
+}
+
+export interface AccountLimits {
+  subject?: string | null;
+  suspended: boolean;
+  degraded: boolean;
+  unmetered: boolean;
+  windows: LimitWindow[];
+  fetched_epoch: number;
+}
+
 export interface Account {
   alias: string;
   email: string;
@@ -18,8 +36,21 @@ export interface Account {
   quota: { "7d_utilization"?: string | null; "7d_reset_epoch"?: string | null };
   last_usage: { input_tokens?: number; output_tokens?: number };
   last_model?: string | null;
+  limits?: AccountLimits | null;
   checked_at?: string | null;
   proxy?: ProxyInfo | null;
+}
+
+export interface AccountLimitsResult {
+  alias: string;
+  ok: boolean;
+  limits?: AccountLimits;
+  error?: string;
+  status?: number;
+}
+
+export interface LimitsSummary {
+  accounts: AccountLimitsResult[];
 }
 
 export interface ProxySummary {

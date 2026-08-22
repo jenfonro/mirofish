@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from typing import Any, Optional
 
 from .config import Settings
@@ -38,8 +39,53 @@ def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
             "quota": metadata.get("quota", {}),
             "last_usage": metadata.get("last_usage", {}),
             "last_model": metadata.get("last_model"),
+            "limits": metadata.get("limits"),
             "checked_at": metadata.get("checked_at"),
             "proxy": proxy}
+
+
+# Window ordering and human labels mirror the upstream /v1/limits response
+# (the same windows the official usage widget reads).
+LIMIT_WINDOW_ORDER = ["5h", "7d", "30d"]
+LIMIT_WINDOW_LABEL = {"5h": "5 小时窗口", "7d": "7 天窗口", "30d": "30 天窗口"}
+LIMIT_WINDOW_LEN = {"5h": 18000, "7d": 604800, "30d": 2592000}
+
+
+def normalize_limits(data: Any, fetched_epoch: float) -> dict[str, Any]:
+    """Shape an upstream /v1/limits body into the payload the WebUI consumes.
+
+    Pass-through of used/budget/reset_at per window plus a server clock so the
+    client can compute the pace line (匀速线 = even-rate reference) exactly.
+    """
+    body = data if isinstance(data, dict) else {}
+    windows = []
+    for entry in body.get("windows", []) if isinstance(body.get("windows"), list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = entry.get("name")
+        used = entry.get("used")
+        budget = entry.get("budget")
+        if not isinstance(name, str) or not isinstance(used, (int, float)) \
+                or not isinstance(budget, (int, float)):
+            continue
+        windows.append({
+            "name": name,
+            "label": LIMIT_WINDOW_LABEL.get(name, name),
+            "length": LIMIT_WINDOW_LEN.get(name),
+            "used": float(used),
+            "budget": float(budget),
+            "reset_at": entry.get("reset_at"),
+        })
+    windows.sort(key=lambda w: LIMIT_WINDOW_ORDER.index(w["name"])
+                 if w["name"] in LIMIT_WINDOW_ORDER else len(LIMIT_WINDOW_ORDER))
+    return {
+        "subject": body.get("subject"),
+        "suspended": bool(body.get("suspended")),
+        "degraded": bool(body.get("degraded")),
+        "unmetered": bool(body.get("unmetered")),
+        "windows": windows,
+        "fetched_epoch": fetched_epoch,
+    }
 
 
 class AccountService:
@@ -125,6 +171,29 @@ class AccountService:
             metadata["quota"] = quota_headers(headers)
         self.store.update_metadata(alias, metadata)
         return public_status(self.store.row(alias), metadata)
+
+    # --- usage limits --------------------------------------------------------
+
+    async def fetch_limits(self, alias: str,
+                           proxy_url: Optional[str] = None) -> dict[str, Any]:
+        """Upstream /v1/limits with device auth (zero model cost).
+
+        Returns the per-window budgets the official usage widget reads, and
+        caches the tightest window's utilization into account metadata so the
+        accounts list can show it without another live call.
+        """
+        alias = alias_value(alias)
+        status, _, data = await self.upstream.signed_json(
+            alias, "GET", "/v1/limits", proxy_url=proxy_url)
+        if status < 200 or status >= 300:
+            raise RelayError("could not read usage limits", status, data)
+        limits = normalize_limits(data, time.time())
+        row = self.store.row(alias)
+        metadata = json.loads(row["metadata_json"])
+        metadata["limits"] = limits
+        metadata["limits_checked_at"] = utc_now()
+        self.store.update_metadata(alias, metadata)
+        return limits
 
     # --- model catalog -------------------------------------------------------
 

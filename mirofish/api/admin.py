@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Request
@@ -42,6 +43,35 @@ async def account_status(alias: str, request: Request,
         alias, lambda url: state.accounts.fetch_status(alias, do_probe, proxy_url=url))
     status["proxy"] = state.pool.account_public(alias)
     return status
+
+
+@router.get("/accounts/{alias}/limits")
+async def account_limits(alias: str, request: Request) -> dict[str, Any]:
+    """Live per-window usage limits from upstream /v1/limits (zero model cost)."""
+    state = get_state(request)
+    alias = alias_value(alias)
+    return await state.with_proxy(
+        alias, lambda url: state.accounts.fetch_limits(alias, proxy_url=url))
+
+
+@router.get("/api/limits")
+async def all_limits(request: Request) -> dict[str, Any]:
+    """Fetch usage limits for every account concurrently (zero model cost)."""
+    state = get_state(request)
+    aliases = state.store.aliases()
+
+    async def one(alias: str) -> dict[str, Any]:
+        try:
+            limits = await state.with_proxy(
+                alias, lambda url: state.accounts.fetch_limits(alias, proxy_url=url))
+            return {"alias": alias, "ok": True, "limits": limits}
+        except RelayError as exc:
+            return {"alias": alias, "ok": False, "error": str(exc), "status": exc.status}
+        except Exception as exc:  # noqa: BLE001 - never let one account break the batch
+            return {"alias": alias, "ok": False, "error": str(exc) or type(exc).__name__}
+
+    results = await asyncio.gather(*(one(alias) for alias in aliases))
+    return {"accounts": list(results)}
 
 
 @router.delete("/api/accounts/{alias}")

@@ -247,6 +247,56 @@ async def test_usage_endpoint_validation(client, auth_headers):
     assert response.status_code == 400
 
 
+LIMITS_RESPONSE = {
+    "subject": "usr_x", "suspended": False, "degraded": False, "unmetered": False,
+    "windows": [
+        {"name": "30d", "used": 1000.0, "budget": 320000, "reset_at": 1789565221},
+        {"name": "5h", "used": 5450.59305, "budget": 26096, "reset_at": 1787075656},
+        {"name": "7d", "used": 13621.348735, "budget": 74560, "reset_at": 1787577758},
+    ],
+}
+
+
+@respx.mock
+async def test_account_limits(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.get(RELAY_BASE + "/v1/limits").mock(
+        return_value=httpx.Response(200, json=LIMITS_RESPONSE))
+    response = await client.get("/accounts/work/limits", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    # Windows are normalized and ordered 5h -> 7d -> 30d.
+    assert [w["name"] for w in body["windows"]] == ["5h", "7d", "30d"]
+    assert body["windows"][0]["used"] == 5450.59305
+    assert body["windows"][0]["label"] == "5 小时窗口"
+    assert body["windows"][0]["length"] == 18000
+    assert body["suspended"] is False
+    # Signed with the device ticket, and the summary is cached into metadata.
+    assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
+    cached = json.loads(state.store.row("work")["metadata_json"])["limits"]
+    assert cached["windows"][0]["name"] == "5h"
+
+
+@respx.mock
+async def test_all_limits_survives_one_failure(client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    respx.get(RELAY_BASE + "/v1/limits").mock(side_effect=[
+        httpx.Response(200, json=LIMITS_RESPONSE),
+        httpx.Response(403, json={"error": {"message": "nope"}}),
+    ])
+    response = await client.get("/api/limits", headers=auth_headers)
+    assert response.status_code == 200
+    results = {r["alias"]: r for r in response.json()["accounts"]}
+    assert results["alpha"]["ok"] != results["beta"]["ok"]
+    ok = next(r for r in results.values() if r["ok"])
+    bad = next(r for r in results.values() if not r["ok"])
+    assert ok["limits"]["windows"]
+    assert bad["error"]
+
+
 @respx.mock
 async def test_login_start_fails_over_dead_node(client, state, auth_headers):
     import time as time_module

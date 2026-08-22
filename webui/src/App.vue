@@ -5,6 +5,7 @@ import { saveTheme, storedTheme } from "./main";
 import { connect, store } from "./store";
 import AccountsCard from "./components/AccountsCard.vue";
 import AddAccountCard from "./components/AddAccountCard.vue";
+import LimitsCard from "./components/LimitsCard.vue";
 import PlaygroundCard from "./components/PlaygroundCard.vue";
 import ProxyCard from "./components/ProxyCard.vue";
 import UsageCard from "./components/UsageCard.vue";
@@ -62,6 +63,7 @@ onMounted(async () => {
 
   <main v-if="booted && store.connected" class="grid">
     <AccountsCard class="span2" />
+    <LimitsCard class="span2" />
     <AddAccountCard />
     <UsageCard />
     <ProxyCard class="span2" />
