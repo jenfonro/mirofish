@@ -62,7 +62,9 @@ class Settings:
     @classmethod
     def from_env(cls) -> "Settings":
         settings = cls(
-            auth_base=os.environ.get("MIROFISH_AUTH_BASE", "https://admin.test.mirofish.ai").rstrip("/"),
+            # admin.test.mirofish.ai was retired upstream (403 "client version
+            # retired"); the deprecation notice points product login here.
+            auth_base=os.environ.get("MIROFISH_AUTH_BASE", "https://auth.mirasim.ai").rstrip("/"),
             relay_base=os.environ.get("MIROFISH_RELAY_BASE", "https://mirasim-relay.mirofish.ai").rstrip("/"),
             cred_backend=os.environ.get("MIROFISH_CRED_BACKEND", "").lower(),
             in_docker=bool(os.environ.get("MIROFISH_IN_DOCKER")),
