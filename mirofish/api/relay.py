@@ -82,6 +82,51 @@ async def messages(request: Request) -> Any:
                              headers={**outgoing, "Cache-Control": "no-cache"})
 
 
+def _estimate_input_tokens(payload: dict[str, Any]) -> int:
+    """Rough local token estimate (~4 chars/token) for when upstream count is
+    unavailable. Walks system + message text so token-counting clients keep
+    working instead of getting a 404."""
+    chars = 0
+
+    def add(value: Any) -> None:
+        nonlocal chars
+        if isinstance(value, str):
+            chars += len(value)
+        elif isinstance(value, list):
+            for item in value:
+                add(item)
+        elif isinstance(value, dict):
+            add(value.get("text"))
+            add(value.get("content"))
+
+    add(payload.get("system"))
+    for message in payload.get("messages", []) if isinstance(payload.get("messages"), list) else []:
+        if isinstance(message, dict):
+            add(message.get("content"))
+    return max(1, chars // 4)
+
+
+@router.post("/v1/messages/count_tokens")
+async def count_tokens(request: Request) -> Any:
+    """Anthropic token-counting endpoint. Proxied to upstream (device-signed,
+    not billable); falls back to a local estimate if upstream lacks it or the
+    proxy hop fails, so clients never see a 404 and stop retry-storming."""
+    state = get_state(request)
+    account = state.pick_account(request.headers.get("X-Mirofish-Account", ""))
+    payload = await read_json_body(request)
+    outgoing = {"X-Mirofish-Account": account}
+    try:
+        async def op(proxy_url):
+            return await state.upstream.signed_json(
+                account, "POST", "/v1/messages/count_tokens", payload, proxy_url)
+        status, _, data = await state.with_proxy(account, op)
+        if 200 <= status < 300 and isinstance(data, dict) and "input_tokens" in data:
+            return JSONResponse(data, headers=outgoing)
+    except Exception:  # noqa: BLE001 - any failure falls back to the estimate
+        pass
+    return JSONResponse({"input_tokens": _estimate_input_tokens(payload)}, headers=outgoing)
+
+
 @router.get("/v1/models")
 async def models(request: Request) -> Any:
     state = get_state(request)

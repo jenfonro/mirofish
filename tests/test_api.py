@@ -258,6 +258,34 @@ LIMITS_RESPONSE = {
 
 
 @respx.mock
+async def test_count_tokens_proxied(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(200, json={"input_tokens": 42}))
+    response = await client.post("/v1/messages/count_tokens", headers=auth_headers, json={
+        "model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 200
+    assert response.json()["input_tokens"] == 42
+    assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
+
+
+@respx.mock
+async def test_count_tokens_falls_back_on_upstream_404(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(404, json={"error": {"message": "no such endpoint"}}))
+    body = {"model": "claude-haiku-4-5",
+            "messages": [{"role": "user", "content": "hi there"}]}
+    response = await client.post("/v1/messages/count_tokens", headers=auth_headers, json=body)
+    assert response.status_code == 200
+    # Local estimate is a positive integer, never a 404.
+    assert isinstance(response.json()["input_tokens"], int)
+    assert response.json()["input_tokens"] >= 1
+
+
+@respx.mock
 async def test_account_limits(client, state, auth_headers):
     add_account(state, "work")
     mock_device_session()
