@@ -130,9 +130,9 @@ class AccountService:
 
     async def model_list(self, alias: str,
                          proxy_url: Optional[str] = None) -> dict[str, Any]:
-        """Upstream /v1/models with the account token (zero model cost)."""
-        status, _, data = await self.upstream.authed_json(
-            alias, "GET", self.settings.relay_base, "/v1/models", proxy_url=proxy_url)
+        """Upstream /v1/models with device auth (zero model cost)."""
+        status, _, data = await self.upstream.signed_json(
+            alias, "GET", "/v1/models", proxy_url=proxy_url)
         body = data if isinstance(data, dict) else {"raw": data}
         return self._public_model_list(status, body)
 

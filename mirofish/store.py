@@ -156,6 +156,7 @@ class Store:
         self.row(alias)
         self.vault.delete(alias, "access")
         self.vault.delete(alias, "refresh")
+        self.vault.delete(alias, "device_private_key")
         with self.db_lock:
             self.db.execute("DELETE FROM accounts WHERE alias=?", (alias,))
             self.db.commit()

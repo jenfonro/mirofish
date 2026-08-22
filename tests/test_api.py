@@ -31,6 +31,11 @@ QUOTA_HEADERS = {"anthropic-ratelimit-unified-7d-utilization": "0.42",
                  "anthropic-ratelimit-unified-7d-reset": "1700000000"}
 
 
+def mock_device_session(ticket: str = "device-ticket"):
+    return respx.post(RELAY_BASE + "/v1/device/session").mock(
+        return_value=httpx.Response(200, json={"ticket": ticket, "expiresIn": 900}))
+
+
 async def test_requires_auth(client):
     response = await client.get("/health")
     assert response.status_code == 401
@@ -77,6 +82,7 @@ def test_pick_account_skips_exhausted_quota(state):
 @respx.mock
 async def test_messages_non_stream(client, state, auth_headers):
     add_account(state, "work")
+    session = mock_device_session()
     route = respx.post(RELAY_BASE + "/v1/messages").mock(
         return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS))
     response = await client.post("/v1/messages", headers=auth_headers, json={
@@ -89,33 +95,56 @@ async def test_messages_non_stream(client, state, auth_headers):
     assert response.headers["X-Mirofish-Quota-7d-Utilization"] == "0.42"
     sent = json.loads(route.calls.last.request.content)
     assert sent["model"] == "claude-haiku-4-5-20251001"
-    assert route.calls.last.request.headers["authorization"] == "Bearer access-work"
+    assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
+    assert all(route.calls.last.request.headers.get(name) for name in (
+        "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig",
+        "x-mirasim-client"))
+    assert session.calls.last.request.headers["authorization"] == "Bearer access-work"
     totals = state.store.usage_summary(1)["totals"]
     assert totals == {"requests": 1, "input_tokens": 12, "output_tokens": 4}
 
 
 @respx.mock
-async def test_messages_refreshes_token_on_401(client, state, auth_headers):
+async def test_messages_refreshes_ticket_on_401(client, state, auth_headers):
     add_account(state, "work")
+    session = mock_device_session()
     respx.post(RELAY_BASE + "/v1/messages").mock(side_effect=[
         httpx.Response(401, json={"error": {"type": "authentication_error"}}),
         httpx.Response(200, json=ANTHROPIC_RESPONSE),
     ])
-    refresh = respx.post(AUTH_BASE + "/auth/refresh").mock(
-        return_value=httpx.Response(200, json={"access_token": "new-access",
-                                               "refresh_token": "new-refresh"}))
     response = await client.post("/v1/messages", headers=auth_headers, json={
         "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
     })
     assert response.status_code == 200
-    assert refresh.called
+    assert session.call_count == 2
+    assert state.store.vault.get("work", "access") == "access-work"
+
+
+@respx.mock
+async def test_device_session_refreshes_access_on_401(client, state, auth_headers):
+    add_account(state, "work")
+    session = respx.post(RELAY_BASE + "/v1/device/session").mock(side_effect=[
+        httpx.Response(401, json={"detail": "expired access"}),
+        httpx.Response(200, json={"ticket": "device-ticket", "expiresIn": 900}),
+    ])
+    refresh = respx.post(AUTH_BASE + "/auth/refresh").mock(
+        return_value=httpx.Response(200, json={"access_token": "new-access",
+                                               "refresh_token": "new-refresh"}))
+    respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "m", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert session.call_count == 2 and refresh.called
     assert state.store.vault.get("work", "access") == "new-access"
-    assert state.store.vault.get("work", "refresh") == "new-refresh"
 
 
 @respx.mock
 async def test_messages_stream_passthrough(client, state, auth_headers):
     add_account(state, "work")
+    mock_device_session()
     respx.post(RELAY_BASE + "/v1/messages").mock(
         return_value=httpx.Response(200, content=SSE_BODY.encode(),
                                     headers={"content-type": "text/event-stream",
@@ -137,6 +166,7 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
 @respx.mock
 async def test_chat_completions_non_stream(client, state, auth_headers):
     add_account(state, "work")
+    mock_device_session()
     route = respx.post(RELAY_BASE + "/v1/messages").mock(
         return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS))
     response = await client.post("/v1/chat/completions", headers=auth_headers, json={
@@ -157,6 +187,7 @@ async def test_chat_completions_non_stream(client, state, auth_headers):
 @respx.mock
 async def test_chat_completions_stream(client, state, auth_headers):
     add_account(state, "work")
+    mock_device_session()
     respx.post(RELAY_BASE + "/v1/messages").mock(
         return_value=httpx.Response(200, content=SSE_BODY.encode(),
                                     headers={"content-type": "text/event-stream"}))

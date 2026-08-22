@@ -9,7 +9,8 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - `mirofish/`: Python package (FastAPI + httpx, async).
   - `mirofish/cli.py`: CLI entry point (`python -m mirofish` / `mirofish`).
   - `mirofish/api/`: FastAPI routes (`admin.py`, `relay.py`, `openai_compat.py`, `webui.py`) and `state.py` (account selection, proxy retry, usage accounting).
-  - `mirofish/upstream.py`: httpx layer, per-alias single-flight token refresh, streaming.
+  - `mirofish/upstream.py`: httpx layer, per-alias single-flight token refresh/device-ticket cache, signed streaming.
+  - `mirofish/device.py`: persistent Ed25519 device identity and `mrs-sig-v1` request headers.
   - `mirofish/proxy/`: subscription parsing (PyYAML), Mihomo controller client + slot manager, sticky pool.
   - `mirofish/vault/`: credential backends (macOS Keychain; AES-256-GCM file vault with legacy v1 migration).
   - `mirofish/store.py`: SQLite metadata + usage log.
@@ -25,6 +26,8 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - SQLite stores metadata and the usage log only.
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
+- Model relay calls use a per-alias Ed25519 device identity, `/v1/device/session` tickets, and
+  `mrs-sig-v1` signatures over the exact request body; the private key lives in the encrypted vault.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
 - Docker runs a Mihomo sidecar for subscription-native proxy protocols. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Old sidecar configs without slots fall back to the legacy single-selector mode automatically.
 - Each account binds persistently to one proxy node, rotating only after proxy network failure.

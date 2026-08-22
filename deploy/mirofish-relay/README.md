@@ -29,11 +29,15 @@ WebUI 支持浅色 / 深色主题。
 
 容器内没有 macOS Keychain，因此使用加密文件后端：
 
-- token 保存在 `/data/secrets.enc`，使用 `MIROFISH_MASTER_KEY` 经 scrypt 派生密钥、
+- token 和 relay 设备私钥保存在 `/data/secrets.enc`，使用 `MIROFISH_MASTER_KEY` 经 scrypt 派生密钥、
   AES-256-GCM 加密（v2 格式）；旧版单文件 relay 写入的 v1 格式（PBKDF2 + HMAC）
   首次读取时自动迁移为 v2，主密钥不变；
 - SQLite `/data/accounts.sqlite3` 只保存元数据（邮箱、plan、租户、用量日志）；
 - 丢失主密钥将无法解密已有账号凭证，需要重新登录。
+
+模型 relay 还要求设备签名：每个本地账号首次发起模型请求时生成一个 Ed25519 设备密钥，
+用它申请约 15 分钟的 device ticket，并为每个请求生成 `mrs-sig-v1` 签名。私钥与账号
+token 一样只进入加密凭证存储，不写入 SQLite 或日志。
 
 ## 代理池
 
@@ -111,5 +115,7 @@ sidecar 的控制端口 `mihomo:9090` 无响应；先执行 `docker compose logs
 
 - compose 默认只绑定 127.0.0.1；如需对外暴露，请自行加反向代理与鉴权。
 - Mirofish 没有精确余额接口；WebUI 显示 plan、用量日志与 relay 返回的 7 天配额利用率。
+- `/v1/models` 和模型请求会先申请设备 ticket；如果升级上游协议，可通过
+  `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识。
 - probe / 模型扫描会产生真实计费的上游调用，仅在明确操作时才会发送。
 - 删除账号只清除本地凭证，不注销远端账号。

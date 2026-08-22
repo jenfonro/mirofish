@@ -35,6 +35,7 @@ class Settings:
     auth_base: str = ""
     relay_base: str = ""
     anthropic_version: str = "2023-06-01"
+    mirasim_client_version: str = "0.0.146"
     keychain_service: str = "open-reverselab.mirofish-relay"
     default_model: str = "claude-haiku-4-5-20251001"
     data_dir: pathlib.Path = field(default_factory=lambda: DEFAULT_DATA_DIR)
@@ -66,6 +67,9 @@ class Settings:
             # retired"); the deprecation notice points product login here.
             auth_base=os.environ.get("MIROFISH_AUTH_BASE", "https://auth.mirasim.ai").rstrip("/"),
             relay_base=os.environ.get("MIROFISH_RELAY_BASE", "https://mirasim-relay.mirofish.ai").rstrip("/"),
+            mirasim_client_version=(
+                os.environ.get("MIROFISH_MIRASIM_CLIENT_VERSION", "0.0.146").strip()
+                or "0.0.146"),
             cred_backend=os.environ.get("MIROFISH_CRED_BACKEND", "").lower(),
             in_docker=bool(os.environ.get("MIROFISH_IN_DOCKER")),
             default_account=os.environ.get("MIROFISH_DEFAULT_ACCOUNT", "").strip(),
