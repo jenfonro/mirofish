@@ -1,0 +1,216 @@
+import json
+
+import httpx
+import pytest
+import respx
+
+from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
+
+ANTHROPIC_RESPONSE = {
+    "id": "msg_1", "type": "message", "role": "assistant",
+    "model": "claude-haiku-4-5-20251001",
+    "content": [{"type": "text", "text": "你好！"}],
+    "stop_reason": "end_turn",
+    "usage": {"input_tokens": 12, "output_tokens": 4},
+}
+
+SSE_BODY = (
+    'event: message_start\n'
+    'data: {"type":"message_start","message":{"usage":{"input_tokens":9}}}\n\n'
+    'event: content_block_start\n'
+    'data: {"type":"content_block_start","index":0,"content_block":{"type":"text"}}\n\n'
+    'event: content_block_delta\n'
+    'data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}\n\n'
+    'event: message_delta\n'
+    'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}\n\n'
+    'event: message_stop\n'
+    'data: {"type":"message_stop"}\n\n'
+)
+
+QUOTA_HEADERS = {"anthropic-ratelimit-unified-7d-utilization": "0.42",
+                 "anthropic-ratelimit-unified-7d-reset": "1700000000"}
+
+
+async def test_requires_auth(client):
+    response = await client.get("/health")
+    assert response.status_code == 401
+    response = await client.get("/health", headers={"X-Mirofish-Proxy-Key": "wrong"})
+    assert response.status_code == 401
+
+
+async def test_health_and_accounts(client, state, auth_headers):
+    add_account(state, "work")
+    response = await client.get("/health", headers=auth_headers)
+    assert response.status_code == 200
+    assert response.json()["accounts"] == 1
+    response = await client.get("/accounts", headers=auth_headers)
+    accounts = response.json()["accounts"]
+    assert accounts[0]["alias"] == "work" and accounts[0]["plan"] == "pro"
+
+
+async def test_bearer_auth_accepted(client, state):
+    response = await client.get("/health",
+                                headers={"Authorization": "Bearer " + state.proxy_key})
+    assert response.status_code == 200
+
+
+def test_pick_account_order(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    assert state.pick_account("beta") == "beta"
+    state.default_account = "alpha"
+    assert state.pick_account("") == "alpha"
+    state.default_account = ""
+    first, second, third = (state.pick_account(""), state.pick_account(""),
+                            state.pick_account(""))
+    assert [first, second, third] == ["alpha", "beta", "alpha"]
+
+
+def test_pick_account_skips_exhausted_quota(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    state.store.merge_metadata("alpha", {"quota": {"7d_utilization": "1.0"}})
+    assert state.pick_account("") == "beta"
+    assert state.pick_account("") == "beta"
+
+
+@respx.mock
+async def test_messages_non_stream(client, state, auth_headers):
+    add_account(state, "work")
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS))
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert response.json()["content"][0]["text"] == "你好！"
+    assert response.headers["X-Mirofish-Account"] == "work"
+    assert response.headers["X-Mirofish-Quota-7d-Utilization"] == "0.42"
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["model"] == "claude-haiku-4-5-20251001"
+    assert route.calls.last.request.headers["authorization"] == "Bearer access-work"
+    totals = state.store.usage_summary(1)["totals"]
+    assert totals == {"requests": 1, "input_tokens": 12, "output_tokens": 4}
+
+
+@respx.mock
+async def test_messages_refreshes_token_on_401(client, state, auth_headers):
+    add_account(state, "work")
+    respx.post(RELAY_BASE + "/v1/messages").mock(side_effect=[
+        httpx.Response(401, json={"error": {"type": "authentication_error"}}),
+        httpx.Response(200, json=ANTHROPIC_RESPONSE),
+    ])
+    refresh = respx.post(AUTH_BASE + "/auth/refresh").mock(
+        return_value=httpx.Response(200, json={"access_token": "new-access",
+                                               "refresh_token": "new-refresh"}))
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "m", "max_tokens": 16, "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert refresh.called
+    assert state.store.vault.get("work", "access") == "new-access"
+    assert state.store.vault.get("work", "refresh") == "new-refresh"
+
+
+@respx.mock
+async def test_messages_stream_passthrough(client, state, auth_headers):
+    add_account(state, "work")
+    respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, content=SSE_BODY.encode(),
+                                    headers={"content-type": "text/event-stream",
+                                             **QUOTA_HEADERS}))
+    async with client.stream("POST", "/v1/messages", headers=auth_headers, json={
+        "model": "m", "max_tokens": 16, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        body = (await response.aread()).decode()
+    assert '"type":"text_delta","text":"Hi"' in body.replace(" ", "").replace('", "', '","') \
+        or 'text_delta' in body
+    assert "message_stop" in body
+    totals = state.store.usage_summary(1)["totals"]
+    assert totals["input_tokens"] == 9 and totals["output_tokens"] == 2
+
+
+@respx.mock
+async def test_chat_completions_non_stream(client, state, auth_headers):
+    add_account(state, "work")
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS))
+    response = await client.post("/v1/chat/completions", headers=auth_headers, json={
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{"role": "system", "content": "terse"},
+                     {"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "chat.completion"
+    assert data["choices"][0]["message"]["content"] == "你好！"
+    assert data["usage"]["total_tokens"] == 16
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["system"] == "terse"
+    assert sent["messages"] == [{"role": "user", "content": "hi"}]
+
+
+@respx.mock
+async def test_chat_completions_stream(client, state, auth_headers):
+    add_account(state, "work")
+    respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, content=SSE_BODY.encode(),
+                                    headers={"content-type": "text/event-stream"}))
+    async with client.stream("POST", "/v1/chat/completions", headers=auth_headers, json={
+        "model": "m", "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    }) as response:
+        assert response.status_code == 200
+        body = (await response.aread()).decode()
+    lines = [line for line in body.split("\n") if line.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]"
+    chunks = [json.loads(line[6:]) for line in lines[:-1]]
+    assert chunks[0]["object"] == "chat.completion.chunk"
+    text = "".join(c["choices"][0]["delta"].get("content") or "" for c in chunks)
+    assert text == "Hi"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
+    assert chunks[-1]["usage"]["total_tokens"] == 11
+
+
+@respx.mock
+async def test_login_flow(client, state, auth_headers):
+    respx.post(AUTH_BASE + "/auth/code").mock(
+        return_value=httpx.Response(200, json={"sent": True}))
+    respx.post(AUTH_BASE + "/auth/verify").mock(
+        return_value=httpx.Response(200, json={"access_token": "a1",
+                                               "refresh_token": "r1"}))
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "u1", "email": "x@example.com"}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={"current_plan": "pro"}))
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(200, json={"tenant": "t1"}))
+
+    response = await client.post("/api/login/start", headers=auth_headers,
+                                 json={"alias": "work", "email": "x@example.com"})
+    assert response.status_code == 200 and response.json()["sent"] is True
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "work", "code": "123456"})
+    assert response.status_code == 200
+    assert response.json()["plan"] == "pro"
+    assert state.store.vault.get("work", "access") == "a1"
+    # bad code format is rejected before hitting upstream
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "work", "code": "12"})
+    assert response.status_code == 400
+
+
+async def test_delete_account(client, state, auth_headers):
+    add_account(state, "work")
+    response = await client.request("DELETE", "/api/accounts/work", headers=auth_headers)
+    assert response.status_code == 200
+    assert state.store.aliases() == []
+
+
+async def test_usage_endpoint_validation(client, auth_headers):
+    response = await client.get("/api/usage?hours=0", headers=auth_headers)
+    assert response.status_code == 400
