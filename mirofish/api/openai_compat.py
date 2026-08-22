@@ -25,8 +25,9 @@ def _dump(chunk: dict[str, Any]) -> bytes:
 @router.post("/v1/chat/completions")
 async def chat_completions(request: Request) -> Any:
     state = get_state(request)
-    account = state.pick_account(request.headers.get("X-Mirofish-Account", ""))
     payload = await read_json_body(request)
+    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
+                                  request.headers.get("X-Mirofish-Session", ""), payload)
     if not payload.get("model"):
         payload["model"] = state.settings.default_model
     anthropic_payload = openai_to_anthropic(payload)

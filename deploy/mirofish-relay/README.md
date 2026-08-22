@@ -98,15 +98,23 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
     GET    /proxies
     GET    /v1/models                # 按账号缓存 5 分钟
     POST   /v1/messages              # Anthropic Messages；"stream":true 为真 SSE 透传
+    POST   /v1/messages/count_tokens # Anthropic token 计数（转发上游，不计费；失败则本地估算）
     POST   /v1/chat/completions      # OpenAI 兼容；支持 tools/图片/流式
     POST   /api/login/start          # {"alias","email"} 发送验证码
     POST   /api/login/finish         # {"alias","code"} 完成登录
     DELETE /api/accounts/<alias>     # 删除本地账号及凭证
     GET    /api/usage?hours=24       # 用量统计（按小时 × 账号聚合）
 
-账号选择顺序：请求头 `X-Mirofish-Account` > `MIROFISH_DEFAULT_ACCOUNT` > 轮询
+账号选择顺序：请求头 `X-Mirofish-Account` > `MIROFISH_DEFAULT_ACCOUNT` > **会话亲和** > 轮询
 （轮询会自动跳过 7 天配额利用率已达 100% 的账号）。响应头返回
 `X-Mirofish-Account` 与 `X-Mirofish-Quota-7d-Utilization` / `-Reset`。
+
+**会话亲和**：同一个对话（窗口）始终路由到同一个账号，不同对话才分配到不同账号——
+避免「一个会话被多账号轮流服务」这种明显的中转特征。会话标识按优先级取：请求头
+`X-Mirofish-Session` > 请求体 `metadata.user_id` > 首条 user 消息的哈希（对话追加轮次时保持不变，
+且刻意忽略 system 提示词，以免所有窗口共用同一提示词而挤到同一账号）。新会话会分配到
+当前承载会话最少的账号，从而在账号间铺开。会话在 `MIROFISH_SESSION_TTL`（默认 1800 秒）无活动后过期。
+WebUI 账号表的「活跃会话」列可实时看到每个账号正在服务的窗口数。
 
 调用模型示例（流式）：
 

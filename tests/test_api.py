@@ -79,6 +79,56 @@ def test_pick_account_skips_exhausted_quota(state):
     assert state.pick_account("") == "beta"
 
 
+def _conv(text):
+    return {"messages": [{"role": "user", "content": text}]}
+
+
+def test_route_account_sticky_within_conversation(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    conv = _conv("help me refactor this function")
+    first = state.route_account("", "", conv)
+    # Same conversation (first user message unchanged as it grows) -> same account.
+    grown = {"messages": conv["messages"] + [
+        {"role": "assistant", "content": "sure"},
+        {"role": "user", "content": "now add tests"}]}
+    for _ in range(5):
+        assert state.route_account("", "", grown) == first
+
+
+def test_route_account_new_windows_spread(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    a = state.route_account("", "", _conv("window one topic"))
+    b = state.route_account("", "", _conv("a totally different second topic"))
+    # Two distinct windows land on the two different accounts, not the same one.
+    assert {a, b} == {"alpha", "beta"}
+
+
+def test_route_account_ignores_shared_system_prompt(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    sys_block = {"role": "system", "content": "You are a coding assistant."}
+    one = state.route_account("", "", {"messages": [sys_block, {"role": "user", "content": "task A"}]})
+    two = state.route_account("", "", {"messages": [sys_block, {"role": "user", "content": "task B"}]})
+    # Identical system prompt must not collapse different windows onto one account.
+    assert {one, two} == {"alpha", "beta"}
+
+
+def test_route_account_explicit_header_overrides(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    assert state.route_account("beta", "", _conv("anything")) == "beta"
+
+
+def test_route_account_session_header_sticky(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    first = state.route_account("", "sess-123", _conv("x"))
+    # Same session id -> same account even if the body differs.
+    assert state.route_account("", "sess-123", _conv("completely different body")) == first
+
+
 @respx.mock
 async def test_messages_non_stream(client, state, auth_headers):
     add_account(state, "work")

@@ -28,9 +28,14 @@ async def health(request: Request) -> dict[str, Any]:
 @router.get("/accounts")
 async def list_accounts(request: Request) -> dict[str, Any]:
     state = get_state(request)
-    return {"accounts": [public_status(state.store.row(alias),
-                                       proxy=state.pool.account_public(alias))
-                         for alias in state.store.aliases()]}
+    sessions = state.session_counts()
+    accounts = []
+    for alias in state.store.aliases():
+        status = public_status(state.store.row(alias),
+                               proxy=state.pool.account_public(alias))
+        status["active_sessions"] = sessions.get(alias, 0)
+        accounts.append(status)
+    return {"accounts": accounts}
 
 
 @router.get("/accounts/{alias}/status")

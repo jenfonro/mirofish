@@ -45,6 +45,7 @@ class Settings:
     cred_backend: str = ""
     in_docker: bool = False
     default_account: str = ""
+    session_ttl: float = 1800.0
 
     proxy_refresh_seconds: float = 600.0
     proxy_fetch_timeout: float = 10.0
@@ -73,6 +74,7 @@ class Settings:
             cred_backend=os.environ.get("MIROFISH_CRED_BACKEND", "").lower(),
             in_docker=bool(os.environ.get("MIROFISH_IN_DOCKER")),
             default_account=os.environ.get("MIROFISH_DEFAULT_ACCOUNT", "").strip(),
+            session_ttl=_env_float("MIROFISH_SESSION_TTL", 1800.0, minimum=60.0),
             proxy_refresh_seconds=_env_float("MIROFISH_PROXY_REFRESH_SECONDS", 600.0, minimum=30.0),
             proxy_fetch_timeout=_env_float("MIROFISH_PROXY_FETCH_TIMEOUT", 10.0, minimum=3.0),
             proxy_subscription_user_agent=(

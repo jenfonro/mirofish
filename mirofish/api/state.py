@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -39,6 +40,14 @@ class AppState:
         self.model_cache: dict[str, tuple[float, dict[str, Any]]] = {}
         self._rr_index = 0
         self._rr_lock = threading.Lock()
+        # Session affinity: a conversation (window) sticks to one account so a
+        # single dialogue is never served by alternating accounts. key ->
+        # {"account", "last"}; new keys are assigned to the least-loaded account
+        # so separate windows spread across accounts instead of round-robining
+        # per request.
+        self._sessions: dict[str, dict[str, Any]] = {}
+        self._last_assigned: dict[str, float] = {}
+        self._session_lock = threading.Lock()
 
     async def aclose(self) -> None:
         await self.upstream.aclose()
@@ -78,6 +87,109 @@ class AppState:
                 chosen = aliases[start % len(aliases)]
                 self._rr_index = (start + 1) % len(aliases)
             return chosen
+
+    # --- session-affinity routing --------------------------------------------
+
+    @staticmethod
+    def _message_text(message: Any) -> str:
+        """Concatenate the text of one message; handles a plain string or a
+        list of Anthropic/OpenAI content blocks."""
+        if not isinstance(message, dict):
+            return ""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        parts: list[str] = []
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+        return "\n".join(parts)
+
+    @classmethod
+    def _session_key_from_payload(cls, payload: Any) -> str:
+        """Derive a key that is stable across the turns of one conversation but
+        differs between conversations. Prefer an explicit client id; otherwise
+        anchor on the first user message (constant from turn 1, and distinct per
+        window). The system prompt is deliberately ignored — it is identical
+        across every window of the same client and would collapse them onto one
+        account."""
+        if not isinstance(payload, dict):
+            return ""
+        meta = payload.get("metadata")
+        if isinstance(meta, dict):
+            uid = meta.get("user_id")
+            if isinstance(uid, str) and uid.strip():
+                return "uid:" + uid.strip()
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "user":
+                    text = cls._message_text(message)
+                    if text:
+                        return "msg:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        return ""
+
+    def _prune_sessions(self, now: float) -> None:
+        ttl = self.settings.session_ttl
+        stale = [key for key, entry in self._sessions.items() if now - entry["last"] > ttl]
+        for key in stale:
+            del self._sessions[key]
+
+    def _sticky_account(self, key: str, aliases: list[str]) -> str:
+        with self._session_lock:
+            now = time.time()
+            self._prune_sessions(now)
+            entry = self._sessions.get(key)
+            if entry and entry["account"] in aliases and self._quota_ok(entry["account"]):
+                entry["last"] = now
+                return entry["account"]
+            # New window: assign the eligible account carrying the fewest live
+            # sessions (ties broken by least-recently assigned) so windows fan
+            # out across accounts instead of piling onto one.
+            eligible = [alias for alias in aliases if self._quota_ok(alias)] or aliases
+            counts = {alias: 0 for alias in eligible}
+            for existing in self._sessions.values():
+                if existing["account"] in counts:
+                    counts[existing["account"]] += 1
+            chosen = min(eligible,
+                         key=lambda alias: (counts[alias], self._last_assigned.get(alias, 0.0)))
+            self._sessions[key] = {"account": chosen, "last": now}
+            self._last_assigned[chosen] = now
+            return chosen
+
+    def session_counts(self) -> dict[str, int]:
+        """Live (non-expired) session count per account, for dashboard display."""
+        with self._session_lock:
+            now = time.time()
+            self._prune_sessions(now)
+            counts: dict[str, int] = {}
+            for entry in self._sessions.values():
+                counts[entry["account"]] = counts.get(entry["account"], 0) + 1
+            return counts
+
+    def route_account(self, requested: str, session_hint: str, payload: Any) -> str:
+        """Account selection for a model request.
+
+        Order: explicit `X-Mirofish-Account` > configured default account >
+        session affinity (same conversation -> same account, new conversation ->
+        least-loaded account) > quota-aware round-robin when no session key can
+        be derived.
+        """
+        requested = (requested or "").strip()
+        if requested:
+            return alias_value(requested)
+        if self.default_account:
+            return self.default_account
+        aliases = self.store.aliases()
+        if not aliases:
+            raise RelayError("no account configured; add one via WebUI or CLI first", 400)
+        key = (session_hint or "").strip() or self._session_key_from_payload(payload)
+        if not key:
+            return self.pick_account("")
+        return self._sticky_account(key, aliases)
 
     # --- pending logins -------------------------------------------------------
 

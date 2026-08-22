@@ -37,6 +37,7 @@ export interface Account {
   last_usage: { input_tokens?: number; output_tokens?: number };
   last_model?: string | null;
   limits?: AccountLimits | null;
+  active_sessions?: number;
   checked_at?: string | null;
   proxy?: ProxyInfo | null;
 }

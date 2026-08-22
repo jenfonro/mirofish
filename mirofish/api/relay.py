@@ -47,8 +47,9 @@ class _UsageWatcher:
 @router.post("/v1/messages")
 async def messages(request: Request) -> Any:
     state = get_state(request)
-    account = state.pick_account(request.headers.get("X-Mirofish-Account", ""))
     payload = await read_json_body(request)
+    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
+                                  request.headers.get("X-Mirofish-Session", ""), payload)
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
 
     if not payload.get("stream"):
@@ -112,8 +113,9 @@ async def count_tokens(request: Request) -> Any:
     not billable); falls back to a local estimate if upstream lacks it or the
     proxy hop fails, so clients never see a 404 and stop retry-storming."""
     state = get_state(request)
-    account = state.pick_account(request.headers.get("X-Mirofish-Account", ""))
     payload = await read_json_body(request)
+    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
+                                  request.headers.get("X-Mirofish-Session", ""), payload)
     outgoing = {"X-Mirofish-Account": account}
     try:
         async def op(proxy_url):

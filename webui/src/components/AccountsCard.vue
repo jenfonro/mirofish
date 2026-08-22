@@ -61,7 +61,7 @@ async function removeAccount(alias: string) {
         <thead>
           <tr>
             <th>别名</th><th>邮箱</th><th>套餐</th><th>代理节点</th>
-            <th>7 天配额</th><th class="num">最近用量</th><th></th>
+            <th>7 天配额</th><th class="num">活跃会话</th><th class="num">最近用量</th><th></th>
           </tr>
         </thead>
         <tbody>
@@ -93,6 +93,10 @@ async function removeAccount(alias: string) {
                 </div>
               </template>
               <span v-else class="muted">未知</span>
+            </td>
+            <td class="num">
+              <span v-if="account.active_sessions" class="badge">{{ account.active_sessions }}</span>
+              <span v-else class="muted">0</span>
             </td>
             <td class="num muted">
               入 {{ account.last_usage?.input_tokens ?? "–" }} /
