@@ -1,0 +1,9 @@
+.git/
+.venv/
+webui/node_modules/
+mirofish/static/
+__pycache__/
+*.pyc
+.env
+tests/
+deploy/mirofish-relay/mihomo-input/

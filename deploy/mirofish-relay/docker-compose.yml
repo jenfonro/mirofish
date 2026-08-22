@@ -11,10 +11,14 @@ services:
       MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT: ${MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT:-mihomo/1.19.0}
       MIROFISH_MIHOMO_SELECTOR: ${MIROFISH_MIHOMO_SELECTOR:-MirofishPool}
       MIROFISH_MIHOMO_PROVIDER: ${MIROFISH_MIHOMO_PROVIDER:-mirofish}
+      # Slot listeners give each account an independent exit; keep these two in
+      # sync with the mirofish-relay service below.
+      MIROFISH_MIHOMO_SLOTS: ${MIROFISH_MIHOMO_SLOTS:-8}
+      MIROFISH_MIHOMO_SLOT_BASE_PORT: ${MIROFISH_MIHOMO_SLOT_BASE_PORT:-7891}
     volumes:
       - mihomo-data:/config
       - ./mihomo-input:/input:ro
-    command: ["python3", "/app/mirofish_relay.py", "--data-dir", "/data", "mihomo-config", "--output", "/config/config.yaml"]
+    command: ["python3", "-m", "mirofish", "--data-dir", "/data", "mihomo-config", "--output", "/config/config.yaml"]
     user: "0:0"
     restart: "no"
 
@@ -49,14 +53,16 @@ services:
       MIROFISH_PROXY_FETCH_TIMEOUT: ${MIROFISH_PROXY_FETCH_TIMEOUT:-10}
       MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT: ${MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT:-mihomo/1.19.0}
       MIROFISH_PROXY_FAILURE_THRESHOLD: ${MIROFISH_PROXY_FAILURE_THRESHOLD:-2}
-      # Mihomo handles SS/VMess/VLESS/Trojan and exposes an internal HTTP proxy.
+      # Mihomo handles SS/VMess/VLESS/Trojan and exposes internal HTTP proxies.
       MIROFISH_MIHOMO_CONTROLLER: http://mihomo:9090
       MIROFISH_MIHOMO_PROXY: http://mihomo:7890
       # Controller requests are short control-plane operations; do not let one
-      # stuck provider refresh hold the HTTP handler open indefinitely.
+      # stuck provider refresh hold a request open indefinitely.
       MIROFISH_MIHOMO_CONTROLLER_TIMEOUT: ${MIROFISH_MIHOMO_CONTROLLER_TIMEOUT:-5}
       MIROFISH_MIHOMO_SELECTOR: ${MIROFISH_MIHOMO_SELECTOR:-MirofishPool}
       MIROFISH_MIHOMO_PROVIDER: ${MIROFISH_MIHOMO_PROVIDER:-mirofish}
+      MIROFISH_MIHOMO_SLOTS: ${MIROFISH_MIHOMO_SLOTS:-8}
+      MIROFISH_MIHOMO_SLOT_BASE_PORT: ${MIROFISH_MIHOMO_SLOT_BASE_PORT:-7891}
     volumes:
       - mirofish-data:/data
     restart: unless-stopped

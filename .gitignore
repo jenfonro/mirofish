@@ -7,3 +7,4 @@ dist/
 *.enc
 proxy.key
 .DS_Store
+mirofish/static/
