@@ -31,9 +31,11 @@ def create_app(state: AppState) -> FastAPI:
     app.include_router(admin.router)
     app.include_router(relay.router)
     app.include_router(openai_compat.router)
-    assets = webui.STATIC_DIR / "assets"
-    if assets.is_dir():
-        app.mount("/assets", StaticFiles(directory=assets), name="assets")
+    # "miku" holds the optional anime-skin character art (webui/public/miku/).
+    for sub in ("assets", "miku"):
+        directory = webui.STATIC_DIR / sub
+        if directory.is_dir():
+            app.mount(f"/{sub}", StaticFiles(directory=directory), name=sub)
     return app
 
 

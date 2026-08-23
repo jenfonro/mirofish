@@ -1,0 +1,110 @@
+/* Miku（初音未来)二次元皮肤：<html data-skin="miku"> 时生效。
+   与明暗主题正交 —— 亮/暗各有一套 Miku 配色，层叠结构与 style.css 保持一致：
+   先亮色，再 OS 深色媒体查询，最后显式 data-theme="dark"。 */
+
+:root[data-skin="miku"] {
+  --page: #eefaf9;
+  --surface: #ffffff;
+  --ink: #0f2422;
+  --ink-2: #3d5a57;
+  --muted: #7a938f;
+  --grid: #d9edeb;
+  --baseline: #aed7d2;
+  --border: rgba(57, 197, 187, 0.35);
+  --accent: #0e9e96;
+  --accent-ink: #ffffff;
+  --good: #0ca30c;
+  --good-text: #006300;
+  --warning: #f5a623;
+  --critical: #d93670;
+  --series-1: #17b3aa;
+  --series-2: #ef5f9a;
+  --series-3: #5a8bd6;
+  --series-4: #eda100;
+  --series-5: #9a6fd0;
+  --series-6: #0e8f88;
+}
+@media (prefers-color-scheme: dark) {
+  :root[data-skin="miku"]:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0a1517;
+    --surface: #10201f;
+    --ink: #e8fbf8;
+    --ink-2: #a9cfca;
+    --muted: #6d908c;
+    --grid: #1c3230;
+    --baseline: #2a4a47;
+    --border: rgba(57, 197, 187, 0.25);
+    --accent: #39c5bb;
+    --accent-ink: #032220;
+    --good-text: #2fd12f;
+    --critical: #ff6f9f;
+    --series-1: #39c5bb;
+    --series-2: #f077ab;
+    --series-3: #6f9fe8;
+    --series-4: #d99a1e;
+    --series-5: #ab84e0;
+    --series-6: #17a398;
+  }
+}
+:root[data-skin="miku"][data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0a1517;
+  --surface: #10201f;
+  --ink: #e8fbf8;
+  --ink-2: #a9cfca;
+  --muted: #6d908c;
+  --grid: #1c3230;
+  --baseline: #2a4a47;
+  --border: rgba(57, 197, 187, 0.25);
+  --accent: #39c5bb;
+  --accent-ink: #032220;
+  --good-text: #2fd12f;
+  --critical: #ff6f9f;
+  --series-1: #39c5bb;
+  --series-2: #f077ab;
+  --series-3: #6f9fe8;
+  --series-4: #d99a1e;
+  --series-5: #ab84e0;
+  --series-6: #17a398;
+}
+
+/* 装饰层：纯 CSS，不依赖角色图，明暗通用。
+   选择器带 :root 前缀以稳定压过组件 scoped 样式。 */
+
+:root[data-skin="miku"] body {
+  background:
+    radial-gradient(720px 420px at 8% -60px, rgba(57, 197, 187, 0.16), transparent 70%),
+    radial-gradient(640px 400px at 96% 108%, rgba(236, 72, 153, 0.1), transparent 70%),
+    var(--page);
+  background-attachment: fixed;
+}
+
+:root[data-skin="miku"] .topbar {
+  border-bottom: none;
+  background-color: var(--surface);
+  background-image: linear-gradient(90deg, #39c5bb, #7ad4cd 35%, #f08bb8 75%, #ec4899);
+  background-size: 100% 2px;
+  background-repeat: no-repeat;
+  background-position: bottom;
+}
+:root[data-skin="miku"] .topbar h1 {
+  background: linear-gradient(90deg, #10a9a0, #ec4899);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+:root[data-skin="miku"] .topbar h1::after { content: " ♪"; }
+
+:root[data-skin="miku"] .card {
+  border-radius: 14px;
+  box-shadow: 0 2px 14px rgba(57, 197, 187, 0.1);
+}
+:root[data-skin="miku"] .card > h2::before {
+  content: "";
+  width: 4px;
+  height: 15px;
+  border-radius: 2px;
+  flex: none;
+  background: linear-gradient(180deg, #39c5bb, #ec4899);
+}

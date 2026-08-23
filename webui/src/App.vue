@@ -1,7 +1,7 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onMounted, reactive, ref } from "vue";
 import { getKey, setKey } from "./api";
-import { saveTheme, storedTheme } from "./main";
+import { saveSkin, saveTheme, storedSkin, storedTheme } from "./main";
 import { connect, store } from "./store";
 import AccountsCard from "./components/AccountsCard.vue";
 import AddAccountCard from "./components/AddAccountCard.vue";
@@ -21,6 +21,23 @@ function cycleTheme() {
   const order = ["system", "light", "dark"];
   theme.value = order[(order.indexOf(theme.value) + 1) % order.length];
   saveTheme(theme.value);
+}
+
+const skin = ref(storedSkin());
+// Character art is optional: each <img> hides itself on load error so the
+// skin degrades to colors-only until PNGs are dropped into webui/public/miku/.
+// Bound via :src so Vite never tries to resolve the (possibly absent) files.
+const MIKU_ART = {
+  logo: "/miku/logo.png",
+  gate: "/miku/gate.png",
+  mascot: "/miku/mascot.png",
+  bg: "/miku/bg.jpg",
+};
+const art = reactive({ logo: true, gate: true, mascot: true, bg: true });
+
+function toggleSkin() {
+  skin.value = skin.value === "miku" ? "plain" : "miku";
+  saveSkin(skin.value);
 }
 
 async function submitKey() {
@@ -50,6 +67,8 @@ onMounted(async () => {
   </div>
 
   <header class="topbar">
+    <img v-if="skin === 'miku' && art.logo" class="miku-logo" :src="MIKU_ART.logo"
+         alt="" @error="art.logo = false" />
     <h1>Mirofish Relay</h1>
     <span v-if="store.health" class="badge">
       <span class="dot ok"></span>{{ store.health.accounts }} 个账号
@@ -57,9 +76,13 @@ onMounted(async () => {
     <span v-if="store.health" class="badge">代理后端 {{ store.health.proxy_backend }}</span>
     <span v-if="store.health" class="badge">v{{ store.health.version }}</span>
     <span class="spacer"></span>
+    <button class="ghost small" @click="toggleSkin">皮肤：{{ skin === "miku" ? "Miku ♪" : "标准" }}</button>
     <button class="ghost small" @click="cycleTheme">主题：{{ THEME_LABEL[theme] }}</button>
     <button v-if="store.connected" class="ghost small" @click="editKey">更换密钥</button>
   </header>
+
+  <img v-if="skin === 'miku' && store.connected && art.bg" class="miku-bg" :src="MIKU_ART.bg"
+       alt="" @error="art.bg = false" />
 
   <main v-if="booted && store.connected" class="grid">
     <AccountsCard class="span2" />
@@ -71,6 +94,8 @@ onMounted(async () => {
   </main>
 
   <main v-else-if="booted" class="gate">
+    <img v-if="skin === 'miku' && art.gate" class="miku-gate-art" :src="MIKU_ART.gate"
+         alt="" @error="art.gate = false" />
     <div class="card gate-card">
       <h2>连接本地中转</h2>
       <p class="muted">
@@ -88,6 +113,9 @@ onMounted(async () => {
       </div>
     </div>
   </main>
+
+  <img v-if="skin === 'miku' && art.mascot" class="miku-mascot" :src="MIKU_ART.mascot"
+       alt="" @error="art.mascot = false" />
 </template>
 
 <style scoped>
@@ -116,7 +144,49 @@ onMounted(async () => {
   .grid { grid-template-columns: 1fr; }
 }
 
-.gate { display: flex; justify-content: center; padding: 12vh 18px 0; }
+.gate { display: flex; justify-content: center; align-items: flex-end; gap: 18px; padding: 12vh 18px 0; }
 .gate-card { width: 420px; max-width: 100%; }
 .gate-error { color: var(--critical); font-size: 13px; margin: 8px 0 0; }
+
+.miku-logo { width: 30px; height: 30px; border-radius: 50%; object-fit: cover; flex: none; }
+.miku-bg {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  z-index: -1;
+  opacity: 0.13;
+  pointer-events: none;
+  user-select: none;
+}
+.miku-gate-art {
+  height: 300px;
+  user-select: none;
+  filter: drop-shadow(0 8px 20px rgba(57, 197, 187, 0.3));
+}
+@media (max-width: 760px) {
+  .miku-gate-art { display: none; }
+}
+.miku-mascot {
+  position: fixed;
+  right: 14px;
+  bottom: -6px;
+  width: 148px;
+  z-index: 5;
+  pointer-events: none;
+  user-select: none;
+  filter: drop-shadow(0 6px 16px rgba(57, 197, 187, 0.35));
+  animation: miku-bob 4.2s ease-in-out infinite;
+}
+@keyframes miku-bob {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-7px); }
+}
+@media (max-width: 1100px) {
+  .miku-mascot { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .miku-mascot { animation: none; }
+}
 </style>
