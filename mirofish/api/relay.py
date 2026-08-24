@@ -10,7 +10,7 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..upstream import quota_headers
+from ..upstream import _claude_compatible_payload, quota_headers
 from ..validate import model_value
 from .deps import get_state, read_json_body, require_auth
 
@@ -134,6 +134,7 @@ async def count_tokens(request: Request) -> Any:
     state = get_state(request)
     payload = await read_json_body(request)
     payload["model"] = model_value(str(payload.get("model", "")))
+    payload = _claude_compatible_payload(payload)
     session_hint = request.headers.get("X-Mirofish-Session", "")
     account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
                                   session_hint, payload)

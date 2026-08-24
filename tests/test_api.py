@@ -10,6 +10,7 @@ from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 
 from mirofish.errors import RelayError
+from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER
 
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 
@@ -176,6 +177,9 @@ async def test_messages_non_stream(client, state, auth_headers):
     assert response.headers["X-Mirofish-Quota-7d-Utilization"] == "0.42"
     sent = json.loads(route.calls.last.request.content)
     assert sent["model"] == "claude-haiku-4-5"
+    assert sent["system"] == [
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+    ]
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
     assert all(route.calls.last.request.headers.get(name) for name in (
         "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig",
@@ -318,7 +322,7 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
     headers = {**auth_headers,
                "X-Claude-Code-Session-Id": "0f20cf48-c292-42e9-a99e-994511307deb"}
     async with client.stream("POST", "/v1/messages?beta=true", headers=headers, json={
-        "model": "m", "max_tokens": 16, "stream": True,
+        "model": "claude-fable-5", "max_tokens": 16, "stream": True,
         "messages": [{"role": "user", "content": "hi"}],
     }) as response:
         assert response.status_code == 200
@@ -330,6 +334,9 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
     assert route.calls.last.request.headers["x-mirasim-session"] == \
         "0f20cf48-c292-42e9-a99e-994511307deb"
     assert route.calls.last.request.url.query == b"beta=true"
+    assert json.loads(route.calls.last.request.content)["system"] == [
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+    ]
     totals = state.store.usage_summary(1)["totals"]
     assert totals["input_tokens"] == 9 and totals["output_tokens"] == 2
 
@@ -378,7 +385,7 @@ async def test_complete_claude_code_payload_is_forwarded_unchanged(
         "metadata": {"user_id": metadata_id},
         "system": [
             {"type": "text", "text": "first"},
-            {"type": "text", "text": "second",
+            {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
              "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": "third",
              "cache_control": {"type": "ephemeral"}},
@@ -413,7 +420,8 @@ async def test_complete_claude_code_payload_is_forwarded_unchanged(
         await response.aread()
 
     sent = route.calls.last.request
-    assert json.loads(sent.content) == payload
+    assert sent.content == json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert sent.headers["anthropic-beta"] == betas
     assert sent.headers["user-agent"] == headers["user-agent"]
     assert sent.headers["x-stainless-package-version"] == "0.112.1"
@@ -440,7 +448,10 @@ async def test_chat_completions_non_stream(client, state, auth_headers):
     assert data["usage"]["total_tokens"] == 16
     sent = json.loads(route.calls.last.request.content)
     assert sent["model"] == "claude-haiku-4-5"
-    assert sent["system"] == "terse"
+    assert sent["system"] == [
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+        {"type": "text", "text": "terse"},
+    ]
     assert sent["messages"] == [{"role": "user", "content": "hi"}]
 
 
@@ -458,7 +469,9 @@ async def test_chat_completions_uses_configured_default_model(
 
     assert response.status_code == 200
     assert response.json()["model"] == "gpt-5.6-luna"
-    assert json.loads(route.calls.last.request.content)["model"] == "gpt-5.6-luna"
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["model"] == "gpt-5.6-luna"
+    assert "system" not in sent
 
 
 @respx.mock
@@ -598,7 +611,11 @@ async def test_count_tokens_proxied(client, state, auth_headers):
         "messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
     assert response.json()["input_tokens"] == 42
-    assert json.loads(route.calls.last.request.content)["model"] == "claude-haiku-4-5"
+    sent = json.loads(route.calls.last.request.content)
+    assert sent["model"] == "claude-haiku-4-5"
+    assert sent["system"] == [
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+    ]
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
     assert route.calls.last.request.headers["x-mirasim-session"] == "count-session"
     assert route.calls.last.request.url.query == b"beta=true"
@@ -615,9 +632,9 @@ async def test_count_tokens_falls_back_on_upstream_404(client, state, auth_heade
             "messages": [{"role": "user", "content": "hi there"}]}
     response = await client.post("/v1/messages/count_tokens", headers=auth_headers, json=body)
     assert response.status_code == 200
-    # Local estimate is a positive integer, never a 404.
-    assert isinstance(response.json()["input_tokens"], int)
-    assert response.json()["input_tokens"] >= 1
+    # The fallback counts the same compatibility block used for generation.
+    assert response.json()["input_tokens"] == \
+        (len(CLAUDE_AGENT_SYSTEM_MARKER) + len("hi there")) // 4
 
 
 @respx.mock
@@ -686,17 +703,23 @@ async def test_status_probe_uses_zero_cost_limits_instead_of_messages(
 
 
 @respx.mock
-async def test_model_scan_sends_minimal_work_with_session_not_probe(state):
+async def test_model_scan_sends_claude_compatible_work_with_session_not_probe(
+        state, monkeypatch):
     add_account(state, "work")
     mock_device_session()
+    monkeypatch.setattr("mirofish.accounts.SCAN_CANDIDATES", ["claude-fable-5"])
     route = respx.post(RELAY_BASE + "/v1/messages").mock(
         return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
 
     result = await state.accounts.scan_models("work", max_models=1)
 
-    assert result == [{"model": "gpt-5.6-luna", "accepted": True}]
+    assert result == [{"model": "claude-fable-5", "accepted": True}]
     sent = route.calls.last.request
-    assert json.loads(sent.content)["max_tokens"] == 2
+    body = json.loads(sent.content)
+    assert body["max_tokens"] == 2
+    assert body["system"] == [
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+    ]
     assert sent.headers["x-mirasim-session"].startswith("mirofish_")
     assert "x-mirasim-probe" not in sent.headers
 

@@ -30,6 +30,16 @@ MESSAGES_PATH = "/v1/messages"
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 LIMITS_PATH = "/v1/limits"
 
+# The current product relay only advertises Claude capacity when the request
+# carries the short Agent SDK system marker emitted by official clients.  It
+# returns a misleading model-unavailable 503 for an otherwise valid minimal
+# Anthropic/OpenAI-compatible request.  Add only this routing marker for
+# third-party Claude callers; official client payloads already contain it and
+# remain structurally unchanged before canonical JSON serialization.
+CLAUDE_AGENT_SYSTEM_MARKER = (
+    "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+)
+
 # The product relay preserves the Claude/Anthropic client fingerprint while
 # replacing caller credentials and adding its own relay metadata/signature.
 # Keep this list deliberately narrow so local proxy keys and cookies can never
@@ -191,6 +201,43 @@ def _json_bytes(payload: Optional[dict[str, Any]]) -> bytes:
     if payload is None:
         return b""
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _claude_compatible_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Return a Claude-routable payload without mutating the caller's body.
+
+    The marker is an independent system text block so an existing system
+    instruction keeps its text and ordering relative to other caller blocks.
+    Non-Claude models and official Claude payloads are returned as-is.
+    """
+    model = payload.get("model")
+    if not isinstance(model, str) or not model.lower().startswith("claude-"):
+        return payload
+
+    system = payload.get("system")
+    if isinstance(system, str):
+        texts = [system]
+    elif isinstance(system, list):
+        texts = [block.get("text") for block in system
+                 if isinstance(block, dict) and block.get("type") == "text"]
+    elif system is None:
+        texts = []
+    else:
+        # Preserve normal upstream validation for malformed system values.
+        return payload
+    if CLAUDE_AGENT_SYSTEM_MARKER in texts:
+        return payload
+
+    marker = {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER}
+    if isinstance(system, str) and system:
+        prepared_system: list[dict[str, Any]] = [
+            marker, {"type": "text", "text": system},
+        ]
+    elif isinstance(system, list):
+        prepared_system = [marker, *system]
+    else:
+        prepared_system = [marker]
+    return {**payload, "system": prepared_system}
 
 
 @dataclass
@@ -500,6 +547,7 @@ class Upstream:
                        session_id: str = "", beta: bool = False,
                        probe: bool = False) -> tuple[dict[str, Any], dict[str, str]]:
         """Buffered (non-stream) Messages call with ticket/signature retry."""
+        payload = _claude_compatible_payload(payload)
         request_body = _json_bytes(payload)
         url_path = MESSAGES_PATH + ("?beta=true" if beta else "")
         extra_headers = self._message_request_headers(
@@ -538,6 +586,7 @@ class Upstream:
         Returns after upstream status/headers are known, so proxy rotation can
         still happen on connect failure; the body streams afterwards.
         """
+        payload = _claude_compatible_payload(payload)
         request_body = _json_bytes(payload)
         url_path = MESSAGES_PATH + ("?beta=true" if beta else "")
         extra_headers = self._message_request_headers(

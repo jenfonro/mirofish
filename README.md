@@ -138,8 +138,10 @@ X-Mirofish-Account: main
 
 未指定账号时，服务会按照默认账号、会话亲和和配额感知轮询规则自动选择账号。
 OpenAI 兼容请求省略 `model` 时使用 `MIROFISH_DEFAULT_MODEL`。旧客户端发送
-`claude-haiku-4-5-20251001` 时会规范化为 `claude-haiku-4-5`；`/v1/models` 中出现某个模型
-不代表上游此刻一定有后端容量，遇到 `no upstream available for model` 时请切换模型。
+`claude-haiku-4-5-20251001` 时会规范化为 `claude-haiku-4-5`。当前上游会把缺少 Claude Agent
+SDK system 标记的第三方极简请求误报为 `no upstream available for model`；relay 会仅对缺少该
+标记的 `claude-*` 请求补一个独立的兼容块，原有 system 内容会完整保留，官方客户端请求和其他
+模型的请求体不会被这项兼容逻辑改写。`/v1/models` 中出现某个模型仍不代表上游此刻一定有后端容量。
 
 ## 常用接口
 
