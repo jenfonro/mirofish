@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..upstream import quota_headers
+from ..validate import model_value
 from .deps import get_state, read_json_body, require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -52,6 +53,7 @@ class _UsageWatcher:
 async def messages(request: Request) -> Any:
     state = get_state(request)
     payload = await read_json_body(request)
+    payload["model"] = model_value(str(payload.get("model", "")))
     session_hint = request.headers.get("X-Mirofish-Session", "")
     requested = request.headers.get("X-Mirofish-Account", "")
     relay_session = state.relay_session_id(
@@ -131,6 +133,7 @@ async def count_tokens(request: Request) -> Any:
     proxy hop fails, so clients never see a 404 and stop retry-storming."""
     state = get_state(request)
     payload = await read_json_body(request)
+    payload["model"] = model_value(str(payload.get("model", "")))
     session_hint = request.headers.get("X-Mirofish-Session", "")
     account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
                                   session_hint, payload)
@@ -165,8 +168,9 @@ async def models(request: Request) -> Any:
                             status_code=400)
     cached = state.model_cache.get(account)
     if cached and time.time() - cached[0] < state.settings.model_catalog_ttl:
-        return cached[1]
+        return {**cached[1], "default_model": state.settings.default_model}
     payload = await state.with_proxy(
         account, lambda url: state.accounts.model_list(account, proxy_url=url))
+    payload["default_model"] = state.settings.default_model
     state.model_cache[account] = (time.time(), payload)
     return payload

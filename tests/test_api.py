@@ -175,7 +175,7 @@ async def test_messages_non_stream(client, state, auth_headers):
     assert response.headers["X-Mirofish-Account"] == "work"
     assert response.headers["X-Mirofish-Quota-7d-Utilization"] == "0.42"
     sent = json.loads(route.calls.last.request.content)
-    assert sent["model"] == "claude-haiku-4-5-20251001"
+    assert sent["model"] == "claude-haiku-4-5"
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
     assert all(route.calls.last.request.headers.get(name) for name in (
         "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig",
@@ -351,8 +351,26 @@ async def test_chat_completions_non_stream(client, state, auth_headers):
     assert data["choices"][0]["message"]["content"] == "你好！"
     assert data["usage"]["total_tokens"] == 16
     sent = json.loads(route.calls.last.request.content)
+    assert sent["model"] == "claude-haiku-4-5"
     assert sent["system"] == "terse"
     assert sent["messages"] == [{"role": "user", "content": "hi"}]
+
+
+@respx.mock
+async def test_chat_completions_uses_configured_default_model(
+        client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS))
+
+    response = await client.post("/v1/chat/completions", headers=auth_headers, json={
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "gpt-5.6-luna"
+    assert json.loads(route.calls.last.request.content)["model"] == "gpt-5.6-luna"
 
 
 @respx.mock
@@ -488,9 +506,11 @@ async def test_count_tokens_proxied(client, state, auth_headers):
         return_value=httpx.Response(200, json={"input_tokens": 42}))
     headers = {**auth_headers, "X-Claude-Code-Session-Id": "count-session"}
     response = await client.post("/v1/messages/count_tokens?beta=true", headers=headers, json={
-        "model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]})
+        "model": "claude-haiku-4-5-20251001",
+        "messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
     assert response.json()["input_tokens"] == 42
+    assert json.loads(route.calls.last.request.content)["model"] == "claude-haiku-4-5"
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
     assert route.calls.last.request.headers["x-mirasim-session"] == "count-session"
     assert route.calls.last.request.url.query == b"beta=true"
@@ -536,6 +556,21 @@ async def test_account_limits(client, state, auth_headers):
 
 
 @respx.mock
+async def test_model_catalog_exposes_configured_default(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    respx.get(RELAY_BASE + "/v1/models").mock(return_value=httpx.Response(200, json={
+        "data": [{"id": "claude-fable-5"}, {"id": "gpt-5.6-luna"}],
+    }))
+
+    response = await client.get("/v1/models", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["models"] == ["claude-fable-5", "gpt-5.6-luna"]
+    assert response.json()["default_model"] == "gpt-5.6-luna"
+
+
+@respx.mock
 async def test_status_probe_uses_zero_cost_limits_instead_of_messages(
         client, state, auth_headers):
     add_account(state, "work")
@@ -571,7 +606,7 @@ async def test_model_scan_sends_minimal_work_with_session_not_probe(state):
 
     result = await state.accounts.scan_models("work", max_models=1)
 
-    assert result == [{"model": "claude-sonnet-5", "accepted": True}]
+    assert result == [{"model": "gpt-5.6-luna", "accepted": True}]
     sent = route.calls.last.request
     assert json.loads(sent.content)["max_tokens"] == 2
     assert sent.headers["x-mirasim-session"].startswith("mirofish_")

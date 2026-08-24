@@ -38,7 +38,7 @@ class Settings:
     mirasim_client_version: str = "0.0.220"
     mirasim_locale: str = "zh-HK"
     keychain_service: str = "open-reverselab.mirofish-relay"
-    default_model: str = "claude-haiku-4-5-20251001"
+    default_model: str = "gpt-5.6-luna"
     data_dir: pathlib.Path = field(default_factory=lambda: DEFAULT_DATA_DIR)
     timeout: float = 30.0
     max_body_bytes: int = 8 * 1024 * 1024
@@ -81,6 +81,9 @@ class Settings:
             cred_backend=os.environ.get("MIROFISH_CRED_BACKEND", "").lower(),
             in_docker=bool(os.environ.get("MIROFISH_IN_DOCKER")),
             default_account=os.environ.get("MIROFISH_DEFAULT_ACCOUNT", "").strip(),
+            default_model=(
+                os.environ.get("MIROFISH_DEFAULT_MODEL", "gpt-5.6-luna").strip()
+                or "gpt-5.6-luna"),
             session_ttl=_env_float("MIROFISH_SESSION_TTL", 1800.0, minimum=60.0),
             proxy_refresh_seconds=_env_float("MIROFISH_PROXY_REFRESH_SECONDS", 600.0, minimum=30.0),
             proxy_fetch_timeout=_env_float("MIROFISH_PROXY_FETCH_TIMEOUT", 10.0, minimum=3.0),

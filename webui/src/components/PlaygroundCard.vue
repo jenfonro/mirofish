@@ -19,9 +19,17 @@ async function loadModels() {
   try {
     const extra: Record<string, string> = {};
     if (account.value) extra["X-Mirofish-Account"] = account.value;
-    const data = await api<{ models?: string[] }>("/v1/models", { headers: extra });
+    const data = await api<{ models?: string[]; default_model?: string }>(
+      "/v1/models",
+      { headers: extra },
+    );
     models.value = data.models || [];
-    if (!model.value && models.value.length) model.value = models.value[0];
+    if (!model.value || !models.value.includes(model.value)) {
+      const preferred = data.default_model;
+      model.value = preferred && models.value.includes(preferred)
+        ? preferred
+        : (models.value[0] || "");
+    }
     if (!models.value.length) toast("上游没有返回模型列表", "info");
   } catch (error: any) {
     toast(`加载模型失败：${error.message}`, "error");

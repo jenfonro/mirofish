@@ -169,7 +169,12 @@ WebUI 账号表的「活跃会话」列可实时看到每个账号正在服务�
       -H 'Content-Type: application/json' \
       -H 'X-Mirofish-Proxy-Key: <proxy-key>' \
       -H 'X-Mirofish-Account: main' \
-      -d '{"model":"claude-haiku-4-5-20251001","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"你好"}]}'
+      -d '{"model":"gpt-5.6-luna","max_tokens":128,"stream":true,"messages":[{"role":"user","content":"你好"}]}'
+
+OpenAI 兼容请求省略 `model` 时使用 `MIROFISH_DEFAULT_MODEL`（默认 `gpt-5.6-luna`）。上游模型容量会变化，
+`/v1/models` 的目录也不保证每个条目此刻都有可用后端；遇到 `no upstream available for model`
+时请切换到实际可调用的模型并在 `.env` 覆盖该变量。旧客户端发送
+`claude-haiku-4-5-20251001` 时会规范化为当前目录 ID `claude-haiku-4-5`。
 
 ## 从旧版（单文件 relay）升级
 

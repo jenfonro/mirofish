@@ -110,7 +110,7 @@ curl -N http://127.0.0.1:8787/v1/messages \
   -H 'Content-Type: application/json' \
   -H 'X-Mirofish-Proxy-Key: <proxy-key>' \
   -d '{
-    "model": "claude-haiku-4-5-20251001",
+    "model": "gpt-5.6-luna",
     "max_tokens": 128,
     "stream": true,
     "messages": [{"role": "user", "content": "你好"}]
@@ -124,7 +124,7 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer <proxy-key>' \
   -d '{
-    "model": "claude-haiku-4-5-20251001",
+    "model": "gpt-5.6-luna",
     "stream": true,
     "messages": [{"role": "user", "content": "你好"}]
   }'
@@ -137,6 +137,9 @@ X-Mirofish-Account: main
 ```
 
 未指定账号时，服务会按照默认账号、会话亲和和配额感知轮询规则自动选择账号。
+OpenAI 兼容请求省略 `model` 时使用 `MIROFISH_DEFAULT_MODEL`。旧客户端发送
+`claude-haiku-4-5-20251001` 时会规范化为 `claude-haiku-4-5`；`/v1/models` 中出现某个模型
+不代表上游此刻一定有后端容量，遇到 `no upstream available for model` 时请切换模型。
 
 ## 常用接口
 
@@ -161,6 +164,7 @@ X-Mirofish-Account: main
 | --- | --- | --- |
 | `MIROFISH_MASTER_KEY` | 无 | 加密凭证的主密钥，至少 16 字符 |
 | `MIROFISH_DEFAULT_ACCOUNT` | 空 | 强制使用的默认账号别名 |
+| `MIROFISH_DEFAULT_MODEL` | `gpt-5.6-luna` | OpenAI 兼容请求未提供模型时使用的上游模型 ID |
 | `MIROFISH_PROXY_SUBSCRIPTION_URL` | 空 | Mihomo 代理订阅地址 |
 | `MIROFISH_PROXY_REFRESH_SECONDS` | `600` | 代理池刷新间隔 |
 | `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点停用前的连续失败次数 |

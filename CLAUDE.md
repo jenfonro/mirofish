@@ -43,6 +43,9 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   must carry distinct route identities into the upstream connection/ticket caches; otherwise an
   existing HTTPS CONNECT tunnel can keep retries on the old exit after the selector changes.
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
+- Missing OpenAI-compatible model ids use `MIROFISH_DEFAULT_MODEL` (currently
+  `gpt-5.6-luna`). The legacy `claude-haiku-4-5-20251001` id is normalized to
+  `claude-haiku-4-5`; model catalog presence does not guarantee live upstream capacity.
 - Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts whose 7-day utilization is exhausted). Accounts disabled via
   the WebUI switch (`POST /api/accounts/{alias}/enabled`, `disabled` in metadata) are excluded
   from automatic selection and return 403 when requested explicitly. An upstream 429

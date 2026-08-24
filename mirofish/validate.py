@@ -12,6 +12,13 @@ ALIAS_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 EMAIL_RE = re.compile(r"[^@\s]+@[^@\s]+\.[^@\s]+")
 CODE_RE = re.compile(r"\d{6}")
 
+# Model ids exposed by the upstream can lose their dated Anthropic alias while
+# existing clients keep sending it. Keep compatibility aliases narrow and only
+# map ids whose canonical equivalent is unambiguous.
+MODEL_ALIASES = {
+    "claude-haiku-4-5-20251001": "claude-haiku-4-5",
+}
+
 
 def alias_value(value: str) -> str:
     value = value.strip()
@@ -54,7 +61,7 @@ def model_value(value: str) -> str:
     value = (value or "").strip()
     if not value or len(value) > 200 or any(ch in value for ch in "\r\n\0"):
         raise RelayError("invalid model name", 400)
-    return value
+    return MODEL_ALIASES.get(value, value)
 
 
 def proxy_subscription_value(value: str) -> str:

@@ -12,6 +12,7 @@ from ..errors import RelayError
 from ..translate import (OpenAIStreamTranslator, anthropic_to_openai_response,
                          iter_sse_events, openai_to_anthropic)
 from ..upstream import quota_headers
+from ..validate import model_value
 from .deps import get_state, read_json_body, require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -28,9 +29,10 @@ async def chat_completions(request: Request) -> Any:
     payload = await read_json_body(request)
     session_hint = request.headers.get("X-Mirofish-Session", "")
     requested = request.headers.get("X-Mirofish-Account", "")
-    relay_session = state.relay_session_id("", session_hint, payload)
     if not payload.get("model"):
         payload["model"] = state.settings.default_model
+    payload["model"] = model_value(str(payload["model"]))
+    relay_session = state.relay_session_id("", session_hint, payload)
     anthropic_payload = openai_to_anthropic(payload)
     model = str(payload.get("model"))
 

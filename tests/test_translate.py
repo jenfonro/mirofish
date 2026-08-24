@@ -16,6 +16,7 @@ def test_system_and_params():
             {"role": "user", "content": "hi"},
         ],
     })
+    assert out["model"] == "claude-haiku-4-5"
     assert out["system"] == "You are terse."
     assert out["max_tokens"] == 128
     # The upstream accepts only temperature == 1 and rejects top_p outright,
