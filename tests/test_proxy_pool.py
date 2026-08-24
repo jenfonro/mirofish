@@ -308,3 +308,31 @@ def test_node_exclude_filters_mihomo_group_names(mihomo_state):
         ["🇭🇰 香港-01", "HK-Central-02", "🇯🇵 日本-01", "SG-Marina-03"])
     names = {config["name"] for config in configs.values()}
     assert names == {"🇯🇵 日本-01", "SG-Marina-03"}
+
+
+def test_store_nodes_prunes_stale_rows_but_keeps_pinned(mihomo_state):
+    """Provider renames and subscription switches must not accumulate dead
+    rows forever; a node an account is still pinned to survives the prune."""
+    state = mihomo_state
+    add_account(state, "acct")
+
+    old = state.pool._configs_from_names(["old-a", "old-b", "old-c"])
+    state.pool._store_nodes(old, skipped=0)
+    pinned_id = next(iter(old))
+    state.store.set_account_proxy("acct", pinned_id)
+
+    new = state.pool._configs_from_names(["new-a", "new-b"])
+    state.pool._store_nodes(new, skipped=0)
+
+    rows = {str(row["proxy_id"]): row for row in state.store.proxy_rows()}
+    # Current set active, pinned old node kept (inactive), the rest deleted.
+    assert set(rows) == set(new) | {pinned_id}
+    assert all(bool(rows[proxy_id]["active"]) for proxy_id in new)
+    assert not bool(rows[pinned_id]["active"])
+    assert set(state.pool.configs) == set(new) | {pinned_id}
+
+    # Once the account moves on, the next refresh drops the leftover too.
+    state.store.set_account_proxy("acct", next(iter(new)))
+    state.pool._store_nodes(new, skipped=0)
+    assert {str(row["proxy_id"]) for row in state.store.proxy_rows()} == set(new)
+    assert set(state.pool.configs) == set(new)

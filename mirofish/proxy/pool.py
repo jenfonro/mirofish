@@ -91,12 +91,19 @@ class ProxyPool:
         return url
 
     def _store_nodes(self, configs: dict[str, dict[str, Any]], skipped: int) -> None:
-        merged = dict(self.configs)
+        # Keep only the current set plus nodes an account is still pinned to
+        # (the pin resolves on its next rotate). Without the prune, every
+        # provider rename and subscription switch left its whole node set
+        # behind in SQLite and the encrypted config vault forever.
+        referenced = self.store.account_proxy_ids()
+        merged = {proxy_id: config for proxy_id, config in self.configs.items()
+                  if proxy_id in referenced}
         merged.update(configs)
         self.store.save_proxy_configs(merged)
         self.store.deactivate_proxies()
         for proxy_id, config in configs.items():
             self.store.upsert_proxy(proxy_id, config, active=True)
+        self.store.prune_proxies(keep=set(merged))
         self.configs = merged
         self.skipped_nodes = skipped
         self.last_refresh = time.time()

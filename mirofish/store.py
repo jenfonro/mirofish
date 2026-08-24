@@ -203,6 +203,27 @@ class Store:
     def save_proxy_configs(self, configs: dict[str, dict[str, Any]]) -> None:
         self.vault.put(PROXY_POOL_ALIAS, "configs", json.dumps(configs, ensure_ascii=False))
 
+    def account_proxy_ids(self) -> set[str]:
+        """Proxy ids some account is currently pinned to."""
+        with self.db_lock:
+            rows = self.db.execute(
+                "SELECT DISTINCT proxy_id FROM accounts WHERE proxy_id IS NOT NULL").fetchall()
+        return {str(row[0]) for row in rows}
+
+    def prune_proxies(self, keep: set[str]) -> int:
+        """Delete proxy rows outside `keep`. Provider auto-updates rename every
+        node and subscription switches replace the set wholesale, so rows that
+        are neither current nor pinned by an account are dead weight."""
+        with self.db_lock:
+            existing = [str(row[0]) for row in
+                        self.db.execute("SELECT proxy_id FROM proxies").fetchall()]
+            stale = [proxy_id for proxy_id in existing if proxy_id not in keep]
+            for proxy_id in stale:
+                self.db.execute("DELETE FROM proxies WHERE proxy_id=?", (proxy_id,))
+            if stale:
+                self.db.commit()
+        return len(stale)
+
     def set_account_proxy(self, alias: str, proxy_id: Optional[str]) -> None:
         with self.db_lock:
             self.db.execute("UPDATE accounts SET proxy_id=?,updated_at=? WHERE alias=?",

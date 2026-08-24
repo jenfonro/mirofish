@@ -78,7 +78,7 @@ async function refresh() {
         上次刷新出错：{{ store.proxies.last_error }}
       </p>
       <p class="muted" style="margin-top: 0">
-        每个账号固定绑定一个节点，只在节点网络失败时轮换。
+        每个账号固定绑定一个节点；节点网络失败或上游拒绝该账号的出口区域时自动轮换。
         上次刷新：{{ formatTime(store.proxies?.last_refresh ?? null) }}
         <template v-if="store.proxies?.skipped_nodes">
           · 跳过 {{ store.proxies.skipped_nodes }} 个不支持的节点
@@ -87,8 +87,8 @@ async function refresh() {
 
       <template v-if="isMihomo">
         <p class="muted">
-          Mihomo 模式的订阅来自 .env（SS/VMess/VLESS/Trojan 等协议由 sidecar 处理）。
-          修改订阅后重新 <code>docker compose up -d</code> 即可。
+          Mihomo 模式的订阅来自 .env（SS/VMess/VLESS/Trojan 等协议由容器内置的 Mihomo 引擎处理）。
+          修改订阅或节点排除规则后重新 <code>docker compose up -d --force-recreate</code> 即可。
         </p>
       </template>
       <template v-else>
