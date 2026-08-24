@@ -20,8 +20,8 @@ sidecar 与 init 容器。
 
     http://127.0.0.1:8787/
 
-首次启动的容器日志会打印本地代理密钥（只显示一次）。密钥也保存在数据卷
-`/data/proxy.key`（compose 服务名为 `mirofish`）：
+为避免 bearer 密钥进入 `docker logs` 或外部日志平台，容器不会打印完整代理密钥。
+密钥保存在权限为 `0600` 的数据卷文件 `/data/proxy.key`（compose 服务名为 `mirofish`）：
 
     docker compose exec mirofish cat /data/proxy.key
 
@@ -105,7 +105,7 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
 
     GET    /health
     GET    /accounts
-    GET    /accounts/<alias>/status[?probe=1]   # probe=1 发送 1-token 探测，计费
+    GET    /accounts/<alias>/status[?probe=1]   # probe=1 同时读取 /v1/limits，不产生模型调用
     GET    /accounts/<alias>/limits    # 单账号用量额度窗口（上游 /v1/limits，不计费）
     GET    /api/limits                 # 全部账号并发拉取用量额度（不计费）
     GET    /proxies
@@ -157,5 +157,6 @@ WebUI 账号表的「活跃会话」列可实时看到每个账号正在服务�
 - `/v1/models` 和模型请求会先申请设备 ticket；如果升级上游协议，可通过
   `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识，通过
   `MIROFISH_MIRASIM_LOCALE` 覆盖默认的 `zh-HK` locale。
-- probe / 模型扫描会产生真实计费的上游调用，仅在明确操作时才会发送。
+- `status?probe=1` 使用 `/v1/limits`，不产生模型调用；显式模型扫描会发送最小工作请求，
+  可能消耗少量额度。
 - 删除账号只清除本地凭证，不注销远端账号。

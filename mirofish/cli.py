@@ -37,11 +37,11 @@ def make_parser() -> argparse.ArgumentParser:
     status = commands.add_parser("status", help="刷新账号套餐和配额状态")
     status.add_argument("alias")
     status.add_argument("--probe", action="store_true",
-                        help="发送一次 1-token 探测，会产生模型调用")
+                        help="同时读取 /v1/limits 用量额度，不产生模型调用")
     models = commands.add_parser("models", help="探测 relay 支持的模型列表")
     models.add_argument("alias")
     models.add_argument("--scan", action="store_true",
-                        help="额外用 1-token 探测候选模型名；会产生少量模型调用费用")
+                        help="额外用最小工作请求扫描候选模型；会产生少量模型调用费用")
     models.add_argument("--max-scan", type=int, default=0,
                         help="--scan 时最多探测的候选模型数（默认全部）")
     remove = commands.add_parser("remove", help="删除本地账号及凭证")
@@ -59,6 +59,12 @@ def make_parser() -> argparse.ArgumentParser:
 
 def _print(value: Any) -> None:
     print(json.dumps(value, ensure_ascii=False, indent=2))
+
+
+def _proxy_key_notice(state: AppState) -> str:
+    """Safe startup notice: never place the bearer secret in process logs."""
+    return ("本地代理密钥已加载；完整值不会写入日志。默认密钥文件："
+            + str(state.store.proxy_key_path))
 
 
 async def _cmd_add(state: AppState, alias: str, email: str) -> None:
@@ -130,7 +136,7 @@ def main() -> int:
                 import uvicorn
                 app = create_app(state)
                 print(f"中转地址：http://{args.host}:{args.port}")
-                print("本地代理密钥（仅显示一次）：" + state.proxy_key)
+                print(_proxy_key_notice(state))
                 print("账号选择头：X-Mirofish-Account")
                 uvicorn.run(app, host=args.host, port=args.port, log_level="info")
         finally:

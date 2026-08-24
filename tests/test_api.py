@@ -536,6 +536,49 @@ async def test_account_limits(client, state, auth_headers):
 
 
 @respx.mock
+async def test_status_probe_uses_zero_cost_limits_instead_of_messages(
+        client, state, auth_headers):
+    add_account(state, "work")
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "u-work", "email": "work@example.com"}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={"current_plan": "pro"}))
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(200, json={"tenant": "t1"}))
+    mock_device_session()
+    limits = respx.get(RELAY_BASE + "/v1/limits").mock(
+        return_value=httpx.Response(200, json=LIMITS_RESPONSE))
+    messages = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(500, json={"error": {"message": "must not run"}}))
+
+    response = await client.get("/accounts/work/status?probe=1", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["limits"]["windows"]
+    assert limits.call_count == 1
+    assert messages.call_count == 0
+    metadata = json.loads(state.store.row("work")["metadata_json"])
+    assert float(metadata["quota"]["7d_utilization"]) == pytest.approx(
+        13621.348735 / 74560)
+
+
+@respx.mock
+async def test_model_scan_sends_minimal_work_with_session_not_probe(state):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+
+    result = await state.accounts.scan_models("work", max_models=1)
+
+    assert result == [{"model": "claude-sonnet-5", "accepted": True}]
+    sent = route.calls.last.request
+    assert json.loads(sent.content)["max_tokens"] == 2
+    assert sent.headers["x-mirasim-session"].startswith("mirofish_")
+    assert "x-mirasim-probe" not in sent.headers
+
+
+@respx.mock
 async def test_all_limits_survives_one_failure(client, state, auth_headers):
     add_account(state, "alpha")
     add_account(state, "beta")

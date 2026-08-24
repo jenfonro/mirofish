@@ -78,7 +78,8 @@ docker compose logs -f mirofish-relay
 - Validate aliases, email addresses, verification codes, model names, request sizes, and JSON payloads at trust boundaries (`mirofish/validate.py`).
 - Maintain both credential backends when changing credential persistence, and keep the v1 file-vault migration path working.
 - Keep SQLite limited to metadata and usage logs. Credentials belong in Keychain or the encrypted file vault.
-- Treat probe and model-scan operations as billable upstream requests and document that behavior.
+- Status probes use zero-cost `/v1/limits`; treat explicit model scans as billable upstream
+  requests and document that behavior.
 - Proxy subscription URLs and node credentials must not enter source control; SQLite stores only proxy metadata and account-to-node IDs. Docker writes Mihomo's runtime config and provider cache under `/data/mihomo/` on the data volume.
 - Preserve the explicit-account, default-account, then round-robin selection order.
 - `proxy_identity()` hashing must stay byte-compatible with stored assignments; changing it orphans existing account-to-node bindings.
@@ -105,4 +106,6 @@ For container-related changes, build the deployment:
 docker compose -f deploy/mirofish-relay/docker-compose.yml build
 ```
 
-Avoid live login, probe, scan, or model requests during routine validation unless explicitly requested, because they contact upstream services and probe operations may consume account quota. The pytest suite mocks all upstream calls.
+Avoid live login, model-scan, or model requests during routine validation unless explicitly
+requested. Status probes use `/v1/limits` and are zero-cost, but still contact upstream. The pytest
+suite mocks all upstream calls.

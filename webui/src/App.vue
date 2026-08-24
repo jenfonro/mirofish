@@ -99,12 +99,13 @@ onMounted(async () => {
     <div class="card gate-card">
       <h2>连接本地中转</h2>
       <p class="muted">
-        输入启动时打印的本地代理密钥（Proxy Key）。密钥仅保存在浏览器
-        localStorage，用于调用本机管理 API。
+        输入数据目录 <span class="mono">proxy.key</span> 中的本地代理密钥。
+        Docker 部署可运行 <span class="mono">docker compose exec mirofish cat /data/proxy.key</span>
+        获取；密钥仅保存在浏览器 localStorage，用于调用管理 API。
       </p>
       <label>X-Mirofish-Proxy-Key</label>
       <input v-model="keyInput" type="password" autocomplete="off"
-             placeholder="启动日志中的 Proxy Key" @keyup.enter="submitKey" />
+             placeholder="proxy.key 中的 Proxy Key" @keyup.enter="submitKey" />
       <p v-if="keyError" class="gate-error">{{ keyError }}</p>
       <div class="row" style="margin-top: 14px">
         <button :disabled="store.checking || !keyInput.trim()" @click="submitKey">

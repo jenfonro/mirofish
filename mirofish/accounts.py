@@ -1,7 +1,7 @@
 """Account lifecycle: email-code login, status refresh, model catalog.
 
-Probe and model-scan operations send billable 1-token model requests against
-the account itself; they only run when explicitly requested.
+Status probes use the zero-cost /v1/limits endpoint. Explicit model scans send
+small, billable work requests and are only run when the caller asks for them.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ from typing import Any, Optional
 from .config import Settings
 from .errors import RelayError
 from .store import Store, utc_now
-from .upstream import Upstream, quota_headers
+from .upstream import Upstream
 from .validate import alias_value, code_value, email_value
 
 logger = logging.getLogger("mirofish.accounts")
@@ -199,22 +199,26 @@ class AccountService:
             alias, "GET", base, "/auth/referral", proxy_url=proxy_url)
         ten_status, _, tenant = await self.upstream.authed_json(
             alias, "GET", self.settings.relay_base, "/me/tenant", proxy_url=proxy_url)
-        if ref_status < 200 or ref_status >= 300 or ten_status < 200 or ten_status >= 300:
-            raise RelayError("account status check failed", 502)
+        if ref_status < 200 or ref_status >= 300:
+            raise RelayError("account referral check failed", ref_status, referral)
+        if ten_status < 200 or ten_status >= 300:
+            raise RelayError("account tenant check failed", ten_status, tenant)
+        if not isinstance(me, dict) or not isinstance(referral, dict) \
+                or not isinstance(tenant, dict):
+            raise RelayError("account status response is malformed", 502)
         old = json.loads(row["metadata_json"])
         metadata = {"user_id": me.get("id"), "email": me.get("email", row["email"]),
                     "plan": referral.get("current_plan"), "tenant": tenant.get("tenant"),
                     "referral": referral, "tenant_response": tenant,
                     "quota": old.get("quota", {}), "last_usage": old.get("last_usage", {}),
                     "last_model": old.get("last_model"), "checked_at": utc_now()}
-        if probe:
-            result, headers = await self.upstream.messages(alias, {
-                "model": self.settings.default_model, "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}],
-            }, proxy_url=proxy_url, probe=True)
-            metadata["last_usage"] = result.get("usage", {}) if isinstance(result, dict) else {}
-            metadata["quota"] = quota_headers(headers)
         self.store.update_metadata(alias, metadata)
+        if probe:
+            # Keep the legacy query flag/CLI option, but use the upstream's
+            # supported zero-cost availability source instead of a synthetic
+            # one-token Messages request (which is now explicitly rejected).
+            await self.fetch_limits(alias, proxy_url=proxy_url)
+            return public_status(self.store.row(alias))
         return public_status(self.store.row(alias), metadata)
 
     # --- usage limits --------------------------------------------------------
@@ -237,6 +241,14 @@ class AccountService:
         metadata = json.loads(row["metadata_json"])
         metadata["limits"] = limits
         metadata["limits_checked_at"] = utc_now()
+        seven_day = next((window for window in limits["windows"]
+                          if window["name"] == "7d"), None)
+        if seven_day and seven_day["budget"] > 0:
+            quota = dict(metadata.get("quota", {}))
+            quota["7d_utilization"] = str(seven_day["used"] / seven_day["budget"])
+            if seven_day.get("reset_at") is not None:
+                quota["7d_reset_epoch"] = str(seven_day["reset_at"])
+            metadata["quota"] = quota
         self.store.update_metadata(alias, metadata)
         return limits
 
@@ -266,15 +278,17 @@ class AccountService:
 
     async def scan_models(self, alias: str, max_models: int = 0,
                           proxy_url: Optional[str] = None) -> list[dict[str, Any]]:
-        """1-token probes over a short candidate list; each accepted probe is billable."""
+        """Minimal work requests over candidate models; accepted calls are billable."""
         candidates = SCAN_CANDIDATES[:max_models] if max_models else SCAN_CANDIDATES
         results: list[dict[str, Any]] = []
         for model in candidates:
-            payload = {"model": model, "max_tokens": 1,
-                       "messages": [{"role": "user", "content": "hi"}]}
+            payload = {"model": model, "max_tokens": 2,
+                       "messages": [{"role": "user", "content": "Reply OK"}]}
             try:
-                await self.upstream.messages(
-                    alias, payload, proxy_url=proxy_url, probe=True)
+                # This is real work, not an availability probe: carry normal
+                # session metadata so the upstream does not reject it as a
+                # deprecated one-token probe.
+                await self.upstream.messages(alias, payload, proxy_url=proxy_url)
                 results.append({"model": model, "accepted": True})
             except RelayError as exc:
                 results.append({"model": model, "accepted": False, "status": exc.status})

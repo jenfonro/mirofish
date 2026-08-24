@@ -124,6 +124,50 @@ async def test_region_blocked_node_is_rotated_away(mihomo_state):
 
 
 @respx.mock
+async def test_tenant_profile_region_refusal_rotates_and_refreshes_status(mihomo_state):
+    """Generic /me/tenant 429s must carry the same rotatable region marker."""
+    state = mihomo_state
+    add_account(state, "acct")
+    names = ["node-a", "node-b"]
+
+    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
+        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
+    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
+        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
+    respx.put(url__regex=rf"{CTRL}/proxies/MirofishSlot\d+").mock(
+        return_value=httpx.Response(204))
+
+    configs = state.pool._configs_from_names(names)
+    state.pool._store_nodes(configs, skipped=0)
+    blocked_id = next(iter(configs))
+    state.store.set_account_proxy("acct", blocked_id)
+
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "u-acct", "email": "acct@example.com"}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={"current_plan": "pro"}))
+    tenant = respx.get(RELAY_BASE + "/me/tenant").mock(side_effect=[
+        httpx.Response(429, json={
+            "error": {
+                "type": "shared_quota_unavailable",
+                "message": "The cloud route is not served to this network region.",
+            },
+        }),
+        httpx.Response(200, json={"tenant": "tenant-ok"}),
+    ])
+
+    result = await state.with_proxy(
+        "acct", lambda url: state.accounts.fetch_status("acct", proxy_url=url))
+
+    assert result["tenant"] == "tenant-ok"
+    assert tenant.call_count == 2
+    assert str(state.store.row("acct")["proxy_id"]) != blocked_id
+    failed = next(row for row in state.store.proxy_rows()
+                  if str(row["proxy_id"]) == blocked_id)
+    assert int(failed["failure_count"]) > 0
+
+
+@respx.mock
 async def test_region_rotation_walks_past_four_nodes(mihomo_state):
     """The old four-attempt cap could miss a served exit later in the pool."""
     state = mihomo_state

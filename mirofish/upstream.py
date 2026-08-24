@@ -246,7 +246,16 @@ class Upstream:
             raise RelayError("upstream network error", 502,
                              {"proxy_network": bool(proxy_url),
                               "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
-        return response.status_code, _lower_headers(response), _parse_body(response)
+        data = _parse_body(response)
+        blocked = _region_block_error(response.status_code, data, proxy_url)
+        if blocked is not None:
+            # Generic authenticated calls such as /me/tenant use this path too.
+            # Preserve the rotatable marker so AppState can abandon the exit
+            # instead of collapsing the upstream 429 into an opaque 502.
+            logger.warning("upstream refused exit region: path=%s %s",
+                           path, _rejection_detail(data))
+            raise blocked
+        return response.status_code, _lower_headers(response), data
 
     # --- token refresh (single-flight per alias) ------------------------------
 

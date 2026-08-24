@@ -24,7 +24,7 @@ async function refreshStatus(alias: string, probe = false) {
   try {
     await api(`/accounts/${alias}/status${probe ? "?probe=1" : ""}`);
     await loadAccounts();
-    toast(probe ? `已探测 ${alias}（消耗 1 token）` : `已刷新 ${alias}`, "ok");
+    toast(probe ? `已刷新 ${alias} 的资料与额度（零模型调用）` : `已刷新 ${alias}`, "ok");
   } catch (error: any) {
     toast(`刷新 ${alias} 失败：${error.message}`, "error");
   } finally {
@@ -108,8 +108,8 @@ async function removeAccount(alias: string) {
               <button class="ghost small" :disabled="busy === account.alias"
                       @click="refreshStatus(account.alias)">刷新</button>
               <button class="ghost small" :disabled="busy === account.alias"
-                      title="发送一次 1-token 探测，更新配额；会产生模型调用"
-                      @click="refreshStatus(account.alias, true)">探测</button>
+                      title="通过 /v1/limits 刷新账号资料与额度；不产生模型调用"
+                      @click="refreshStatus(account.alias, true)">资料+额度</button>
               <button class="danger small" @click="removeAccount(account.alias)">删除</button>
             </td>
           </tr>
