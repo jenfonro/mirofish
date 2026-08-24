@@ -31,6 +31,13 @@ from .mihomo import MihomoClient, SlotManager
 from .parse import parse_proxy_subscription, proxy_from_uri, proxy_identity, proxy_url
 
 
+# How long an account remembers "this exit's region is refused for me". Whether
+# a region is served depends on the account's upstream tier (plus accounts keep
+# working through exits that shared-tier accounts are refused from), so the
+# memory is per account and must never count against the node globally.
+REGION_REFUSAL_TTL = 1800.0
+
+
 class ProxyPool:
     def __init__(self, store: Store, settings: Settings) -> None:
         self.store = store
@@ -55,6 +62,8 @@ class ProxyPool:
         self.last_attempt = 0.0
         self.last_error = ""
         self.skipped_nodes = 0
+        # alias -> node_id -> expiry epoch of a per-account region refusal.
+        self._region_refused: dict[str, dict[str, float]] = {}
 
     @property
     def uses_mihomo(self) -> bool:
@@ -235,11 +244,30 @@ class ProxyPool:
         config = self.configs.get(str(row["proxy_id"]))
         return dict(config) if isinstance(config, dict) else None
 
+    def _refused_ids(self, alias: str) -> set[str]:
+        """Node ids this account was region-refused from, pruned by TTL."""
+        entries = self._region_refused.get(alias)
+        if not entries:
+            return set()
+        now = time.time()
+        live = {node_id: until for node_id, until in entries.items() if until > now}
+        if live:
+            self._region_refused[alias] = live
+        else:
+            self._region_refused.pop(alias, None)
+        return set(live)
+
     def _select(self, alias: str, exclude: Optional[str] = None) -> dict[str, Any]:
+        refused = self._refused_ids(alias)
         rows = [row for row in self.store.proxy_rows(active_only=True)
-                if str(row["proxy_id"]) != (exclude or "") and int(row["failure_count"]) == 0
+                if str(row["proxy_id"]) != (exclude or "")
+                and str(row["proxy_id"]) not in refused
+                and int(row["failure_count"]) == 0
                 and self._config_for_row(row)]
         if not rows:
+            if refused:
+                raise RelayError("the upstream refuses every available exit region "
+                                 "for this account; retry later", 503)
             raise RelayError("proxy pool has no available node for this account", 503)
         counts = self.store.proxy_assignment_counts()
         rows.sort(key=lambda row: (counts.get(str(row["proxy_id"]), 0),
@@ -270,6 +298,8 @@ class ProxyPool:
             return None
         row = self.store.row(alias)
         current_id = str(row["proxy_id"] or "")
+        if current_id and current_id in self._refused_ids(alias):
+            current_id = ""
         if current_id:
             proxy_row = next((item for item in self.store.proxy_rows(active_only=True)
                               if str(item["proxy_id"]) == current_id
@@ -288,6 +318,25 @@ class ProxyPool:
         if not self.configured:
             return None
         config = self._select(alias, exclude=str(failed["id"]))
+        self.store.set_account_proxy(alias, str(config["id"]))
+        return config
+
+    def mark_region_refused(self, alias: str, refused: dict[str, Any]) -> None:
+        """The upstream refused this account from this exit's region. A property
+        of the (account, region) pair — other accounts may keep working through
+        the same node — so remember it per account and leave the node's global
+        health untouched."""
+        alias = alias_value(alias)
+        self._region_refused.setdefault(alias, {})[str(refused["id"])] = \
+            time.time() + REGION_REFUSAL_TTL
+        self.store.set_account_proxy(alias, None)
+
+    def rotate_region(self, alias: str, refused: dict[str, Any]) -> dict[str, Any]:
+        """Move the account to an exit it has not been region-refused from yet.
+        Raises 503 once every exit has refused it."""
+        alias = alias_value(alias)
+        self.mark_region_refused(alias, refused)
+        config = self._select(alias)
         self.store.set_account_proxy(alias, str(config["id"]))
         return config
 

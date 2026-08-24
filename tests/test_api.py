@@ -736,3 +736,23 @@ async def test_messages_surface_exhaustion_when_every_account_is_refused(
     assert response.status_code == 429
     assert response.json()["error"]["type"] == "credit_exhausted_shared"
     assert route.call_count == 2
+
+
+async def test_failover_covers_region_refused_everywhere(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    refused = RelayError(
+        "upstream does not serve this proxy exit region", 502,
+        {"region_blocked": True, "region_refused_everywhere": True})
+    served = []
+
+    async def run(account: str):
+        served.append(account)
+        if account == "alpha":
+            raise refused
+        return "ok"
+
+    account, result = await state.with_account_failover("", "", _conv("hello"), run)
+    assert (account, result) == ("beta", "ok")
+    assert served == ["alpha", "beta"]
+    assert state.exhausted_cooldown("alpha") > 0

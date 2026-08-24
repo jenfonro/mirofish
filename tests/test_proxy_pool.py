@@ -115,12 +115,13 @@ async def test_region_blocked_node_is_rotated_away(mihomo_state):
     assert await state.with_proxy("acct", op) == "ok"
     assert len(attempts) == 2
 
-    # The account moved off the blocked node, and the node carries the failure.
+    # The account moved off the refused node, remembers the refusal, and the
+    # node's global health is untouched (other tiers may be served through it).
     assert str(state.store.row("acct")["proxy_id"]) != blocked_id
-    failed = next(r for r in state.store.proxy_rows()
-                  if str(r["proxy_id"]) == blocked_id)
-    assert int(failed["failure_count"]) >= 1
-    assert "region" in str(failed["last_error"])
+    assert blocked_id in state.pool._refused_ids("acct")
+    refused = next(r for r in state.store.proxy_rows()
+                   if str(r["proxy_id"]) == blocked_id)
+    assert int(refused["failure_count"]) == 0
 
 
 @respx.mock
@@ -162,9 +163,10 @@ async def test_tenant_profile_region_refusal_rotates_and_refreshes_status(mihomo
     assert result["tenant"] == "tenant-ok"
     assert tenant.call_count == 2
     assert str(state.store.row("acct")["proxy_id"]) != blocked_id
-    failed = next(row for row in state.store.proxy_rows()
-                  if str(row["proxy_id"]) == blocked_id)
-    assert int(failed["failure_count"]) > 0
+    assert blocked_id in state.pool._refused_ids("acct")
+    refused = next(row for row in state.store.proxy_rows()
+                   if str(row["proxy_id"]) == blocked_id)
+    assert int(refused["failure_count"]) == 0
 
 
 @respx.mock
@@ -240,14 +242,20 @@ async def test_region_rotation_walks_past_four_nodes(mihomo_state):
 
     assert await state.with_proxy("acct", op) == "ok"
     assert len(attempts) == 5
-    rows = state.store.proxy_rows()
-    assert sum(int(row["failure_count"]) > 0 for row in rows) == 4
+    # The four refusals stay per-account memory; the pool itself is untouched.
+    assert all(int(row["failure_count"]) == 0 for row in state.store.proxy_rows())
+    assert len(state.pool._refused_ids("acct")) == 4
 
 
 @respx.mock
-async def test_last_region_blocked_node_is_quarantined(mihomo_state):
+async def test_region_refused_everywhere_cools_account_not_pool(mihomo_state):
+    """When every exit region refuses one account, the account (not the pool)
+    is taken out of service: other accounts keep their nodes, the refused
+    account cools down, and its immediate retries fail fast without another
+    node sweep."""
     state = mihomo_state
     add_account(state, "acct")
+    add_account(state, "other")
     names = ["node-a", "node-b"]
 
     respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
@@ -262,12 +270,30 @@ async def test_last_region_blocked_node_is_quarantined(mihomo_state):
     region_error = RelayError(
         "upstream does not serve this proxy exit region", 502,
         {"region_blocked": True, "upstream": "shared_quota_unavailable: ..."})
+    attempts = []
 
     async def op(_proxy_url):
+        attempts.append(_proxy_url)
         raise region_error
 
     with pytest.raises(RelayError) as raised:
         await state.with_proxy("acct", op)
     assert raised.value.data["region_blocked"] is True
-    assert all(int(row["failure_count"]) > 0 for row in state.store.proxy_rows())
+    assert raised.value.data["region_refused_everywhere"] is True
+    assert len(attempts) == 2  # one sweep: each exit tried exactly once
     assert state.store.row("acct")["proxy_id"] is None
+
+    # The pool stays healthy for everyone else.
+    assert all(int(row["failure_count"]) == 0 for row in state.store.proxy_rows())
+    assert await state.pool.for_account("other") is not None
+
+    # The error is account-scoped: selection cools the account down.
+    assert state.note_account_unserviceable("acct", raised.value) is True
+    assert state.exhausted_cooldown("acct") > 0
+
+    # An immediate retry fails fast instead of sweeping the pool again.
+    attempts.clear()
+    with pytest.raises(RelayError) as retried:
+        await state.with_proxy("acct", op)
+    assert retried.value.status == 503
+    assert attempts == []

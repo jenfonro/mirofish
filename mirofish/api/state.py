@@ -262,16 +262,29 @@ class AppState:
             for key in stale:
                 del self._sessions[key]
 
+    @staticmethod
+    def _is_region_refused_everywhere(exc: RelayError) -> bool:
+        """Every available exit region refused this account (flag set by
+        `_rotate_after_failure` once the per-account rotation ran out of
+        exits). Like a shared-quota refusal, this cannot be fixed by another
+        node — only by another account or by waiting."""
+        return (isinstance(exc.data, dict)
+                and exc.data.get("region_refused_everywhere") is True)
+
     def note_account_unserviceable(self, alias: str, exc: RelayError) -> bool:
-        """Record a shared-quota refusal so automatic selection avoids the
-        account for a while. Returns True when the error was that kind."""
-        if not self._is_account_exhausted(exc):
+        """Record an account-scoped upstream refusal so automatic selection
+        avoids the account for a while. Returns True when the error was one."""
+        if self._is_account_exhausted(exc):
+            reason = "shared-quota refusal"
+        elif self._is_region_refused_everywhere(exc):
+            reason = "region refusal from every exit"
+        else:
             return False
         self._exhausted_until[alias] = time.time() + SHARED_QUOTA_COOLDOWN
         self.drop_account_sessions(alias)
         logger.warning(
-            "account cooling down for %ds after shared-quota refusal: account=%s",
-            int(SHARED_QUOTA_COOLDOWN), alias)
+            "account cooling down for %ds after %s: account=%s",
+            int(SHARED_QUOTA_COOLDOWN), reason, alias)
         return True
 
     async def with_account_failover(
@@ -346,18 +359,44 @@ class AppState:
         return (exc.status == 502 and isinstance(exc.data, dict)
                 and exc.data.get("region_blocked") is True)
 
-    @classmethod
-    def _rotate_reason(cls, exc: RelayError) -> Optional[str]:
-        """Why this node should be abandoned, or None to propagate the error.
+    def _rotate_after_failure(self, alias: str, proxy: dict[str, Any],
+                              exc: RelayError,
+                              network_failures: int) -> Optional[dict[str, Any]]:
+        """Pick the next exit after a routed failure, or raise `exc`.
 
-        A region refusal is as fatal to a node as a network failure: the exit
-        stays unusable for every account until the upstream serves that region
-        again, so the account must not remain pinned to it."""
-        if cls._is_proxy_network_failure(exc):
-            return "proxy network failure"
-        if cls._is_region_blocked(exc):
-            return "upstream does not serve this exit region"
-        return None
+        A region refusal moves the account through exits it has not been
+        refused from yet — a per-account memory, never a global node failure,
+        because whether a region is served depends on the account's upstream
+        tier. Once every exit has refused the account, `exc` is annotated so
+        account-level failover treats the account as unserviceable. A network
+        failure keeps quarantining the node globally (a dead node is dead for
+        everyone), capped at MAX_NETWORK_PROXY_ATTEMPTS."""
+        if self._is_region_blocked(exc):
+            try:
+                return self.pool.rotate_region(alias, proxy)
+            except RelayError as rotate_exc:
+                if rotate_exc.status == 503:
+                    if isinstance(exc.data, dict):
+                        exc.data["region_refused_everywhere"] = True
+                    raise exc from rotate_exc
+                raise
+        if self._is_proxy_network_failure(exc):
+            if network_failures >= MAX_NETWORK_PROXY_ATTEMPTS:
+                # The final failed node must also be quarantined; otherwise
+                # the next request immediately starts on the same known-bad
+                # exit and repeats the rejection loop.
+                self.pool.fail(alias, proxy, "proxy network failure")
+                raise exc
+            try:
+                return self.pool.rotate(alias, proxy, "proxy network failure")
+            except RelayError as rotate_exc:
+                if rotate_exc.status == 503:
+                    # rotate() already recorded the final failed exit. Keep
+                    # the actionable upstream error instead of replacing it
+                    # with the pool's generic "no node" error.
+                    raise exc from rotate_exc
+                raise
+        raise exc
 
     async def with_proxy(self, alias: str,
                          op: Callable[[Optional[str]], Awaitable[Any]]) -> Any:
@@ -371,26 +410,11 @@ class AppState:
                 self.pool.success(proxy)
                 return result
             except RelayError as exc:
-                reason = self._rotate_reason(exc)
-                if not proxy or reason is None:
+                if not proxy:
                     raise
                 if self._is_proxy_network_failure(exc):
                     network_failures += 1
-                if network_failures >= MAX_NETWORK_PROXY_ATTEMPTS:
-                    # The final failed node must also be quarantined; otherwise
-                    # the next request immediately starts on the same known-bad
-                    # exit and repeats the rejection loop.
-                    self.pool.fail(alias, proxy, reason)
-                    raise
-                try:
-                    proxy = self.pool.rotate(alias, proxy, reason)
-                except RelayError as rotate_exc:
-                    if rotate_exc.status == 503:
-                        # rotate() already recorded the final failed exit. Keep
-                        # the actionable upstream error instead of replacing it
-                        # with the pool's generic "no node" error.
-                        raise exc from rotate_exc
-                    raise
+                proxy = self._rotate_after_failure(alias, proxy, exc, network_failures)
                 if proxy is None:
                     raise
 
@@ -420,11 +444,15 @@ class AppState:
                 self.pool.success(proxy)
                 return proxy, result
             except RelayError as exc:
-                retriable = (self._rotate_reason(exc) is not None
+                region = self._is_region_blocked(exc)
+                retriable = (region or self._is_proxy_network_failure(exc)
                              or self._is_non_api_response(exc))
                 if not retriable or attempt + 1 >= attempts:
                     raise
-                self.store.mark_proxy_failure(str(proxy["id"]), str(exc)[:200])
+                if region:
+                    self.pool.mark_region_refused(alias, proxy)
+                else:
+                    self.store.mark_proxy_failure(str(proxy["id"]), str(exc)[:200])
         raise RelayError("proxy request failed", 502)
 
     async def open_messages_stream(
@@ -454,20 +482,11 @@ class AppState:
                 return response, stack
             except RelayError as exc:
                 await stack.aclose()
-                reason = self._rotate_reason(exc)
-                if not proxy or reason is None:
+                if not proxy:
                     raise
                 if self._is_proxy_network_failure(exc):
                     network_failures += 1
-                if network_failures >= MAX_NETWORK_PROXY_ATTEMPTS:
-                    self.pool.fail(alias, proxy, reason)
-                    raise
-                try:
-                    proxy = self.pool.rotate(alias, proxy, reason)
-                except RelayError as rotate_exc:
-                    if rotate_exc.status == 503:
-                        raise exc from rotate_exc
-                    raise
+                proxy = self._rotate_after_failure(alias, proxy, exc, network_failures)
                 if proxy is None:
                     raise
             except BaseException:
