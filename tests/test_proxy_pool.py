@@ -168,6 +168,50 @@ async def test_tenant_profile_region_refusal_rotates_and_refreshes_status(mihomo
 
 
 @respx.mock
+async def test_shared_credit_exhaustion_does_not_rotate_proxy(mihomo_state):
+    """Account/shared quota errors are not properties of the proxy exit."""
+    state = mihomo_state
+    add_account(state, "acct")
+    names = ["node-a", "node-b"]
+
+    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
+        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
+    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
+        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
+    respx.put(url__regex=rf"{CTRL}/proxies/MirofishSlot\d+").mock(
+        return_value=httpx.Response(204))
+
+    configs = state.pool._configs_from_names(names)
+    state.pool._store_nodes(configs, skipped=0)
+    original_id = next(iter(configs))
+    state.store.set_account_proxy("acct", original_id)
+
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "u-acct", "email": "acct@example.com"}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={"current_plan": "free"}))
+    tenant = respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(429, json={
+            "error": {
+                "type": "credit_exhausted_shared",
+                "message": "The relay's shared quota is used up.",
+            },
+        }))
+
+    with pytest.raises(RelayError) as raised:
+        await state.with_proxy(
+            "acct", lambda url: state.accounts.fetch_status("acct", proxy_url=url))
+
+    assert raised.value.status == 429
+    assert raised.value.data["error"]["type"] == "credit_exhausted_shared"
+    assert tenant.call_count == 1
+    assert str(state.store.row("acct")["proxy_id"]) == original_id
+    original = next(row for row in state.store.proxy_rows()
+                    if str(row["proxy_id"]) == original_id)
+    assert int(original["failure_count"]) == 0
+
+
+@respx.mock
 async def test_region_rotation_walks_past_four_nodes(mihomo_state):
     """The old four-attempt cap could miss a served exit later in the pool."""
     state = mihomo_state

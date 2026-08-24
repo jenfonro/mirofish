@@ -34,7 +34,8 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   upstream 429 `shared_quota_unavailable` (the exit's region is not served — a node property,
   not an account one), and when a provider auto-update renames nodes so the stored assignment
   no longer exists (Mihomo answers 400; the pool resyncs immediately instead of waiting for
-  the refresh interval).
+  the refresh interval). Do not rotate on account/shared-quota errors such as
+  `credit_exhausted_shared`; those are not exit properties.
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
 - Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts whose 7-day utilization is exhausted). Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned the least-loaded eligible account so separate windows fan out. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the plain round-robin used for `/v1/models`.
 - WebUI is built by Vite into `mirofish/static/` and served by the relay; a fallback page with build instructions appears if it is missing.
