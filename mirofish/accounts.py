@@ -7,6 +7,7 @@ the account itself; they only run when explicitly requested.
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import time
 from typing import Any, Optional
@@ -17,9 +18,12 @@ from .store import Store, utc_now
 from .upstream import Upstream, quota_headers
 from .validate import alias_value, code_value, email_value
 
+logger = logging.getLogger("mirofish.accounts")
+
 SCAN_CANDIDATES = [
-    "claude-haiku-4-5-20251001",
+    "claude-sonnet-5",
     "claude-haiku-4-5",
+    "claude-haiku-4-5-20251001",
     "claude-sonnet-4-5-20250929",
     "claude-sonnet-4-5",
     "claude-opus-4-1-20250805",
@@ -40,6 +44,7 @@ def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
             "last_usage": metadata.get("last_usage", {}),
             "last_model": metadata.get("last_model"),
             "limits": metadata.get("limits"),
+            "profile_pending": bool(metadata.get("profile_pending")),
             "checked_at": metadata.get("checked_at"),
             "proxy": proxy}
 
@@ -123,21 +128,61 @@ class AccountService:
         if not isinstance(access, str) or not access \
                 or not isinstance(renewal, str) or not renewal:
             raise RelayError("upstream login response is missing tokens", 502)
-        s1, _, me = await self.upstream.json("GET", self.settings.auth_base, "/auth/me",
-                                             access=access, proxy_url=proxy_url)
-        s2, _, referral = await self.upstream.json("GET", self.settings.auth_base,
-                                                   "/auth/referral", access=access,
-                                                   proxy_url=proxy_url)
-        s3, _, tenant = await self.upstream.json("GET", self.settings.relay_base,
-                                                 "/me/tenant", access=access,
-                                                 proxy_url=proxy_url)
-        if any(s < 200 or s >= 300 for s in (s1, s2, s3)):
-            raise RelayError("could not verify account state", 502)
-        metadata = {"user_id": me.get("id"), "email": me.get("email", email),
-                    "plan": referral.get("current_plan"), "tenant": tenant.get("tenant"),
-                    "referral": referral, "tenant_response": tenant, "quota": {},
-                    "last_usage": {}, "checked_at": utc_now()}
+        # Verification codes are single-use. Persist the issued credentials
+        # before making the optional profile calls below: if one of those calls
+        # has a transient proxy/upstream failure, reporting 502 would prompt the
+        # caller to submit an already-consumed code and receive a misleading
+        # 401. A saved account can refresh its profile later without another
+        # login code.
+        metadata = {"user_id": None, "email": email, "plan": None, "tenant": None,
+                    "referral": {}, "tenant_response": {}, "quota": {},
+                    "last_usage": {}, "profile_pending": True,
+                    "checked_at": None}
         self.store.save(alias, email, access, renewal, metadata, proxy_id=proxy_id)
+
+        try:
+            s1, _, me = await self.upstream.json(
+                "GET", self.settings.auth_base, "/auth/me",
+                access=access, proxy_url=proxy_url)
+            s2, _, referral = await self.upstream.json(
+                "GET", self.settings.auth_base, "/auth/referral",
+                access=access, proxy_url=proxy_url)
+            s3, _, tenant = await self.upstream.json(
+                "GET", self.settings.relay_base, "/me/tenant",
+                access=access, proxy_url=proxy_url)
+        except RelayError as exc:
+            logger.warning(
+                "login credentials saved but profile lookup failed: account=%s status=%s",
+                alias, exc.status)
+            result = public_status(self.store.row(alias), metadata)
+            result["profile_pending"] = True
+            return result
+
+        profile_ok = (
+            all(200 <= status < 300 for status in (s1, s2, s3))
+            and isinstance(me, dict)
+            and isinstance(referral, dict)
+            and isinstance(tenant, dict)
+        )
+        if not profile_ok:
+            logger.warning(
+                "login credentials saved but profile lookup was rejected: "
+                "account=%s statuses=%s/%s/%s", alias, s1, s2, s3)
+            result = public_status(self.store.row(alias), metadata)
+            result["profile_pending"] = True
+            return result
+
+        metadata.update({
+            "user_id": me.get("id"),
+            "email": me.get("email", email),
+            "plan": referral.get("current_plan"),
+            "tenant": tenant.get("tenant"),
+            "referral": referral,
+            "tenant_response": tenant,
+            "profile_pending": False,
+            "checked_at": utc_now(),
+        })
+        self.store.update_metadata(alias, metadata)
         return public_status(self.store.row(alias), metadata)
 
     # --- status ------------------------------------------------------------
@@ -166,7 +211,7 @@ class AccountService:
             result, headers = await self.upstream.messages(alias, {
                 "model": self.settings.default_model, "max_tokens": 1,
                 "messages": [{"role": "user", "content": "hi"}],
-            }, proxy_url=proxy_url)
+            }, proxy_url=proxy_url, probe=True)
             metadata["last_usage"] = result.get("usage", {}) if isinstance(result, dict) else {}
             metadata["quota"] = quota_headers(headers)
         self.store.update_metadata(alias, metadata)
@@ -228,7 +273,8 @@ class AccountService:
             payload = {"model": model, "max_tokens": 1,
                        "messages": [{"role": "user", "content": "hi"}]}
             try:
-                await self.upstream.messages(alias, payload, proxy_url=proxy_url)
+                await self.upstream.messages(
+                    alias, payload, proxy_url=proxy_url, probe=True)
                 results.append({"model": model, "accepted": True})
             except RelayError as exc:
                 results.append({"model": model, "accepted": False, "status": exc.status})

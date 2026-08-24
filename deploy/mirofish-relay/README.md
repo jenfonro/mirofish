@@ -45,7 +45,9 @@ sidecar 与 init 容器。
 
 模型 relay 还要求设备签名：每个本地账号首次发起模型请求时生成一个 Ed25519 设备密钥，
 用它申请约 15 分钟的 device ticket，并为每个请求生成 `mrs-sig-v1` 签名。私钥与账号
-token 一样只进入加密凭证存储，不写入 SQLite 或日志。
+token 一样只进入加密凭证存储，不写入 SQLite 或日志。当前默认客户端标识为抓包确认的
+`0.0.220`。Anthropic 请求会保留 `?beta=true` 与白名单内的 Claude SDK 特征头；查询串不会
+错误地并入签名，调用方的 `Authorization` / `X-Api-Key` 也绝不会转发给上游。
 
 ## 代理池
 
@@ -56,7 +58,15 @@ Hysteria、TUIC 等 Mihomo 支持的节点都可以使用。配置与 provider �
 
 订阅地址由 `.env` 的 `MIROFISH_PROXY_SUBSCRIPTION_URL` 配置；它优先于 WebUI 曾保存的地址。
 服务会定期读取 Mihomo 的节点列表，并把每个账号选中的节点 ID 写入 SQLite，因此同一账号会持续
-使用同一个出口节点；节点网络失败时才切换到下一个节点。
+使用同一个出口节点。出现下面三种情况才切换节点，并把该节点标记为失败（累计到
+`MIROFISH_PROXY_FAILURE_THRESHOLD` 次后停用）：
+
+- **节点网络失败**：连接超时、拒绝等传输层错误。
+- **上游不服务该出口区域**：上游返回 429 `shared_quota_unavailable`（「云端中转未在当前网络
+  区域提供服务」）。区域可用性是节点属性而非账号属性，因此换到被服务区域的节点即可恢复；
+  否则账号会永久卡在这个节点上。
+- **节点在订阅更新后消失**：Mihomo 的 provider 自动更新会重命名全部节点，此时切换选择器会被
+  控制器以 400 拒绝。服务会立即重新同步节点列表并重新绑定，不必等到下一次定时刷新。
 
 ### 多槽位并发出口
 
@@ -103,10 +113,16 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
     POST   /v1/messages              # Anthropic Messages；"stream":true 为真 SSE 透传
     POST   /v1/messages/count_tokens # Anthropic token 计数（转发上游，不计费；失败则本地估算）
     POST   /v1/chat/completions      # OpenAI 兼容；支持 tools/图片/流式
+                                     # 注意：上游以 thinking 模式服务，仅接受 temperature=1
+                                     # 且不接受 top_p；其他采样参数会被自动丢弃而非转发
     POST   /api/login/start          # {"alias","email"} 发送验证码
     POST   /api/login/finish         # {"alias","code"} 完成登录
     DELETE /api/accounts/<alias>     # 删除本地账号及凭证
     GET    /api/usage?hours=24       # 用量统计（按小时 × 账号聚合）
+
+验证码一旦验证成功，access/refresh token 会先写入加密存储，再读取套餐、租户等展示资料。
+如果后续资料接口临时失败，`/api/login/finish` 仍返回成功并标记 `profile_pending=true`；这样不会因
+重复提交已经消费的验证码而出现先 502、后 401。稍后在账号列表点击「刷新」即可补齐资料。
 
 账号选择顺序：请求头 `X-Mirofish-Account` > `MIROFISH_DEFAULT_ACCOUNT` > **会话亲和** > 轮询
 （轮询会自动跳过 7 天配额利用率已达 100% 的账号）。响应头返回
@@ -139,6 +155,7 @@ WebUI 账号表的「活跃会话」列可实时看到每个账号正在服务�
   `127.0.0.1:8787:8787`。
 - Mirofish 没有精确余额接口；WebUI 显示 plan、用量日志与 relay 返回的 7 天配额利用率。
 - `/v1/models` 和模型请求会先申请设备 ticket；如果升级上游协议，可通过
-  `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识。
+  `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识，通过
+  `MIROFISH_MIRASIM_LOCALE` 覆盖默认的 `zh-HK` locale。
 - probe / 模型扫描会产生真实计费的上游调用，仅在明确操作时才会发送。
 - 删除账号只清除本地凭证，不注销远端账号。

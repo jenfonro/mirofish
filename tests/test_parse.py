@@ -74,3 +74,31 @@ def test_proxy_url_quoting():
     config = {"scheme": "socks5", "host": "h.example.com", "port": 1080,
               "username": "u@x", "password": "p:w"}
     assert proxy_url(config) == "socks5://u%40x:p%3Aw@h.example.com:1080"
+
+
+def test_payload_summary_redacts_content():
+    from mirofish.upstream import _payload_summary, _rejection_detail
+
+    payload = {
+        "model": "claude-fable-5", "max_tokens": 4096, "temperature": 1.3,
+        "system": "TOP SECRET SYSTEM PROMPT",
+        "messages": [
+            {"role": "user", "content": "my secret question"},
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": [
+                {"type": "text", "text": "hidden text"},
+                {"type": "tool_result", "tool_use_id": "call_1", "content": "42"},
+            ]},
+        ],
+    }
+    summary = _payload_summary(payload)
+    for secret in ("SECRET", "secret question", "hidden text", "42"):
+        assert secret not in summary
+    assert "model=claude-fable-5" in summary
+    assert "temperature=1.3" in summary
+    assert "assistant:EMPTY" in summary
+    assert "tool_result" in summary
+
+    detail = _rejection_detail({"error": {"type": "invalid_request_error",
+                                          "message": "The request was rejected as invalid."}})
+    assert detail == "invalid_request_error: The request was rejected as invalid."

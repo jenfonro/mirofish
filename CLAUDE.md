@@ -30,7 +30,11 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   `mrs-sig-v1` signatures over the exact request body; the private key lives in the encrypted vault.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
 - Docker runs a single container: `docker-entrypoint.sh` generates the Mihomo config and starts the bundled Mihomo engine (skipped when no subscription is set), then starts the relay; the relay reaches the engine over loopback (`127.0.0.1:9090`/`7890`). If either process exits the container restarts. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Configs without slots fall back to the legacy single-selector mode automatically. Mihomo config + provider cache live under `/data/mihomo/`.
-- Each account binds persistently to one proxy node, rotating only after proxy network failure.
+- Each account binds persistently to one proxy node, rotating on proxy network failure, on an
+  upstream 429 `shared_quota_unavailable` (the exit's region is not served — a node property,
+  not an account one), and when a provider auto-update renames nodes so the stored assignment
+  no longer exists (Mihomo answers 400; the pool resyncs immediately instead of waiting for
+  the refresh interval).
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
 - Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts whose 7-day utilization is exhausted). Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned the least-loaded eligible account so separate windows fan out. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the plain round-robin used for `/v1/models`.
 - WebUI is built by Vite into `mirofish/static/` and served by the relay; a fallback page with build instructions appears if it is missing.

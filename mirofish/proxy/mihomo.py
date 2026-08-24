@@ -63,8 +63,17 @@ class MihomoClient:
         return [str(item) for item in nodes]
 
     async def set_selector(self, group: str, node: str) -> None:
-        await self.json("PUT", "/proxies/" + urllib.parse.quote(group, safe=""),
-                        {"name": node})
+        try:
+            await self.json("PUT", "/proxies/" + urllib.parse.quote(group, safe=""),
+                            {"name": node})
+        except RelayError as exc:
+            if isinstance(exc.data, dict) and exc.data.get("status") == 400:
+                # Mihomo answers 400 when the node name is not in the group:
+                # the provider auto-updated and renamed its nodes, so every
+                # stored assignment is stale until the pool resyncs.
+                raise RelayError("Mihomo no longer knows proxy node", 502,
+                                 {"unknown_node": True}) from exc
+            raise
 
     async def refresh_provider(self, provider: str) -> None:
         try:

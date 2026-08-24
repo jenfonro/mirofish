@@ -6,8 +6,9 @@ import hashlib
 import json
 import threading
 import time
+import uuid
 from contextlib import AsyncExitStack
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Mapping, Optional
 
 import httpx
 
@@ -22,6 +23,7 @@ from ..vault import make_credential_store
 
 LOGIN_TTL_SECONDS = 600.0
 QUOTA_EXHAUSTED = 0.999
+MAX_NETWORK_PROXY_ATTEMPTS = 4
 
 
 class AppState:
@@ -191,6 +193,25 @@ class AppState:
             return self.pick_account("")
         return self._sticky_account(key, aliases)
 
+    @classmethod
+    def relay_session_id(cls, claude_session: str, session_hint: str,
+                         payload: Any) -> str:
+        """Stable, non-secret session id for the upstream relay metadata.
+
+        Preserve Claude Code's own printable session id when available. Other
+        local affinity hints are hashed so arbitrary caller values and message
+        text never appear in an upstream header.
+        """
+        direct = (claude_session or "").strip()
+        if direct and len(direct) <= 128 \
+                and all(0x21 <= ord(char) <= 0x7e for char in direct):
+            return direct
+        key = (session_hint or "").strip() or cls._session_key_from_payload(payload)
+        if key:
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+            return "mirofish_" + digest
+        return "mirofish_" + str(uuid.uuid4())
+
     # --- pending logins -------------------------------------------------------
 
     def put_pending_login(self, alias: str, email: str, proxy_id: Optional[str]) -> None:
@@ -208,33 +229,63 @@ class AppState:
 
     # --- proxy-aware execution ----------------------------------------------
 
-    def _attempts(self, proxy: Optional[dict[str, Any]]) -> int:
-        if proxy is None:
-            return 1
-        return min(4, max(2, self.pool.active_count()))
-
     @staticmethod
     def _is_proxy_network_failure(exc: RelayError) -> bool:
         return (exc.status == 502 and isinstance(exc.data, dict)
                 and exc.data.get("proxy_network") is True)
 
+    @staticmethod
+    def _is_region_blocked(exc: RelayError) -> bool:
+        return (exc.status == 502 and isinstance(exc.data, dict)
+                and exc.data.get("region_blocked") is True)
+
+    @classmethod
+    def _rotate_reason(cls, exc: RelayError) -> Optional[str]:
+        """Why this node should be abandoned, or None to propagate the error.
+
+        A region refusal is as fatal to a node as a network failure: the exit
+        stays unusable for every account until the upstream serves that region
+        again, so the account must not remain pinned to it."""
+        if cls._is_proxy_network_failure(exc):
+            return "proxy network failure"
+        if cls._is_region_blocked(exc):
+            return "upstream does not serve this exit region"
+        return None
+
     async def with_proxy(self, alias: str,
                          op: Callable[[Optional[str]], Awaitable[Any]]) -> Any:
-        """Run one account operation, rotating its sticky node on network failure."""
+        """Run an account operation, rotating away from unusable sticky exits."""
         proxy = await self.pool.for_account(alias)
-        attempts = self._attempts(proxy)
-        for attempt in range(attempts):
+        network_failures = 0
+        while True:
             try:
                 async with self.pool.route(alias, proxy) as proxy_url:
                     result = await op(proxy_url)
                 self.pool.success(proxy)
                 return result
             except RelayError as exc:
-                if not proxy or not self._is_proxy_network_failure(exc) \
-                        or attempt + 1 >= attempts:
+                reason = self._rotate_reason(exc)
+                if not proxy or reason is None:
                     raise
-                proxy = self.pool.rotate(alias, proxy, "proxy network failure")
-        raise RelayError("proxy request failed", 502)
+                if self._is_proxy_network_failure(exc):
+                    network_failures += 1
+                if network_failures >= MAX_NETWORK_PROXY_ATTEMPTS:
+                    # The final failed node must also be quarantined; otherwise
+                    # the next request immediately starts on the same known-bad
+                    # exit and repeats the rejection loop.
+                    self.pool.fail(alias, proxy, reason)
+                    raise
+                try:
+                    proxy = self.pool.rotate(alias, proxy, reason)
+                except RelayError as rotate_exc:
+                    if rotate_exc.status == 503:
+                        # rotate() already recorded the final failed exit. Keep
+                        # the actionable upstream error instead of replacing it
+                        # with the pool's generic "no node" error.
+                        raise exc from rotate_exc
+                    raise
+                if proxy is None:
+                    raise
 
     async def with_fixed_proxy(self, alias: str, proxy: Optional[dict[str, Any]],
                                op: Callable[[Optional[str]], Awaitable[Any]]) -> Any:
@@ -262,7 +313,7 @@ class AppState:
                 self.pool.success(proxy)
                 return proxy, result
             except RelayError as exc:
-                retriable = (self._is_proxy_network_failure(exc)
+                retriable = (self._rotate_reason(exc) is not None
                              or self._is_non_api_response(exc))
                 if not retriable or attempt + 1 >= attempts:
                     raise
@@ -271,7 +322,10 @@ class AppState:
 
     async def open_messages_stream(
             self, alias: str,
-            payload: dict[str, Any]) -> tuple[httpx.Response, AsyncExitStack]:
+            payload: dict[str, Any], *,
+            request_headers: Optional[Mapping[str, str]] = None,
+            session_id: str = "", beta: bool = False,
+    ) -> tuple[httpx.Response, AsyncExitStack]:
         """Open a streaming upstream call inside its proxy route context.
 
         The returned AsyncExitStack keeps the route (and, for shared mihomo
@@ -279,26 +333,39 @@ class AppState:
         when the stream finishes.
         """
         proxy = await self.pool.for_account(alias)
-        attempts = self._attempts(proxy)
-        for attempt in range(attempts):
+        network_failures = 0
+        while True:
             stack = AsyncExitStack()
             try:
                 proxy_url = await stack.enter_async_context(
                     self.pool.route(alias, proxy))
-                response = await self.upstream.stream_messages(alias, payload, proxy_url)
+                response = await self.upstream.stream_messages(
+                    alias, payload, proxy_url, request_headers=request_headers,
+                    session_id=session_id, beta=beta)
                 stack.push_async_callback(response.aclose)
                 self.pool.success(proxy)
                 return response, stack
             except RelayError as exc:
                 await stack.aclose()
-                if not proxy or not self._is_proxy_network_failure(exc) \
-                        or attempt + 1 >= attempts:
+                reason = self._rotate_reason(exc)
+                if not proxy or reason is None:
                     raise
-                proxy = self.pool.rotate(alias, proxy, "proxy network failure")
+                if self._is_proxy_network_failure(exc):
+                    network_failures += 1
+                if network_failures >= MAX_NETWORK_PROXY_ATTEMPTS:
+                    self.pool.fail(alias, proxy, reason)
+                    raise
+                try:
+                    proxy = self.pool.rotate(alias, proxy, reason)
+                except RelayError as rotate_exc:
+                    if rotate_exc.status == 503:
+                        raise exc from rotate_exc
+                    raise
+                if proxy is None:
+                    raise
             except BaseException:
                 await stack.aclose()
                 raise
-        raise RelayError("proxy request failed", 502)
 
     # --- usage accounting ---------------------------------------------------
 

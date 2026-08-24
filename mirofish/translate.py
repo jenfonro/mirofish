@@ -148,9 +148,14 @@ def openai_to_anthropic(payload: dict[str, Any]) -> dict[str, Any]:
     }
     if system_parts:
         out["system"] = "\n\n".join(system_parts)
-    for key in ("temperature", "top_p"):
-        if isinstance(payload.get(key), (int, float)):
-            out[key] = payload[key]
+    # The subscription upstream serves models in thinking mode, which accepts
+    # only temperature == 1 and no top_p/top_k; anything else draws a blanket
+    # invalid-request 400. Drop unsupported sampling values instead of
+    # relaying a request that is guaranteed to fail.
+    temperature = payload.get("temperature")
+    if (isinstance(temperature, (int, float)) and not isinstance(temperature, bool)
+            and float(temperature) == 1.0):
+        out["temperature"] = 1
     stop = payload.get("stop")
     if isinstance(stop, str) and stop:
         out["stop_sequences"] = [stop]

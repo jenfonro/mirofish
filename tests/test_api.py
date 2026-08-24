@@ -1,8 +1,15 @@
+import base64
+import hashlib
 import json
+import uuid
 
 import httpx
 import pytest
 import respx
+from cryptography.exceptions import InvalidSignature
+from cryptography.hazmat.primitives import serialization
+
+from mirofish.errors import RelayError
 
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 
@@ -34,6 +41,21 @@ QUOTA_HEADERS = {"anthropic-ratelimit-unified-7d-utilization": "0.42",
 def mock_device_session(ticket: str = "device-ticket"):
     return respx.post(RELAY_BASE + "/v1/device/session").mock(
         return_value=httpx.Response(200, json={"ticket": ticket, "expiresIn": 900}))
+
+
+def verify_relay_signature(state, request: httpx.Request, path: str) -> bytes:
+    headers = request.headers
+    body = request.content
+    signed = "\n".join((
+        "mrs-sig-v1", request.method, path, headers["x-mirasim-ts"],
+        headers["x-mirasim-nonce"], hashlib.sha256(body).hexdigest(),
+    )).encode()
+    signature = base64.urlsafe_b64decode(
+        headers["x-mirasim-sig"] + "=" * (-len(headers["x-mirasim-sig"]) % 4))
+    public = serialization.load_der_public_key(
+        base64.b64decode(state.upstream._signer("work").public_key))
+    public.verify(signature, signed)
+    return signature
 
 
 async def test_requires_auth(client):
@@ -129,6 +151,15 @@ def test_route_account_session_header_sticky(state):
     assert state.route_account("", "sess-123", _conv("completely different body")) == first
 
 
+def test_relay_session_id_preserves_claude_id_and_hashes_local_hints(state):
+    assert state.relay_session_id("claude-session-1", "local-secret", _conv("x")) == \
+        "claude-session-1"
+    first = state.relay_session_id("", "local-secret", _conv("private prompt"))
+    second = state.relay_session_id("", "local-secret", _conv("changed prompt"))
+    assert first == second and first.startswith("mirofish_")
+    assert "local-secret" not in first and "private prompt" not in first
+
+
 @respx.mock
 async def test_messages_non_stream(client, state, auth_headers):
     add_account(state, "work")
@@ -149,9 +180,72 @@ async def test_messages_non_stream(client, state, auth_headers):
     assert all(route.calls.last.request.headers.get(name) for name in (
         "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig",
         "x-mirasim-client"))
+    assert route.calls.last.request.headers["x-mirasim-client"] == "0.0.220"
+    assert route.calls.last.request.headers["x-mirasim-agent"] == "claude"
+    assert route.calls.last.request.headers["x-mirasim-session"].startswith("mirofish_")
+    assert "x-mirasim-probe" not in route.calls.last.request.headers
     assert session.calls.last.request.headers["authorization"] == "Bearer access-work"
     totals = state.store.usage_summary(1)["totals"]
     assert totals == {"requests": 1, "input_tokens": 12, "output_tokens": 4}
+
+
+@respx.mock
+async def test_messages_preserves_beta_query_and_claude_fingerprint(
+        client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages?beta=true").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+    session_id = "8fe5ff39-0f50-4121-a1de-9e896e963ee2"
+    headers = {
+        **auth_headers,
+        "user-agent": "claude-cli/2.1.241 (external, mirasim)",
+        "x-claude-code-session-id": session_id,
+        "x-stainless-arch": "arm64",
+        "x-stainless-lang": "js",
+        "x-stainless-os": "MacOS",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-runtime": "node",
+        "x-stainless-runtime-version": "v26.3.0",
+        "anthropic-beta": (
+            "claude-code-20250219,oauth-2025-04-20,"
+            "mid-conversation-system-2026-04-07"),
+        "anthropic-dangerous-direct-browser-access": "true",
+        "x-app": "cli",
+        "authorization": "Bearer caller-secret",
+        "x-api-key": "caller-api-key",
+        # Caller-supplied relay metadata must never override our own.
+        "x-mirasim-session": "attacker-controlled",
+    }
+    response = await client.post("/v1/messages?beta=true", headers=headers, json={
+        "model": "claude-sonnet-5", "max_tokens": 64,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    sent = route.calls.last.request
+    assert sent.url.query == b"beta=true"
+    assert sent.headers["user-agent"] == headers["user-agent"]
+    assert sent.headers["x-stainless-package-version"] == "0.112.1"
+    assert sent.headers["anthropic-beta"] == (
+        "claude-code-20250219,mid-conversation-system-2026-04-07")
+    assert sent.headers["x-mirasim-session"] == session_id
+    assert sent.headers["x-mirasim-agent"] == "claude"
+    assert sent.headers["x-mirasim-locale"] == "zh-HK"
+    assert sent.headers["authorization"] == "Bearer device-ticket"
+    assert "x-api-key" not in sent.headers
+    uuid.UUID(sent.headers["x-mirasim-call"])
+    assert "x-mirasim-probe" not in sent.headers
+
+    signature = verify_relay_signature(state, sent, "/v1/messages")
+    query_payload = "\n".join((
+        "mrs-sig-v1", "POST", "/v1/messages?beta=true",
+        sent.headers["x-mirasim-ts"], sent.headers["x-mirasim-nonce"],
+        hashlib.sha256(sent.content).hexdigest(),
+    )).encode()
+    public = serialization.load_der_public_key(
+        base64.b64decode(state.upstream._signer("work").public_key))
+    with pytest.raises(InvalidSignature):
+        public.verify(signature, query_payload)
 
 
 @respx.mock
@@ -192,14 +286,38 @@ async def test_device_session_refreshes_access_on_401(client, state, auth_header
 
 
 @respx.mock
-async def test_messages_stream_passthrough(client, state, auth_headers):
+async def test_message_region_refusal_is_exposed_as_rotatable_proxy_error(state):
     add_account(state, "work")
     mock_device_session()
     respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(429, json={
+            "error": {
+                "type": "shared_quota_unavailable",
+                "message": "The cloud route is not served to this network region.",
+            },
+        }))
+
+    with pytest.raises(RelayError) as raised:
+        await state.upstream.messages(
+            "work", {"model": "m", "max_tokens": 16,
+                     "messages": [{"role": "user", "content": "hi"}]},
+            proxy_url="http://proxy.test:8080")
+
+    assert raised.value.status == 502
+    assert raised.value.data["region_blocked"] is True
+
+
+@respx.mock
+async def test_messages_stream_passthrough(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages?beta=true").mock(
         return_value=httpx.Response(200, content=SSE_BODY.encode(),
                                     headers={"content-type": "text/event-stream",
                                              **QUOTA_HEADERS}))
-    async with client.stream("POST", "/v1/messages", headers=auth_headers, json={
+    headers = {**auth_headers,
+               "X-Claude-Code-Session-Id": "0f20cf48-c292-42e9-a99e-994511307deb"}
+    async with client.stream("POST", "/v1/messages?beta=true", headers=headers, json={
         "model": "m", "max_tokens": 16, "stream": True,
         "messages": [{"role": "user", "content": "hi"}],
     }) as response:
@@ -209,6 +327,9 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
     assert '"type":"text_delta","text":"Hi"' in body.replace(" ", "").replace('", "', '","') \
         or 'text_delta' in body
     assert "message_stop" in body
+    assert route.calls.last.request.headers["x-mirasim-session"] == \
+        "0f20cf48-c292-42e9-a99e-994511307deb"
+    assert route.calls.last.request.url.query == b"beta=true"
     totals = state.store.usage_summary(1)["totals"]
     assert totals["input_tokens"] == 9 and totals["output_tokens"] == 2
 
@@ -278,11 +399,63 @@ async def test_login_flow(client, state, auth_headers):
                                  json={"alias": "work", "code": "123456"})
     assert response.status_code == 200
     assert response.json()["plan"] == "pro"
+    assert response.json()["profile_pending"] is False
     assert state.store.vault.get("work", "access") == "a1"
     # bad code format is rejected before hitting upstream
     response = await client.post("/api/login/finish", headers=auth_headers,
                                  json={"alias": "work", "code": "12"})
     assert response.status_code == 400
+
+
+@respx.mock
+async def test_login_keeps_consumed_code_credentials_when_profile_is_rejected(
+        client, state, auth_headers):
+    respx.post(AUTH_BASE + "/auth/code").mock(
+        return_value=httpx.Response(200, json={"sent": True}))
+    verify = respx.post(AUTH_BASE + "/auth/verify").mock(
+        return_value=httpx.Response(200, json={"access_token": "saved-access",
+                                               "refresh_token": "saved-refresh"}))
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "u1", "email": "x@example.com"}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(503, json={"error": {"message": "temporary"}}))
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(200, json={"tenant": "t1"}))
+
+    await client.post("/api/login/start", headers=auth_headers,
+                      json={"alias": "work", "email": "x@example.com"})
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "work", "code": "123456"})
+
+    # The verification code has already been consumed, so optional profile
+    # failures must not turn this into a 502 followed by a retrying 401.
+    assert response.status_code == 200
+    assert response.json()["profile_pending"] is True
+    assert verify.call_count == 1
+    assert state.store.aliases() == ["work"]
+    assert state.store.credentials("work") == ("saved-access", "saved-refresh")
+    assert "work" not in state.pending_logins
+
+
+@respx.mock
+async def test_login_keeps_credentials_when_profile_has_network_failure(
+        client, state, auth_headers):
+    respx.post(AUTH_BASE + "/auth/code").mock(
+        return_value=httpx.Response(200, json={"sent": True}))
+    respx.post(AUTH_BASE + "/auth/verify").mock(
+        return_value=httpx.Response(200, json={"access_token": "saved-access",
+                                               "refresh_token": "saved-refresh"}))
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        side_effect=httpx.ConnectError("profile exit disconnected"))
+
+    await client.post("/api/login/start", headers=auth_headers,
+                      json={"alias": "work", "email": "x@example.com"})
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "work", "code": "123456"})
+
+    assert response.status_code == 200
+    assert response.json()["profile_pending"] is True
+    assert state.store.credentials("work") == ("saved-access", "saved-refresh")
 
 
 async def test_delete_account(client, state, auth_headers):
@@ -311,13 +484,17 @@ LIMITS_RESPONSE = {
 async def test_count_tokens_proxied(client, state, auth_headers):
     add_account(state, "work")
     mock_device_session()
-    route = respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+    route = respx.post(RELAY_BASE + "/v1/messages/count_tokens?beta=true").mock(
         return_value=httpx.Response(200, json={"input_tokens": 42}))
-    response = await client.post("/v1/messages/count_tokens", headers=auth_headers, json={
+    headers = {**auth_headers, "X-Claude-Code-Session-Id": "count-session"}
+    response = await client.post("/v1/messages/count_tokens?beta=true", headers=headers, json={
         "model": "claude-haiku-4-5", "messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
     assert response.json()["input_tokens"] == 42
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
+    assert route.calls.last.request.headers["x-mirasim-session"] == "count-session"
+    assert route.calls.last.request.url.query == b"beta=true"
+    verify_relay_signature(state, route.calls.last.request, "/v1/messages/count_tokens")
 
 
 @respx.mock
@@ -352,6 +529,8 @@ async def test_account_limits(client, state, auth_headers):
     assert body["suspended"] is False
     # Signed with the device ticket, and the summary is cached into metadata.
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
+    assert route.calls.last.request.headers["x-mirasim-probe"] == "usage"
+    assert route.calls.last.request.headers["accept-encoding"] == "identity"
     cached = json.loads(state.store.row("work")["metadata_json"])["limits"]
     assert cached["windows"][0]["name"] == "5h"
 

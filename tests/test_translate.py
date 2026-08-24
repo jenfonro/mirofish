@@ -9,6 +9,7 @@ def test_system_and_params():
         "model": "claude-haiku-4-5-20251001",
         "max_tokens": 128,
         "temperature": 0.4,
+        "top_p": 0.9,
         "stop": ["END"],
         "messages": [
             {"role": "system", "content": "You are terse."},
@@ -17,9 +18,20 @@ def test_system_and_params():
     })
     assert out["system"] == "You are terse."
     assert out["max_tokens"] == 128
-    assert out["temperature"] == 0.4
+    # The upstream accepts only temperature == 1 and rejects top_p outright,
+    # so other sampling values must not be forwarded.
+    assert "temperature" not in out
+    assert "top_p" not in out
     assert out["stop_sequences"] == ["END"]
     assert out["messages"] == [{"role": "user", "content": "hi"}]
+
+
+def test_temperature_one_is_forwarded():
+    out = openai_to_anthropic({
+        "model": "m", "temperature": 1.0,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert out["temperature"] == 1
 
 
 def test_tools_and_tool_results():

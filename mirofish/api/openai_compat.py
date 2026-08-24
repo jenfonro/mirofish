@@ -26,8 +26,10 @@ def _dump(chunk: dict[str, Any]) -> bytes:
 async def chat_completions(request: Request) -> Any:
     state = get_state(request)
     payload = await read_json_body(request)
+    session_hint = request.headers.get("X-Mirofish-Session", "")
     account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
-                                  request.headers.get("X-Mirofish-Session", ""), payload)
+                                  session_hint, payload)
+    relay_session = state.relay_session_id("", session_hint, payload)
     if not payload.get("model"):
         payload["model"] = state.settings.default_model
     anthropic_payload = openai_to_anthropic(payload)
@@ -35,14 +37,16 @@ async def chat_completions(request: Request) -> Any:
 
     if not payload.get("stream"):
         async def op(proxy_url):
-            return await state.upstream.messages(account, anthropic_payload, proxy_url)
+            return await state.upstream.messages(
+                account, anthropic_payload, proxy_url, session_id=relay_session)
         result, headers = await state.with_proxy(account, op)
         usage = result.get("usage", {}) if isinstance(result, dict) else {}
         outgoing = state.record_usage(account, model, usage, headers)
         return JSONResponse(anthropic_to_openai_response(result, model), headers=outgoing)
 
     anthropic_payload["stream"] = True
-    response, stack = await state.open_messages_stream(account, anthropic_payload)
+    response, stack = await state.open_messages_stream(
+        account, anthropic_payload, session_id=relay_session)
     upstream_headers = {key.lower(): value for key, value in response.headers.items()}
     quota = quota_headers(upstream_headers)
     outgoing = {"X-Mirofish-Account": account, "Cache-Control": "no-cache"}

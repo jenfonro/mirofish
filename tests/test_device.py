@@ -8,7 +8,7 @@ from mirofish.device import DeviceSigner
 
 
 def test_device_signer_persists_identity_and_verifiable_signature(state):
-    signer = DeviceSigner(state.store, "work", "0.0.146")
+    signer = DeviceSigner(state.store, "work", "0.0.220")
     body = b'{"hello":"world"}'
     headers = signer.headers("POST", "/v1/messages", body)
 
@@ -28,6 +28,8 @@ def test_device_signer_persists_identity_and_verifiable_signature(state):
         headers["x-mirasim-sig"] + "=" * (-len(headers["x-mirasim-sig"]) % 4))
     public.verify(signature, payload)
 
-    reloaded = DeviceSigner(state.store, "work", "0.0.146")
+    assert headers["x-mirasim-client"] == "0.0.220"
+
+    reloaded = DeviceSigner(state.store, "work", "0.0.220")
     assert reloaded.device_id == signer.device_id
     assert reloaded.public_key == signer.public_key

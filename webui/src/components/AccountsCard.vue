@@ -70,6 +70,8 @@ async function removeAccount(alias: string) {
             <td>{{ account.email }}</td>
             <td>
               <span class="badge">{{ account.plan || "未知" }}</span>
+              <span v-if="account.profile_pending" class="badge"
+                    title="验证码登录已完成；套餐和租户资料可稍后刷新">资料待刷新</span>
             </td>
             <td>
               <template v-if="account.proxy">

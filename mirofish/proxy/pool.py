@@ -7,8 +7,8 @@ Modes:
   HTTP(S)/SOCKS5 nodes directly.
 - disabled: no proxy configured; requests go out directly.
 
-Each account stays pinned to one node and only rotates after a proxy network
-failure, mirroring the legacy behavior.
+Each account stays pinned to one node and rotates after a proxy network failure
+or an upstream refusal tied to that exit's network region.
 """
 
 from __future__ import annotations
@@ -115,6 +115,20 @@ class ProxyPool:
             raise RelayError("proxy subscription network error", 502,
                              {"reason": str(exc)[:200]}) from exc
 
+    def _configs_from_names(self, names: list[str]) -> dict[str, dict[str, Any]]:
+        assert self.mihomo_proxy is not None
+        system = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
+        configs: dict[str, dict[str, Any]] = {}
+        for raw_name in names:
+            name = raw_name.strip()
+            if not name or name in system or name == self.settings.mihomo_selector \
+                    or name.startswith("MirofishSlot"):
+                continue
+            config = {**self.mihomo_proxy, "name": name, "mihomo_node": name}
+            proxy_id = proxy_identity(config)
+            configs[proxy_id] = {**config, "id": proxy_id}
+        return configs
+
     async def _refresh_mihomo(self, force: bool) -> dict[str, Any]:
         assert self.mihomo is not None and self.mihomo_proxy is not None
         now = time.time()
@@ -125,16 +139,7 @@ class ProxyPool:
             if force:
                 await self.mihomo.refresh_provider(self.settings.mihomo_provider)
             names = await self.mihomo.group_nodes(self.settings.mihomo_selector)
-            system = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
-            configs: dict[str, dict[str, Any]] = {}
-            for raw_name in names:
-                name = raw_name.strip()
-                if not name or name in system or name == self.settings.mihomo_selector \
-                        or name.startswith("MirofishSlot"):
-                    continue
-                config = {**self.mihomo_proxy, "name": name, "mihomo_node": name}
-                proxy_id = proxy_identity(config)
-                configs[proxy_id] = {**config, "id": proxy_id}
+            configs = self._configs_from_names(names)
             if not configs:
                 raise RelayError("Mihomo has not loaded any subscription nodes", 502)
             self._store_nodes(configs, skipped=0)
@@ -144,6 +149,21 @@ class ProxyPool:
             if force or not self.store.proxy_rows(active_only=True):
                 raise
             return self.public_summary()
+
+    async def resync_mihomo_nodes(self) -> None:
+        """Replace the active node set from the live selector group.
+
+        The sidecar's provider auto-updates on its own schedule and renames
+        every node, which orphans the stored active set (and all sticky
+        assignments) until the next scheduled refresh. Called when Mihomo
+        rejects a node name the store still lists as active, so recovery does
+        not have to wait out the refresh interval."""
+        assert self.mihomo is not None
+        async with self.lock:
+            names = await self.mihomo.group_nodes(self.settings.mihomo_selector)
+            configs = self._configs_from_names(names)
+            if configs:
+                self._store_nodes(configs, skipped=0)
 
     async def refresh(self, force: bool = False) -> dict[str, Any]:
         async with self.lock:
@@ -264,13 +284,18 @@ class ProxyPool:
 
     def rotate(self, alias: str, failed: dict[str, Any], reason: str) -> Optional[dict[str, Any]]:
         alias = alias_value(alias)
-        self.store.mark_proxy_failure(str(failed["id"]), reason)
+        self.fail(alias, failed, reason)
         if not self.configured:
             return None
-        self.store.set_account_proxy(alias, None)
         config = self._select(alias, exclude=str(failed["id"]))
         self.store.set_account_proxy(alias, str(config["id"]))
         return config
+
+    def fail(self, alias: str, failed: dict[str, Any], reason: str) -> None:
+        """Record an unusable exit and remove the account's sticky binding."""
+        alias = alias_value(alias)
+        self.store.mark_proxy_failure(str(failed["id"]), reason)
+        self.store.set_account_proxy(alias, None)
 
     def success(self, proxy: Optional[dict[str, Any]]) -> None:
         if proxy:
@@ -293,8 +318,18 @@ class ProxyPool:
             node = str(proxy.get("mihomo_node", "")).strip()
             if not node:
                 raise RelayError("Mihomo proxy node name is missing", 500)
-            async with self.slots.route(alias_value(alias), node) as url:
-                yield url
+            try:
+                async with self.slots.route(alias_value(alias), node) as url:
+                    yield url
+            except RelayError as exc:
+                if isinstance(exc.data, dict) and exc.data.get("unknown_node"):
+                    # The provider renamed its nodes; resync the store and
+                    # surface a rotatable proxy failure so the caller's retry
+                    # re-pins this account to a live node immediately.
+                    await self.resync_mihomo_nodes()
+                    raise RelayError("proxy node no longer exists after provider update",
+                                     502, {"proxy_network": True}) from exc
+                raise
             return
         yield proxy_url(proxy)
 

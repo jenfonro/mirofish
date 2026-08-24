@@ -28,11 +28,19 @@ async function sendCode() {
 async function verify() {
   busy.value = true;
   try {
-    const result = await api<{ alias: string; plan?: string }>("/api/login/finish", {
+    const result = await api<{
+      alias: string;
+      plan?: string;
+      profile_pending?: boolean;
+    }>("/api/login/finish", {
       method: "POST",
       body: JSON.stringify({ alias: alias.value.trim(), code: code.value.trim() }),
     });
-    toast(`登录成功：${result.alias}（${result.plan || "未知套餐"}）`, "ok");
+    if (result.profile_pending) {
+      toast(`登录成功：${result.alias}；账号资料暂未加载，可稍后刷新`, "info");
+    } else {
+      toast(`登录成功：${result.alias}（${result.plan || "未知套餐"}）`, "ok");
+    }
     alias.value = email.value = code.value = "";
     stage.value = "start";
     await loadAccounts();

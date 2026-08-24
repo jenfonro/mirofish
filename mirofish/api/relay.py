@@ -16,6 +16,10 @@ from .deps import get_state, read_json_body, require_auth
 router = APIRouter(dependencies=[Depends(require_auth)])
 
 
+def _beta_enabled(request: Request) -> bool:
+    return request.query_params.get("beta", "").strip().lower() == "true"
+
+
 class _UsageWatcher:
     """Extract usage numbers from an Anthropic SSE stream as it passes through."""
 
@@ -48,19 +52,27 @@ class _UsageWatcher:
 async def messages(request: Request) -> Any:
     state = get_state(request)
     payload = await read_json_body(request)
+    session_hint = request.headers.get("X-Mirofish-Session", "")
     account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
-                                  request.headers.get("X-Mirofish-Session", ""), payload)
+                                  session_hint, payload)
+    relay_session = state.relay_session_id(
+        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
+    beta = _beta_enabled(request)
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
 
     if not payload.get("stream"):
         async def op(proxy_url):
-            return await state.upstream.messages(account, payload, proxy_url)
+            return await state.upstream.messages(
+                account, payload, proxy_url, request_headers=request.headers,
+                session_id=relay_session, beta=beta)
         result, headers = await state.with_proxy(account, op)
         usage = result.get("usage", {}) if isinstance(result, dict) else {}
         outgoing = state.record_usage(account, model, usage, headers)
         return JSONResponse(result, headers=outgoing)
 
-    response, stack = await state.open_messages_stream(account, payload)
+    response, stack = await state.open_messages_stream(
+        account, payload, request_headers=request.headers,
+        session_id=relay_session, beta=beta)
     upstream_headers = {key.lower(): value for key, value in response.headers.items()}
     quota = quota_headers(upstream_headers)
     outgoing = {"X-Mirofish-Account": account}
@@ -114,13 +126,18 @@ async def count_tokens(request: Request) -> Any:
     proxy hop fails, so clients never see a 404 and stop retry-storming."""
     state = get_state(request)
     payload = await read_json_body(request)
+    session_hint = request.headers.get("X-Mirofish-Session", "")
     account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
-                                  request.headers.get("X-Mirofish-Session", ""), payload)
+                                  session_hint, payload)
+    relay_session = state.relay_session_id(
+        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
     outgoing = {"X-Mirofish-Account": account}
     try:
         async def op(proxy_url):
             return await state.upstream.signed_json(
-                account, "POST", "/v1/messages/count_tokens", payload, proxy_url)
+                account, "POST", "/v1/messages/count_tokens", payload, proxy_url,
+                request_headers=request.headers, session_id=relay_session,
+                beta=_beta_enabled(request))
         status, _, data = await state.with_proxy(account, op)
         if 200 <= status < 300 and isinstance(data, dict) and "input_tokens" in data:
             return JSONResponse(data, headers=outgoing)
