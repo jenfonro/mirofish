@@ -8,12 +8,16 @@ proxied traffic behind one global selector switch.
 
 from __future__ import annotations
 
+import logging
 import os
 import pathlib
 import stat
-from typing import Any
+from typing import Any, Optional
 
+import httpx
 import yaml
+
+logger = logging.getLogger("mirofish.mihomo_config")
 
 from .config import Settings
 from .errors import RelayError
@@ -35,6 +39,42 @@ def _write_private(path: pathlib.Path, content: bytes) -> None:
             os.close(fd)
 
 
+def dns_from_subscription(raw: bytes) -> Optional[dict[str, Any]]:
+    """The subscription's own top-level `dns:` section, if it carries one.
+
+    Some providers publish node servers under private domains that only their
+    own DNS can resolve (public resolvers answer with placeholder addresses),
+    declared via `nameserver-policy` in the subscription's full Clash config.
+    Mihomo only reads `proxies` from a provider file, so the dns section must
+    be copied into the root config or those nodes never connect."""
+    try:
+        data = yaml.safe_load(raw)
+    except yaml.YAMLError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    dns = data.get("dns")
+    return dns if isinstance(dns, dict) and dns else None
+
+
+def _fetch_subscription_dns(url: str, settings: Settings) -> Optional[dict[str, Any]]:
+    """Best effort: a failure only means the generated config has no dns
+    section, exactly what was generated before."""
+    try:
+        with httpx.Client(timeout=30.0, follow_redirects=True) as client:
+            response = client.get(url, headers={
+                "User-Agent": settings.proxy_subscription_user_agent})
+            response.raise_for_status()
+            if len(response.content) > settings.proxy_fetch_max_bytes:
+                logger.warning("subscription too large to inspect for a dns section")
+                return None
+            return dns_from_subscription(response.content)
+    except (httpx.HTTPError, OSError) as exc:
+        logger.warning("could not inspect the subscription for a dns section: %s",
+                       type(exc).__name__)
+        return None
+
+
 def write_mihomo_config(output_path: pathlib.Path, settings: Settings) -> None:
     subscription = os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_URL", "").strip()
     subscription_file = os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_FILE", "").strip()
@@ -54,11 +94,13 @@ def write_mihomo_config(output_path: pathlib.Path, settings: Settings) -> None:
     (output_path.parent / "providers").mkdir(parents=True, exist_ok=True)
 
     provider: dict[str, Any]
+    dns: Optional[dict[str, Any]] = None
     if subscription:
         provider = {"type": "http", "url": subscription,
                     "path": "./providers/mirofish.yaml",
                     "interval": int(settings.proxy_refresh_seconds),
                     "header": {"User-Agent": [settings.proxy_subscription_user_agent]}}
+        dns = _fetch_subscription_dns(subscription, settings)
     else:
         # Mihomo restricts file providers to its home/safe path. Copy the
         # read-only host bind mount into the named /config volume first.
@@ -74,6 +116,7 @@ def write_mihomo_config(output_path: pathlib.Path, settings: Settings) -> None:
         provider_file = output_path.parent / "subscription.yaml"
         _write_private(provider_file, source_bytes)
         provider = {"type": "file", "path": str(provider_file)}
+        dns = dns_from_subscription(source_bytes)
 
     groups: list[dict[str, Any]] = [{"name": settings.mihomo_selector, "type": "select",
                                      "use": [settings.mihomo_provider]}]
@@ -103,5 +146,9 @@ def write_mihomo_config(output_path: pathlib.Path, settings: Settings) -> None:
         # each pinned to its own selector group, so it never hits the rules.
         "rules": ["MATCH,DIRECT"],
     }
+    if dns:
+        # Copied verbatim from the subscription so provider-private node
+        # domains (nameserver-policy) resolve the way the provider requires.
+        config["dns"] = dns
     _write_private(output_path,
                    yaml.safe_dump(config, allow_unicode=True, sort_keys=False).encode("utf-8"))
