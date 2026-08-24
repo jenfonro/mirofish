@@ -47,7 +47,9 @@ sidecar 与 init 容器。
 并为当前出口申请约 15 分钟的 device ticket，再为每个请求生成 `mrs-sig-v1` 签名。私钥与账号
 token 一样只进入加密凭证存储，不写入 SQLite 或日志。当前默认客户端标识为抓包确认的
 `0.0.220`。Anthropic 请求会保留 `?beta=true` 与白名单内的 Claude SDK 特征头；查询串不会
-错误地并入签名，调用方的 `Authorization` / `X-Api-Key` 也绝不会转发给上游。
+错误地并入签名，调用方的 `Authorization` / `X-Api-Key` 也绝不会转发给上游。模型流量默认发往
+官方客户端当前使用的 `https://relay.mirasim.ai`；旧的 `mirasim-relay.mirofish.ai` 分发可能仍返回
+模型目录，却对 Claude 请求错误返回 `no upstream available for model`。
 
 ## 代理池
 
@@ -188,6 +190,7 @@ OpenAI 兼容请求省略 `model` 时使用 `MIROFISH_DEFAULT_MODEL`（默认 `g
   `127.0.0.1:8787:8787`。
 - Mirofish 没有精确余额接口；WebUI 显示 plan、用量日志与 relay 返回的 7 天配额利用率。
 - `/v1/models` 和模型请求会先申请设备 ticket；如果升级上游协议，可通过
+  `MIROFISH_RELAY_BASE` 覆盖默认 relay 地址，通过
   `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识，通过
   `MIROFISH_MIRASIM_LOCALE` 覆盖默认的 `zh-HK` locale。
 - `status?probe=1` 使用 `/v1/limits`，不产生模型调用；显式模型扫描会发送最小工作请求，

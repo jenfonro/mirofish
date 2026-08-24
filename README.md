@@ -165,6 +165,7 @@ OpenAI 兼容请求省略 `model` 时使用 `MIROFISH_DEFAULT_MODEL`。旧客户
 | `MIROFISH_MASTER_KEY` | 无 | 加密凭证的主密钥，至少 16 字符 |
 | `MIROFISH_DEFAULT_ACCOUNT` | 空 | 强制使用的默认账号别名 |
 | `MIROFISH_DEFAULT_MODEL` | `gpt-5.6-luna` | OpenAI 兼容请求未提供模型时使用的上游模型 ID |
+| `MIROFISH_RELAY_BASE` | `https://relay.mirasim.ai` | 官方客户端当前使用的模型 relay 地址 |
 | `MIROFISH_PROXY_SUBSCRIPTION_URL` | 空 | Mihomo 代理订阅地址 |
 | `MIROFISH_PROXY_REFRESH_SECONDS` | `600` | 代理池刷新间隔 |
 | `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点停用前的连续失败次数 |

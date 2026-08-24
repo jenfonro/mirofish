@@ -17,6 +17,11 @@ services:
       MIROFISH_DEFAULT_ACCOUNT: ${MIROFISH_DEFAULT_ACCOUNT:-}
       # OpenAI 兼容请求未提供 model 时使用；按当前上游实际可用模型覆盖。
       MIROFISH_DEFAULT_MODEL: ${MIROFISH_DEFAULT_MODEL:-gpt-5.6-luna}
+      # 官方 auth / relay 地址及客户端协议指纹；保留为环境变量以便上游迁移时无代码切换。
+      MIROFISH_AUTH_BASE: ${MIROFISH_AUTH_BASE:-https://auth.mirasim.ai}
+      MIROFISH_RELAY_BASE: ${MIROFISH_RELAY_BASE:-https://relay.mirasim.ai}
+      MIROFISH_MIRASIM_CLIENT_VERSION: ${MIROFISH_MIRASIM_CLIENT_VERSION:-0.0.220}
+      MIROFISH_MIRASIM_LOCALE: ${MIROFISH_MIRASIM_LOCALE:-zh-HK}
       # 代理订阅：远程 URL 或挂载到 /input 的本地文件，二选一；留空则纯直连（不启动 mihomo）。
       MIROFISH_PROXY_SUBSCRIPTION_URL: ${MIROFISH_PROXY_SUBSCRIPTION_URL:-}
       MIROFISH_PROXY_SUBSCRIPTION_FILE: ${MIROFISH_PROXY_SUBSCRIPTION_FILE:-}
