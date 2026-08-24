@@ -27,6 +27,23 @@ def slot_group_name(index: int) -> str:
     return f"MirofishSlot{index}"
 
 
+class RoutedProxyURL(str):
+    """A proxy URL carrying the Mihomo selector route it represents.
+
+    The string value is deliberately the listener's real URL so existing
+    callers and httpx see no synthetic query/fragment.  ``route_identity`` is
+    metadata for connection/ticket caches: two nodes behind the same listener
+    must not share a keep-alive tunnel after the selector is switched.
+    """
+
+    route_identity: str
+
+    def __new__(cls, url: str, route_identity: str) -> "RoutedProxyURL":
+        value = super().__new__(cls, url)
+        value.route_identity = route_identity
+        return value
+
+
 class MihomoClient:
     def __init__(self, controller: str, timeout: float) -> None:
         self._client = httpx.AsyncClient(base_url=controller, trust_env=False,
@@ -154,7 +171,9 @@ class SlotManager:
                 if self.legacy_node != node:
                     await self.client.set_selector(self.legacy_selector, node)
                     self.legacy_node = node
-                yield self.legacy_proxy_url
+                yield RoutedProxyURL(
+                    self.legacy_proxy_url,
+                    f"mihomo:{self.legacy_selector}:{node}")
             return
         slot = await self._slot_for(alias)
         shared = len(slot.accounts) > 1
@@ -165,10 +184,14 @@ class SlotManager:
                 if slot.current_node != node:
                     await self.client.set_selector(slot.group, node)
                     slot.current_node = node
-                yield self._proxy_url_for_port(slot.port)
+                yield RoutedProxyURL(
+                    self._proxy_url_for_port(slot.port),
+                    f"mihomo:{slot.group}:{node}")
             return
         async with slot.lock:
             if slot.current_node != node:
                 await self.client.set_selector(slot.group, node)
                 slot.current_node = node
-        yield self._proxy_url_for_port(slot.port)
+        yield RoutedProxyURL(
+            self._proxy_url_for_port(slot.port),
+            f"mihomo:{slot.group}:{node}")

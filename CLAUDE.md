@@ -9,7 +9,7 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - `mirofish/`: Python package (FastAPI + httpx, async).
   - `mirofish/cli.py`: CLI entry point (`python -m mirofish` / `mirofish`).
   - `mirofish/api/`: FastAPI routes (`admin.py`, `relay.py`, `openai_compat.py`, `webui.py`) and `state.py` (account selection, proxy retry, usage accounting).
-  - `mirofish/upstream.py`: httpx layer, per-alias single-flight token refresh/device-ticket cache, signed streaming.
+  - `mirofish/upstream.py`: httpx layer, per-alias single-flight token refresh, per-account/exit device-ticket and connection caches, signed streaming.
   - `mirofish/device.py`: persistent Ed25519 device identity and `mrs-sig-v1` request headers.
   - `mirofish/proxy/`: subscription parsing (PyYAML), Mihomo controller client + slot manager, sticky pool.
   - `mirofish/vault/`: credential backends (macOS Keychain; AES-256-GCM file vault with legacy v1 migration).
@@ -26,7 +26,7 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - SQLite stores metadata and the usage log only.
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
-- Model relay calls use a per-alias Ed25519 device identity, `/v1/device/session` tickets, and
+- Model relay calls use a per-alias Ed25519 device identity, per-exit `/v1/device/session` tickets, and
   `mrs-sig-v1` signatures over the exact request body; the private key lives in the encrypted vault.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
 - Docker runs a single container: `docker-entrypoint.sh` generates the Mihomo config and starts the bundled Mihomo engine (skipped when no subscription is set), then starts the relay; the relay reaches the engine over loopback (`127.0.0.1:9090`/`7890`). If either process exits the container restarts. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Configs without slots fall back to the legacy single-selector mode automatically. Mihomo config + provider cache live under `/data/mihomo/`.
@@ -39,7 +39,9 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   the refresh interval). Once every exit has region-refused an account, the error is marked
   `region_refused_everywhere` and handled like `credit_exhausted_shared`: account cooldown +
   failover, never further proxy rotation. Do not rotate on account/shared-quota errors such as
-  `credit_exhausted_shared`; those are not exit properties.
+  `credit_exhausted_shared`; those are not exit properties. Mihomo nodes behind the same slot URL
+  must carry distinct route identities into the upstream connection/ticket caches; otherwise an
+  existing HTTPS CONNECT tunnel can keep retries on the old exit after the selector changes.
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
 - Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts whose 7-day utilization is exhausted). Accounts disabled via
   the WebUI switch (`POST /api/accounts/{alias}/enabled`, `disabled` in metadata) are excluded

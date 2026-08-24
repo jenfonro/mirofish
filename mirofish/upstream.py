@@ -203,11 +203,11 @@ class Upstream:
     def __init__(self, settings: Settings, store: Store) -> None:
         self.settings = settings
         self.store = store
-        self._clients: dict[str, httpx.AsyncClient] = {}
+        self._clients: dict[tuple[str, str], httpx.AsyncClient] = {}
         self._clients_lock = asyncio.Lock()
         self._refresh_locks: dict[str, asyncio.Lock] = {}
-        self._ticket_locks: dict[str, asyncio.Lock] = {}
-        self._ticket_cache: dict[str, _DeviceTicket] = {}
+        self._ticket_locks: dict[tuple[str, str], asyncio.Lock] = {}
+        self._ticket_cache: dict[tuple[str, str], _DeviceTicket] = {}
         self._signers: dict[str, DeviceSigner] = {}
 
     async def aclose(self) -> None:
@@ -217,13 +217,29 @@ class Upstream:
         for client in clients:
             await client.aclose()
 
+    @staticmethod
+    def _proxy_route(proxy_url: Optional[str]) -> tuple[str, str]:
+        """Return the transport URL and its logical route identity.
+
+        Mihomo switches several nodes behind one stable listener URL.  A
+        keep-alive CONNECT tunnel was therefore previously reused after a node
+        rotation, leaving retries on the refused old exit.  ``RoutedProxyURL``
+        supplies the selector/node identity without changing the URL httpx
+        receives; ordinary direct proxy strings retain the legacy URL key.
+        """
+        if not proxy_url:
+            return "", ""
+        return str(proxy_url), str(getattr(proxy_url, "route_identity", ""))
+
     async def client(self, proxy_url: Optional[str]) -> httpx.AsyncClient:
-        key = proxy_url or ""
+        transport_url, route_identity = self._proxy_route(proxy_url)
+        key = (transport_url, route_identity)
         async with self._clients_lock:
             client = self._clients.get(key)
             if client is None:
                 client = httpx.AsyncClient(
-                    proxy=proxy_url, trust_env=False, follow_redirects=False,
+                    proxy=transport_url or None, trust_env=False,
+                    follow_redirects=False,
                     timeout=httpx.Timeout(self.settings.timeout, connect=10.0, pool=30.0),
                 )
                 self._clients[key] = client
@@ -265,10 +281,15 @@ class Upstream:
             lock = self._refresh_locks.setdefault(alias, asyncio.Lock())
         return lock
 
-    def _ticket_lock(self, alias: str) -> asyncio.Lock:
-        lock = self._ticket_locks.get(alias)
+    def _ticket_key(self, alias: str, proxy_url: Optional[str]) -> tuple[str, str]:
+        transport_url, route_identity = self._proxy_route(proxy_url)
+        return alias, route_identity or transport_url
+
+    def _ticket_lock(self, alias: str, proxy_url: Optional[str]) -> asyncio.Lock:
+        key = self._ticket_key(alias, proxy_url)
+        lock = self._ticket_locks.get(key)
         if lock is None:
-            lock = self._ticket_locks.setdefault(alias, asyncio.Lock())
+            lock = self._ticket_locks.setdefault(key, asyncio.Lock())
         return lock
 
     def _signer(self, alias: str) -> DeviceSigner:
@@ -300,7 +321,12 @@ class Upstream:
         return headers
 
     def _invalidate_ticket(self, alias: str) -> None:
-        self._ticket_cache.pop(alias, None)
+        # Access refresh and a relay 401 invalidate every route-scoped ticket
+        # for this account.  Tickets are cached per route because the upstream
+        # may bind a short-lived device session to its source exit.
+        stale = [key for key in self._ticket_cache if key[0] == alias]
+        for key in stale:
+            self._ticket_cache.pop(key, None)
 
     async def refresh_access(self, alias: str, stale_access: str,
                              proxy_url: Optional[str] = None) -> str:
@@ -378,8 +404,9 @@ class Upstream:
 
     async def _device_ticket(self, alias: str, proxy_url: Optional[str] = None,
                              force: bool = False) -> str:
-        async with self._ticket_lock(alias):
-            cached = self._ticket_cache.get(alias)
+        key = self._ticket_key(alias, proxy_url)
+        async with self._ticket_lock(alias, proxy_url):
+            cached = self._ticket_cache.get(key)
             if not force and cached and time.monotonic() < cached.expires_at - 60.0:
                 return cached.value
             access, _ = self.store.credentials(alias)
@@ -392,7 +419,7 @@ class Upstream:
                     raise
                 access = await self.refresh_access(alias, access, proxy_url)
                 ticket = await self._mint_device_ticket(alias, access, proxy_url)
-            self._ticket_cache[alias] = ticket
+            self._ticket_cache[key] = ticket
             return ticket.value
 
     async def _signed_relay_response(self, alias: str, method: str, path: str,
