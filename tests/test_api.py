@@ -622,3 +622,117 @@ async def test_login_start_fails_over_dead_node(client, state, auth_headers):
     assert response.status_code == 200 and response.json()["sent"] is True
     failures = [int(row["failure_count"]) for row in state.store.proxy_rows()]
     assert sorted(failures) == [0, 1]  # the dead node was marked and skipped
+
+
+EXHAUSTED_BODY = {"type": "error", "error": {
+    "type": "credit_exhausted_shared", "message": "shared quota used up"}}
+
+
+async def test_account_toggle_excludes_from_selection(client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    response = await client.post("/api/accounts/alpha/enabled", headers=auth_headers,
+                                 json={"enabled": False})
+    assert response.json() == {"alias": "alpha", "enabled": False}
+    accounts = (await client.get("/accounts", headers=auth_headers)).json()["accounts"]
+    assert {a["alias"]: a["disabled"] for a in accounts} == {"alpha": True, "beta": False}
+    # Automatic selection never lands on the disabled account.
+    assert state.pick_account("") == "beta"
+    assert state.route_account("", "", _conv("hello there")) == "beta"
+    # Explicitly pinning a disabled account is refused clearly.
+    with pytest.raises(RelayError) as excinfo:
+        state.route_account("alpha", "", {})
+    assert excinfo.value.status == 403
+    await client.post("/api/accounts/alpha/enabled", headers=auth_headers,
+                      json={"enabled": True})
+    assert state.route_account("alpha", "", {}) == "alpha"
+
+
+async def test_disable_detaches_live_sessions(client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    conv = _conv("pinned conversation")
+    pinned = state.route_account("", "", conv)
+    other = "beta" if pinned == "alpha" else "alpha"
+    await client.post(f"/api/accounts/{pinned}/enabled", headers=auth_headers,
+                      json={"enabled": False})
+    # The next turn of the same conversation moves off the disabled account.
+    assert state.route_account("", "", conv) == other
+
+
+@respx.mock
+async def test_messages_fail_over_on_shared_credit_exhaustion(client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(side_effect=[
+        httpx.Response(429, json=EXHAUSTED_BODY),
+        httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS),
+    ])
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert response.headers["X-Mirofish-Account"] == "beta"
+    assert route.call_count == 2
+    # The refused account cools down; later windows avoid it and the panel sees it.
+    assert state.exhausted_cooldown("alpha") > 0
+    assert state.route_account("", "", _conv("a brand new window")) == "beta"
+    accounts = (await client.get("/accounts", headers=auth_headers)).json()["accounts"]
+    cooldowns = {a["alias"]: a["shared_quota_cooldown"] for a in accounts}
+    assert cooldowns["alpha"] > 0 and cooldowns["beta"] == 0
+
+
+@respx.mock
+async def test_messages_stream_fails_over_on_shared_credit_exhaustion(
+        client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    respx.post(RELAY_BASE + "/v1/messages").mock(side_effect=[
+        httpx.Response(429, json=EXHAUSTED_BODY),
+        httpx.Response(200, text=SSE_BODY,
+                       headers={"content-type": "text/event-stream", **QUOTA_HEADERS}),
+    ])
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 16, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert response.headers["X-Mirofish-Account"] == "beta"
+    assert "message_stop" in response.text
+
+
+@respx.mock
+async def test_messages_explicit_account_is_never_substituted(client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(429, json=EXHAUSTED_BODY))
+    response = await client.post(
+        "/v1/messages", headers={**auth_headers, "X-Mirofish-Account": "alpha"},
+        json={"model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "credit_exhausted_shared"
+    assert route.call_count == 1
+
+
+@respx.mock
+async def test_messages_surface_exhaustion_when_every_account_is_refused(
+        client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(429, json=EXHAUSTED_BODY))
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    # Both accounts were tried once, then the actionable upstream error surfaced.
+    assert response.status_code == 429
+    assert response.json()["error"]["type"] == "credit_exhausted_shared"
+    assert route.call_count == 2

@@ -27,8 +27,7 @@ async def chat_completions(request: Request) -> Any:
     state = get_state(request)
     payload = await read_json_body(request)
     session_hint = request.headers.get("X-Mirofish-Session", "")
-    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
-                                  session_hint, payload)
+    requested = request.headers.get("X-Mirofish-Account", "")
     relay_session = state.relay_session_id("", session_hint, payload)
     if not payload.get("model"):
         payload["model"] = state.settings.default_model
@@ -36,17 +35,24 @@ async def chat_completions(request: Request) -> Any:
     model = str(payload.get("model"))
 
     if not payload.get("stream"):
-        async def op(proxy_url):
-            return await state.upstream.messages(
-                account, anthropic_payload, proxy_url, session_id=relay_session)
-        result, headers = await state.with_proxy(account, op)
+        async def run(account: str):
+            return await state.with_proxy(
+                account,
+                lambda proxy_url: state.upstream.messages(
+                    account, anthropic_payload, proxy_url, session_id=relay_session))
+        account, (result, headers) = await state.with_account_failover(
+            requested, session_hint, payload, run)
         usage = result.get("usage", {}) if isinstance(result, dict) else {}
         outgoing = state.record_usage(account, model, usage, headers)
         return JSONResponse(anthropic_to_openai_response(result, model), headers=outgoing)
 
     anthropic_payload["stream"] = True
-    response, stack = await state.open_messages_stream(
-        account, anthropic_payload, session_id=relay_session)
+
+    async def run_stream(account: str):
+        return await state.open_messages_stream(
+            account, anthropic_payload, session_id=relay_session)
+    account, (response, stack) = await state.with_account_failover(
+        requested, session_hint, payload, run_stream)
     upstream_headers = {key.lower(): value for key, value in response.headers.items()}
     quota = quota_headers(upstream_headers)
     outgoing = {"X-Mirofish-Account": account, "Cache-Control": "no-cache"}

@@ -53,26 +53,31 @@ async def messages(request: Request) -> Any:
     state = get_state(request)
     payload = await read_json_body(request)
     session_hint = request.headers.get("X-Mirofish-Session", "")
-    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
-                                  session_hint, payload)
+    requested = request.headers.get("X-Mirofish-Account", "")
     relay_session = state.relay_session_id(
         request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
     beta = _beta_enabled(request)
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
 
     if not payload.get("stream"):
-        async def op(proxy_url):
-            return await state.upstream.messages(
-                account, payload, proxy_url, request_headers=request.headers,
-                session_id=relay_session, beta=beta)
-        result, headers = await state.with_proxy(account, op)
+        async def run(account: str):
+            return await state.with_proxy(
+                account,
+                lambda proxy_url: state.upstream.messages(
+                    account, payload, proxy_url, request_headers=request.headers,
+                    session_id=relay_session, beta=beta))
+        account, (result, headers) = await state.with_account_failover(
+            requested, session_hint, payload, run)
         usage = result.get("usage", {}) if isinstance(result, dict) else {}
         outgoing = state.record_usage(account, model, usage, headers)
         return JSONResponse(result, headers=outgoing)
 
-    response, stack = await state.open_messages_stream(
-        account, payload, request_headers=request.headers,
-        session_id=relay_session, beta=beta)
+    async def run_stream(account: str):
+        return await state.open_messages_stream(
+            account, payload, request_headers=request.headers,
+            session_id=relay_session, beta=beta)
+    account, (response, stack) = await state.with_account_failover(
+        requested, session_hint, payload, run_stream)
     upstream_headers = {key.lower(): value for key, value in response.headers.items()}
     quota = quota_headers(upstream_headers)
     outgoing = {"X-Mirofish-Account": account}

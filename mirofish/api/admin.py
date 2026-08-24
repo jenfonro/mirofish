@@ -34,6 +34,7 @@ async def list_accounts(request: Request) -> dict[str, Any]:
         status = public_status(state.store.row(alias),
                                proxy=state.pool.account_public(alias))
         status["active_sessions"] = sessions.get(alias, 0)
+        status["shared_quota_cooldown"] = round(state.exhausted_cooldown(alias))
         accounts.append(status)
     return {"accounts": accounts}
 
@@ -77,6 +78,20 @@ async def all_limits(request: Request) -> dict[str, Any]:
 
     results = await asyncio.gather(*(one(alias) for alias in aliases))
     return {"accounts": list(results)}
+
+
+@router.post("/api/accounts/{alias}/enabled")
+async def set_account_enabled(alias: str, request: Request) -> dict[str, Any]:
+    """Panel switch. A disabled account keeps its credentials but is excluded
+    from automatic selection; requesting it explicitly returns 403."""
+    state = get_state(request)
+    alias = alias_value(alias)
+    payload = await read_json_body(request)
+    enabled = bool(payload.get("enabled"))
+    state.store.merge_metadata(alias, {"disabled": not enabled})
+    if not enabled:
+        state.drop_account_sessions(alias)
+    return {"alias": alias, "enabled": enabled}
 
 
 @router.delete("/api/accounts/{alias}")

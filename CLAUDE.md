@@ -37,7 +37,12 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   the refresh interval). Do not rotate on account/shared-quota errors such as
   `credit_exhausted_shared`; those are not exit properties.
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
-- Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts whose 7-day utilization is exhausted). Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned the least-loaded eligible account so separate windows fan out. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the plain round-robin used for `/v1/models`.
+- Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts whose 7-day utilization is exhausted). Accounts disabled via
+  the WebUI switch (`POST /api/accounts/{alias}/enabled`, `disabled` in metadata) are excluded
+  from automatic selection and return 403 when requested explicitly. An upstream 429
+  `credit_exhausted_shared` is an account property: the request fails over to another account
+  (never when explicitly pinned), the refused account cools down for `SHARED_QUOTA_COOLDOWN`
+  (600s) and its live sessions are reassigned — without rotating its proxy node. Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned the least-loaded eligible account so separate windows fan out. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the plain round-robin used for `/v1/models`.
 - WebUI is built by Vite into `mirofish/static/` and served by the relay; a fallback page with build instructions appears if it is missing.
 
 ## Common commands

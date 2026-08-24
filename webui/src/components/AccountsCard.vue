@@ -32,6 +32,27 @@ async function refreshStatus(alias: string, probe = false) {
   }
 }
 
+async function toggleEnabled(account: Account) {
+  busy.value = account.alias;
+  try {
+    const enabled = !!account.disabled;
+    await api(`/api/accounts/${account.alias}/enabled`, {
+      method: "POST",
+      body: JSON.stringify({ enabled }),
+    });
+    await loadAccounts();
+    toast(enabled ? `已启用 ${account.alias}` : `已停用 ${account.alias}：不再参与自动分配`, "ok");
+  } catch (error: any) {
+    toast(`切换 ${account.alias} 失败：${error.message}`, "error");
+  } finally {
+    busy.value = "";
+  }
+}
+
+function cooldownLabel(seconds: number): string {
+  return seconds >= 90 ? `${Math.ceil(seconds / 60)} 分钟` : `${seconds} 秒`;
+}
+
 async function removeAccount(alias: string) {
   if (!confirm(`删除账号 ${alias} 的本地凭证？（不会注销远端账号）`)) return;
   try {
@@ -60,18 +81,35 @@ async function removeAccount(alias: string) {
       <table>
         <thead>
           <tr>
-            <th>别名</th><th>邮箱</th><th>套餐</th><th>代理节点</th>
+            <th>启用</th><th>别名</th><th>邮箱</th><th>套餐</th><th>代理节点</th>
             <th>7 天配额</th><th class="num">活跃会话</th><th class="num">最近用量</th><th></th>
           </tr>
         </thead>
         <tbody>
-          <tr v-for="account in store.accounts" :key="account.alias">
+          <tr v-for="account in store.accounts" :key="account.alias"
+              :class="{ off: account.disabled }">
+            <td>
+              <button class="switch" :class="{ on: !account.disabled }"
+                      :disabled="busy === account.alias"
+                      :title="account.disabled
+                        ? '已停用：不参与自动分配，点击启用'
+                        : '已启用：点击停用后不再参与自动分配（凭证保留）'"
+                      @click="toggleEnabled(account)">
+                <span class="knob"></span>
+              </button>
+            </td>
             <td class="mono">{{ account.alias }}</td>
             <td>{{ account.email }}</td>
             <td>
               <span class="badge">{{ account.plan || "未知" }}</span>
               <span v-if="account.profile_pending" class="badge"
                     title="验证码登录已完成；套餐和租户资料可稍后刷新">资料待刷新</span>
+              <span v-if="account.disabled" class="badge">已停用</span>
+              <span v-else-if="account.shared_quota_cooldown" class="badge"
+                    :title="'上游共享额度拒绝了这个账号；自动分配会先避开它，'
+                      + cooldownLabel(account.shared_quota_cooldown) + '后自动重试'">
+                额度冷却 {{ cooldownLabel(account.shared_quota_cooldown) }}
+              </span>
             </td>
             <td>
               <template v-if="account.proxy">
@@ -121,6 +159,19 @@ async function removeAccount(alias: string) {
 
 <style scoped>
 .scroll-x { overflow-x: auto; }
+tr.off td:not(:first-child) { opacity: 0.55; }
+.switch {
+  width: 34px; height: 18px; border-radius: 9px; padding: 0; position: relative;
+  border: 1px solid var(--border, rgba(128, 128, 128, 0.5));
+  background: var(--critical); cursor: pointer;
+}
+.switch.on { background: var(--good); }
+.switch:disabled { opacity: 0.5; cursor: default; }
+.switch .knob {
+  position: absolute; top: 1px; left: 1px; width: 14px; height: 14px;
+  border-radius: 50%; background: #fff; transition: left 0.15s ease;
+}
+.switch.on .knob { left: 17px; }
 .quota-cell { display: flex; align-items: center; gap: 8px; }
 .actions { white-space: nowrap; text-align: right; }
 .actions button { margin-left: 6px; }

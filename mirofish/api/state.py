@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import threading
 import time
 import uuid
@@ -21,9 +22,15 @@ from ..upstream import Upstream, quota_headers
 from ..validate import alias_value
 from ..vault import make_credential_store
 
+logger = logging.getLogger("mirofish.state")
+
 LOGIN_TTL_SECONDS = 600.0
 QUOTA_EXHAUSTED = 0.999
 MAX_NETWORK_PROXY_ATTEMPTS = 4
+# How long automatic selection avoids an account after the upstream refuses it
+# with credit_exhausted_shared. The reset time is unknown to us, so re-probe
+# occasionally instead of blacklisting until restart.
+SHARED_QUOTA_COOLDOWN = 600.0
 
 
 class AppState:
@@ -50,6 +57,9 @@ class AppState:
         self._sessions: dict[str, dict[str, Any]] = {}
         self._last_assigned: dict[str, float] = {}
         self._session_lock = threading.Lock()
+        # alias -> epoch until which automatic selection avoids the account
+        # (upstream refused it with credit_exhausted_shared).
+        self._exhausted_until: dict[str, float] = {}
 
     async def aclose(self) -> None:
         await self.upstream.aclose()
@@ -65,28 +75,61 @@ class AppState:
         except (RelayError, ValueError, TypeError, json.JSONDecodeError):
             return True
 
+    def account_disabled(self, alias: str) -> bool:
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+            return bool(metadata.get("disabled"))
+        except (RelayError, json.JSONDecodeError):
+            return False
+
+    def exhausted_cooldown(self, alias: str) -> float:
+        """Seconds left in this account's shared-quota cooldown (0 = serviceable)."""
+        return max(0.0, self._exhausted_until.get(alias, 0.0) - time.time())
+
+    def _selectable(self, alias: str) -> bool:
+        """Eligible for automatic selection: not switched off in the panel and
+        not cooling down after an upstream shared-quota refusal. Quota load is
+        a soft preference handled separately; these two are hard exclusions."""
+        return not self.account_disabled(alias) and self.exhausted_cooldown(alias) <= 0.0
+
+    def _explicit_account(self, requested: str) -> str:
+        """An explicitly requested account is honored even during a cooldown
+        (the caller may know the quota reset), but never when switched off."""
+        alias = alias_value(requested)
+        if self.account_disabled(alias):
+            raise RelayError("account is disabled in the panel: " + alias, 403)
+        return alias
+
+    def _no_selectable_error(self) -> RelayError:
+        return RelayError("all accounts are disabled or cooling down after a "
+                          "shared-quota refusal; enable one in the panel or retry later", 503)
+
     def pick_account(self, requested: str) -> str:
         """Explicit header > default account > quota-aware round-robin."""
         requested = requested.strip()
         if requested:
-            return alias_value(requested)
-        if self.default_account:
+            return self._explicit_account(requested)
+        if self.default_account and self._selectable(self.default_account):
             return self.default_account
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
+        selectable = [alias for alias in aliases if self._selectable(alias)]
+        if not selectable:
+            raise self._no_selectable_error()
         with self._rr_lock:
             start = self._rr_index
             chosen = None
             for offset in range(len(aliases)):
                 candidate = aliases[(start + offset) % len(aliases)]
-                if self._quota_ok(candidate):
+                if candidate in selectable and self._quota_ok(candidate):
                     chosen = candidate
                     self._rr_index = (start + offset + 1) % len(aliases)
                     break
             if chosen is None:
-                # Every account looks exhausted; fall back to plain round-robin.
-                chosen = aliases[start % len(aliases)]
+                # Every serviceable account looks exhausted; round-robin among
+                # the serviceable ones anyway.
+                chosen = selectable[start % len(selectable)]
                 self._rr_index = (start + 1) % len(aliases)
             return chosen
 
@@ -145,13 +188,17 @@ class AppState:
             now = time.time()
             self._prune_sessions(now)
             entry = self._sessions.get(key)
-            if entry and entry["account"] in aliases and self._quota_ok(entry["account"]):
+            if entry and entry["account"] in aliases and self._selectable(entry["account"]) \
+                    and self._quota_ok(entry["account"]):
                 entry["last"] = now
                 return entry["account"]
             # New window: assign the eligible account carrying the fewest live
             # sessions (ties broken by least-recently assigned) so windows fan
             # out across accounts instead of piling onto one.
-            eligible = [alias for alias in aliases if self._quota_ok(alias)] or aliases
+            serviceable = [alias for alias in aliases if self._selectable(alias)]
+            if not serviceable:
+                raise self._no_selectable_error()
+            eligible = [alias for alias in serviceable if self._quota_ok(alias)] or serviceable
             counts = {alias: 0 for alias in eligible}
             for existing in self._sessions.values():
                 if existing["account"] in counts:
@@ -182,8 +229,8 @@ class AppState:
         """
         requested = (requested or "").strip()
         if requested:
-            return alias_value(requested)
-        if self.default_account:
+            return self._explicit_account(requested)
+        if self.default_account and self._selectable(self.default_account):
             return self.default_account
         aliases = self.store.aliases()
         if not aliases:
@@ -192,6 +239,66 @@ class AppState:
         if not key:
             return self.pick_account("")
         return self._sticky_account(key, aliases)
+
+    # --- account-level failover -----------------------------------------------
+
+    @staticmethod
+    def _is_account_exhausted(exc: RelayError) -> bool:
+        """The upstream refused to serve this ACCOUNT (its shared credit pool is
+        used up). An account property, not an exit property: rotating proxies
+        cannot fix it, but another account can still serve the request."""
+        if not isinstance(exc.data, dict):
+            return False
+        error = exc.data.get("error")
+        return (isinstance(error, dict)
+                and str(error.get("type")) == "credit_exhausted_shared")
+
+    def drop_account_sessions(self, alias: str) -> None:
+        """Detach live sessions pinned to an account so each conversation's next
+        turn is reassigned instead of repeating a failing or disabled account."""
+        with self._session_lock:
+            stale = [key for key, entry in self._sessions.items()
+                     if entry["account"] == alias]
+            for key in stale:
+                del self._sessions[key]
+
+    def note_account_unserviceable(self, alias: str, exc: RelayError) -> bool:
+        """Record a shared-quota refusal so automatic selection avoids the
+        account for a while. Returns True when the error was that kind."""
+        if not self._is_account_exhausted(exc):
+            return False
+        self._exhausted_until[alias] = time.time() + SHARED_QUOTA_COOLDOWN
+        self.drop_account_sessions(alias)
+        logger.warning(
+            "account cooling down for %ds after shared-quota refusal: account=%s",
+            int(SHARED_QUOTA_COOLDOWN), alias)
+        return True
+
+    async def with_account_failover(
+            self, requested: str, session_hint: str, payload: Any,
+            run: Callable[[str], Awaitable[Any]]) -> tuple[str, Any]:
+        """Route an account and run the request, failing over to another account
+        when the upstream refuses the chosen one with credit_exhausted_shared.
+        An explicitly requested account is never substituted."""
+        requested = (requested or "").strip()
+        tried: set[str] = set()
+        last: Optional[RelayError] = None
+        while True:
+            try:
+                account = self.route_account(requested, session_hint, payload)
+            except RelayError as route_exc:
+                # Prefer the actionable upstream refusal over the pool-empty error.
+                raise (last or route_exc) from route_exc
+            if account in tried:
+                raise last if last is not None else RelayError(
+                    "account selection returned an already-failed account", 500)
+            try:
+                return account, await run(account)
+            except RelayError as exc:
+                if not self.note_account_unserviceable(account, exc) or requested:
+                    raise
+                tried.add(account)
+                last = exc
 
     @classmethod
     def relay_session_id(cls, claude_session: str, session_hint: str,

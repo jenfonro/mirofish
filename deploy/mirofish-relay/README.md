@@ -120,6 +120,7 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
                                      # 且不接受 top_p；其他采样参数会被自动丢弃而非转发
     POST   /api/login/start          # {"alias","email"} 发送验证码
     POST   /api/login/finish         # {"alias","code"} 完成登录
+    POST   /api/accounts/<alias>/enabled # {"enabled":true|false} 面板启用/停用开关
     DELETE /api/accounts/<alias>     # 删除本地账号及凭证
     GET    /api/usage?hours=24       # 用量统计（按小时 × 账号聚合）
 
@@ -130,6 +131,12 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
 账号选择顺序：请求头 `X-Mirofish-Account` > `MIROFISH_DEFAULT_ACCOUNT` > **会话亲和** > 轮询
 （轮询会自动跳过 7 天配额利用率已达 100% 的账号）。响应头返回
 `X-Mirofish-Account` 与 `X-Mirofish-Quota-7d-Utilization` / `-Reset`。
+
+**停用与共享额度冷却**：在 WebUI 停用的账号保留凭证但不参与任何自动分配；显式用
+`X-Mirofish-Account` 指定它会返回 403。当上游以 `credit_exhausted_shared`（共享额度耗尽）
+拒绝某个账号时，该请求会自动换一个账号重试（显式指定的账号不替换），被拒账号进入
+10 分钟冷却期，期间自动分配会避开它，其活跃会话也会改派到其他账号；冷却结束后自动
+重新尝试。这个错误是账号属性而非出口属性，因此不会触发代理节点轮换。
 
 **会话亲和**：同一个对话（窗口）始终路由到同一个账号，不同对话才分配到不同账号——
 避免「一个会话被多账号轮流服务」这种明显的中转特征。会话标识按优先级取：请求头

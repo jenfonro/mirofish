@@ -38,6 +38,8 @@ export interface Account {
   last_model?: string | null;
   limits?: AccountLimits | null;
   profile_pending?: boolean;
+  disabled?: boolean;
+  shared_quota_cooldown?: number;
   active_sessions?: number;
   checked_at?: string | null;
   proxy?: ProxyInfo | null;
