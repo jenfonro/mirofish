@@ -297,3 +297,14 @@ async def test_region_refused_everywhere_cools_account_not_pool(mihomo_state):
         await state.with_proxy("acct", op)
     assert retried.value.status == 503
     assert attempts == []
+
+
+def test_node_exclude_filters_mihomo_group_names(mihomo_state):
+    from mirofish.validate import node_exclude_pattern
+
+    state = mihomo_state
+    state.pool.node_exclude = node_exclude_pattern("香港|HK|🇭🇰")
+    configs = state.pool._configs_from_names(
+        ["🇭🇰 香港-01", "HK-Central-02", "🇯🇵 日本-01", "SG-Marina-03"])
+    names = {config["name"] for config in configs.values()}
+    assert names == {"🇯🇵 日本-01", "SG-Marina-03"}

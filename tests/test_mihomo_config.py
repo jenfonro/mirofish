@@ -93,3 +93,26 @@ def test_url_subscription_fetch_failure_is_non_fatal(tmp_path, settings, monkeyp
     config = yaml.safe_load(output.read_text())
     assert "dns" not in config
     assert config["proxy-providers"]["mirofish"]["url"] == url
+
+
+def test_node_exclude_filter_reaches_provider(tmp_path, settings, monkeypatch):
+    source = tmp_path / "sub.yaml"
+    source.write_text(SUB_WITHOUT_DNS)
+    monkeypatch.setenv("MIROFISH_PROXY_SUBSCRIPTION_FILE", str(source))
+    settings.proxy_node_exclude = "香港|HK|🇭🇰"
+    output = _generate(tmp_path)
+    write_mihomo_config(output, settings)
+    config = yaml.safe_load(output.read_text())
+    provider = config["proxy-providers"]["mirofish"]
+    assert provider["exclude-filter"] == "香港|HK|🇭🇰"
+
+
+def test_invalid_node_exclude_regex_fails_loudly(tmp_path, settings, monkeypatch):
+    from mirofish.errors import RelayError
+
+    source = tmp_path / "sub.yaml"
+    source.write_text(SUB_WITHOUT_DNS)
+    monkeypatch.setenv("MIROFISH_PROXY_SUBSCRIPTION_FILE", str(source))
+    settings.proxy_node_exclude = "香港|(unclosed"
+    with pytest.raises(RelayError):
+        write_mihomo_config(_generate(tmp_path), settings)

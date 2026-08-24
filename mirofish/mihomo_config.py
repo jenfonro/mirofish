@@ -22,7 +22,8 @@ logger = logging.getLogger("mirofish.mihomo_config")
 from .config import Settings
 from .errors import RelayError
 from .proxy.mihomo import slot_group_name
-from .validate import proxy_subscription_file_value, proxy_subscription_value
+from .validate import (node_exclude_pattern, proxy_subscription_file_value,
+                       proxy_subscription_value)
 
 
 def _write_private(path: pathlib.Path, content: bytes) -> None:
@@ -117,6 +118,11 @@ def write_mihomo_config(output_path: pathlib.Path, settings: Settings) -> None:
         _write_private(provider_file, source_bytes)
         provider = {"type": "file", "path": str(provider_file)}
         dns = dns_from_subscription(source_bytes)
+
+    if node_exclude_pattern(settings.proxy_node_exclude) is not None:
+        # Filtered at the provider, so neither the selector groups nor the
+        # relay's node list ever see the excluded exits.
+        provider["exclude-filter"] = settings.proxy_node_exclude
 
     groups: list[dict[str, Any]] = [{"name": settings.mihomo_selector, "type": "select",
                                      "use": [settings.mihomo_provider]}]

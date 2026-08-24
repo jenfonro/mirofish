@@ -27,6 +27,22 @@ def email_value(value: str) -> str:
     return value
 
 
+def node_exclude_pattern(value: str) -> re.Pattern[str] | None:
+    """Compile MIROFISH_PROXY_NODE_EXCLUDE, or None when unset.
+
+    The same string is handed to Mihomo's provider `exclude-filter` (Go RE2),
+    so keep expressions to the common subset — plain alternations like
+    `香港|HK|🇭🇰` behave identically in both engines."""
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        return re.compile(value)
+    except re.error as exc:
+        raise RelayError(
+            "MIROFISH_PROXY_NODE_EXCLUDE is not a valid regular expression", 500) from exc
+
+
 def code_value(value: str) -> str:
     value = value.strip()
     if not CODE_RE.fullmatch(value):

@@ -53,6 +53,9 @@ class Settings:
     proxy_fetch_max_bytes: int = 8 * 1024 * 1024
     proxy_subscription_user_agent: str = "mihomo/1.19.0"
     proxy_failure_threshold: int = 2
+    # Regex over node names; matches are dropped from the pool entirely
+    # (Mihomo provider exclude-filter + direct-mode parse filter).
+    proxy_node_exclude: str = ""
 
     mihomo_controller: str = ""
     mihomo_proxy: str = ""
@@ -85,6 +88,7 @@ class Settings:
                 os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT", "mihomo/1.19.0").strip()
                 or "mihomo/1.19.0"),
             proxy_failure_threshold=_env_int("MIROFISH_PROXY_FAILURE_THRESHOLD", 2, minimum=1),
+            proxy_node_exclude=os.environ.get("MIROFISH_PROXY_NODE_EXCLUDE", "").strip(),
             mihomo_controller=os.environ.get("MIROFISH_MIHOMO_CONTROLLER", "").rstrip("/"),
             mihomo_proxy=os.environ.get("MIROFISH_MIHOMO_PROXY", "").strip(),
             mihomo_selector=os.environ.get("MIROFISH_MIHOMO_SELECTOR", "MirofishPool").strip() or "MirofishPool",

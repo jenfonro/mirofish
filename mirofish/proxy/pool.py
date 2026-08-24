@@ -26,7 +26,7 @@ import httpx
 from ..config import Settings
 from ..errors import RelayError
 from ..store import Store
-from ..validate import alias_value, proxy_subscription_value
+from ..validate import alias_value, node_exclude_pattern, proxy_subscription_value
 from .mihomo import MihomoClient, SlotManager
 from .parse import parse_proxy_subscription, proxy_from_uri, proxy_identity, proxy_url
 
@@ -56,6 +56,7 @@ class ProxyPool:
             self.slots = SlotManager(self.mihomo, proxy_url(self.mihomo_proxy),
                                      settings.mihomo_slots, settings.mihomo_slot_base_port,
                                      settings.mihomo_selector)
+        self.node_exclude = node_exclude_pattern(settings.proxy_node_exclude)
         self.subscription_url = store.proxy_subscription_url()
         self.configs = store.proxy_configs()
         self.last_refresh = 0.0
@@ -133,6 +134,10 @@ class ProxyPool:
             if not name or name in system or name == self.settings.mihomo_selector \
                     or name.startswith("MirofishSlot"):
                 continue
+            # Belt and braces next to the provider exclude-filter: also covers
+            # a sidecar still running a config generated before the filter.
+            if self.node_exclude and self.node_exclude.search(name):
+                continue
             config = {**self.mihomo_proxy, "name": name, "mihomo_node": name}
             proxy_id = proxy_identity(config)
             configs[proxy_id] = {**config, "id": proxy_id}
@@ -190,6 +195,11 @@ class ProxyPool:
             try:
                 raw = await self._fetch_subscription(url)
                 nodes, skipped = parse_proxy_subscription(raw)
+                if self.node_exclude:
+                    kept = [item for item in nodes
+                            if not self.node_exclude.search(str(item.get("name", "")))]
+                    skipped += len(nodes) - len(kept)
+                    nodes = kept
                 configs = {proxy_identity(item): {**item, "id": proxy_identity(item)}
                            for item in nodes}
                 if not configs:
@@ -259,15 +269,24 @@ class ProxyPool:
 
     def _select(self, alias: str, exclude: Optional[str] = None) -> dict[str, Any]:
         refused = self._refused_ids(alias)
-        rows = [row for row in self.store.proxy_rows(active_only=True)
+        available = [row for row in self.store.proxy_rows(active_only=True)
+                     if int(row["failure_count"]) == 0
+                     and self._config_for_row(row)]
+        rows = [row for row in available
                 if str(row["proxy_id"]) != (exclude or "")
-                and str(row["proxy_id"]) not in refused
-                and int(row["failure_count"]) == 0
-                and self._config_for_row(row)]
+                and str(row["proxy_id"]) not in refused]
         if not rows:
-            if refused:
+            available_ids = {str(row["proxy_id"]) for row in available}
+            # A previous request may already have swept every usable exit for
+            # this account (for example, the dashboard's /api/limits fetch).
+            # Preserve the account-scoped marker so the next model request can
+            # cool this account and fail over without another upstream call.
+            # Do not attach it when the pool is genuinely empty/dead, or when
+            # `exclude` removed a node after a network failure.
+            if exclude is None and available_ids and available_ids <= refused:
                 raise RelayError("the upstream refuses every available exit region "
-                                 "for this account; retry later", 503)
+                                 "for this account; retry later", 503,
+                                 {"region_refused_everywhere": True})
             raise RelayError("proxy pool has no available node for this account", 503)
         counts = self.store.proxy_assignment_counts()
         rows.sort(key=lambda row: (counts.get(str(row["proxy_id"]), 0),
