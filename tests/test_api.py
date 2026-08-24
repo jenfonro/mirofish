@@ -334,6 +334,94 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
     assert totals["input_tokens"] == 9 and totals["output_tokens"] == 2
 
 
+@pytest.mark.parametrize("model,betas", [
+    (
+        "claude-fable-5",
+        "claude-code-20250219,context-1m-2025-08-07,"
+        "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,"
+        "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
+        "mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,"
+        "effort-2025-11-24,fallback-credit-2026-06-01",
+    ),
+    (
+        "claude-opus-4-8",
+        "claude-code-20250219,context-1m-2025-08-07,"
+        "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,"
+        "context-management-2025-06-27,prompt-caching-scope-2026-01-05,"
+        "mid-conversation-system-2026-04-07,advisor-tool-2026-03-01,"
+        "effort-2025-11-24",
+    ),
+])
+@respx.mock
+async def test_complete_claude_code_payload_is_forwarded_unchanged(
+        client, state, auth_headers, model, betas):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages?beta=true").mock(
+        return_value=httpx.Response(
+            200, content=SSE_BODY.encode(),
+            headers={"content-type": "text/event-stream"}))
+    session_id = "0f20cf48-c292-42e9-a99e-994511307deb"
+    metadata_id = json.dumps({
+        "device_id": "a" * 64,
+        "account_uuid": "",
+        "session_id": session_id,
+    }, separators=(",", ":"))
+    payload = {
+        "model": model,
+        "max_tokens": 64000,
+        "stream": True,
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "high"},
+        "context_management": {
+            "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
+        "metadata": {"user_id": metadata_id},
+        "system": [
+            {"type": "text", "text": "first"},
+            {"type": "text", "text": "second",
+             "cache_control": {"type": "ephemeral"}},
+            {"type": "text", "text": "third",
+             "cache_control": {"type": "ephemeral"}},
+        ],
+        "tools": [{
+            "name": "noop",
+            "description": "test tool",
+            "input_schema": {"type": "object", "properties": {}},
+        }],
+        "messages": [
+            {"role": "user", "content": [
+                {"type": "text", "text": "hello",
+                 "cache_control": {"type": "ephemeral"}}]},
+            {"role": "system", "content": "continue"},
+        ],
+    }
+    headers = {
+        **auth_headers,
+        "user-agent": "claude-cli/2.1.241 (external, mirasim)",
+        "x-claude-code-session-id": session_id,
+        "anthropic-version": "2023-06-01",
+        "anthropic-beta": betas,
+        "anthropic-dangerous-direct-browser-access": "true",
+        "x-app": "cli",
+        "x-stainless-package-version": "0.112.1",
+        "x-stainless-runtime": "node",
+    }
+
+    async with client.stream(
+            "POST", "/v1/messages?beta=true", headers=headers, json=payload) as response:
+        assert response.status_code == 200
+        await response.aread()
+
+    sent = route.calls.last.request
+    assert json.loads(sent.content) == payload
+    assert sent.headers["anthropic-beta"] == betas
+    assert sent.headers["user-agent"] == headers["user-agent"]
+    assert sent.headers["x-stainless-package-version"] == "0.112.1"
+    assert sent.headers["x-mirasim-session"] == session_id
+    assert sent.url.query == b"beta=true"
+    verify_relay_signature(state, sent, "/v1/messages")
+
+
 @respx.mock
 async def test_chat_completions_non_stream(client, state, auth_headers):
     add_account(state, "work")

@@ -49,7 +49,7 @@ token 一样只进入加密凭证存储，不写入 SQLite 或日志。当前默
 `0.0.220`。Anthropic 请求会保留 `?beta=true` 与白名单内的 Claude SDK 特征头；查询串不会
 错误地并入签名，调用方的 `Authorization` / `X-Api-Key` 也绝不会转发给上游。模型流量默认发往
 官方客户端当前使用的 `https://relay.mirasim.ai`；旧的 `mirasim-relay.mirofish.ai` 分发可能仍返回
-模型目录，却对 Claude 请求错误返回 `no upstream available for model`。
+模型目录；当前观察到它可能对同一 Claude 请求返回 `no upstream available for model`。
 
 ## 代理池
 

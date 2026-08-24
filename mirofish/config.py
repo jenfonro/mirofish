@@ -72,8 +72,9 @@ class Settings:
             # retired"); the deprecation notice points product login here.
             auth_base=os.environ.get("MIROFISH_AUTH_BASE", "https://auth.mirasim.ai").rstrip("/"),
             # Current official clients send relay traffic here.  The legacy
-            # mirasim-relay.mirofish.ai distribution can still advertise the
-            # catalog while returning false model-unavailable responses.
+            # mirasim-relay.mirofish.ai distribution was observed advertising
+            # the catalog while returning model-unavailable for the same
+            # official-shape Claude requests.
             relay_base=os.environ.get(
                 "MIROFISH_RELAY_BASE", "https://relay.mirasim.ai").rstrip("/"),
             mirasim_client_version=(
