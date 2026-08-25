@@ -187,6 +187,8 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
 
 ## 注意
 
+- Docker 镜像使用仓库中的 `uv.lock` 做 `--locked --no-dev` 安装；修改
+  `pyproject.toml` 依赖后必须同步更新并提交锁文件，否则镜像构建会直接失败。
 - compose 当前把 `8787` 绑定到 `0.0.0.0`（公网可达）。任何能访问该端口的人只需本地代理密钥即可调用；
   公网部署强烈建议在前面加 TLS 与额外鉴权（反向代理 / Cloudflare Access）。改回仅本机：把 ports 设为
   `127.0.0.1:8787:8787`。
@@ -195,6 +197,38 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   `MIROFISH_RELAY_BASE` 覆盖默认 relay 地址，通过
   `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识，通过
   `MIROFISH_MIRASIM_LOCALE` 覆盖默认的 `zh-HK` locale。
+- 调用方自带 `claude-cli/...` User-Agent 时，其 SDK 指纹按抓包顺序原样透传。其他调用方
+  （OpenAI 兼容、第三方 SDK）会被补全为完整的官方指纹：`User-Agent`、`x-stainless-*`、
+  `x-app: cli`、`accept-encoding: gzip, deflate, br, zstd`，并加上路由所需的
+  `anthropic-beta: claude-code-20250219`；`x-claude-code-session-id` 与
+  `x-mirasim-session` 取相同值，和官方客户端一致。指纹字段是整体覆盖而不是逐项补默认值，
+  避免出现 `lang: python` 与 `runtime: node` 并存这种任何真实客户端都不会发出的组合；
+  只有 `anthropic-version` 和 `anthropic-beta` 这两个会改变请求语义的选项保留调用方的值。
+  `MIROFISH_CLAUDE_CLI_USER_AGENT` 可覆盖 User-Agent。
+- 判断某个指纹字段能否按账号变化，规则是：只有上游无法从别处独立核对的字段才可以。
+  据此：
+  - 描述「机器」的 `x-stainless-arch` / `x-stainless-os` **按账号区分**——CPU/操作系统
+    无法通过 TLS 连接核对，由别名确定性推导，同一账号终生不变，不同账号落在不同平台。
+    否则一批订阅在上游看来是同一台工作站，正好抵消每账号独立设备密钥与独立代理出口的
+    作用。调用方自带 CLI 指纹时这一对同样按账号改写（一个客户端在前、多账号在后时，
+    机器应属于账号而非客户端）。arch 与 os 成对抽取，不会拼出从未发行的机型。
+  - `x-mirasim-locale`、`x-mirasim-client`、`x-stainless-runtime-version` 等**刻意保持
+    全账号一致**。locale 可被上游拿出口 IP 的地理位置核对，按别名随机分散会造出
+    IP 与 locale 不匹配，反而比统一值更显眼；默认 `zh-HK` 时代理池本身就是亚洲池，
+    统一的亚洲 locale 恰是独立用户会发的值。真正正确的做法是让 locale 跟随出口地区，
+    但节点元数据并不可靠地携带地区信息，所以由运营者按需通过 `MIROFISH_MIRASIM_LOCALE`
+    统一设置。版本类字段同理：上游知道实际发行过哪些版本，伪造会变成「从未发行的
+    版本」这一破绽，而真实用户群本就聚集在当前版本上。
+- 上游会话标识（`x-mirasim-session`）现在是裸 v4 UUID，不再带 `mirofish_` 前缀：该值同时用作
+  `x-claude-code-session-id`，官方客户端在这里发的一直是 UUID。对同一对话仍然是确定性的，
+  会话亲和行为不变。
+- Claude 模型请求会自动补上官方客户端的 prompt cache 断点（Agent SDK 标记块、最后一个
+  system 块、最后一个 user 轮次的末尾块，共 3 个，与抓包一致；`tools` 不打断点）。
+  调用方自己带了任何 `cache_control` 时整体不改动，因为上游最多只接受 4 个断点。
+  最后一个 user 轮次如果是字符串内容，会展开为等价的 text block 以便承载断点。
+- 上游固定使用 HTTP/1.1 连接池；`MIROFISH_KEEPALIVE_EXPIRY`（默认 75 秒）、
+  `MIROFISH_MAX_CONNECTIONS`（默认 100）和 `MIROFISH_MAX_KEEPALIVE_CONNECTIONS`
+  （默认 20）控制连接复用，`MIROFISH_STREAM_READ_TIMEOUT`（默认 600 秒）控制流式读取超时。
 - `status?probe=1` 使用 `/v1/limits`，不产生模型调用；显式模型扫描会发送最小工作请求，
   可能消耗少量额度。
 - 删除账号只清除本地凭证，不注销远端账号。

@@ -77,7 +77,13 @@ async def _cmd_add(state: AppState, alias: str, email: str) -> None:
         lambda url: state.accounts.finish_login(
             alias, email, code, proxy_url=url,
             proxy_id=str(proxy["id"]) if proxy and proxy.get("id") else None))
+    state.reset_account_runtime(alias)
     _print(result)
+
+
+def _cmd_remove(state: AppState, alias: str) -> None:
+    state.remove_account(alias)
+    print("已删除本地账号：" + alias)
 
 
 async def _cmd_status(state: AppState, alias: str, probe: bool) -> None:
@@ -128,8 +134,7 @@ def main() -> int:
                 _run(_cmd_models(state, args.alias, args.scan, args.max_scan))
             elif args.command == "remove":
                 if input("确认删除本地账号和凭证？输入 DELETE：") == "DELETE":
-                    state.store.remove(args.alias)
-                    print("已删除本地账号：" + args.alias)
+                    _cmd_remove(state, args.alias)
             elif args.command == "serve":
                 if state.default_account:
                     state.store.row(state.default_account)

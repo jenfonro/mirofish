@@ -1,0 +1,20 @@
+{
+  "schema": 1,
+  "method": "GET",
+  "path": "/v1/limits",
+  "query": "",
+  "http_version": "HTTP/1.1",
+  "headers": [
+    {"name": "x-mirasim-probe", "value": "usage"},
+    {"name": "Authorization", "value": "<redacted:authorization>"},
+    {"name": "x-mirasim-device", "value": "<dynamic:device_id>"},
+    {"name": "x-mirasim-ts", "value": "<dynamic:unix_ms>"},
+    {"name": "x-mirasim-nonce", "value": "<dynamic:base64url_12b>"},
+    {"name": "x-mirasim-sig", "value": "<dynamic:ed25519_signature>"},
+    {"name": "x-mirasim-client", "value": "0.0.220"},
+    {"name": "accept-encoding", "value": "identity"},
+    {"name": "Host", "value": "relay.mirasim.ai"},
+    {"name": "Connection", "value": "keep-alive"}
+  ],
+  "body": {"kind": "empty"}
+}

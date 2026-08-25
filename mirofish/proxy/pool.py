@@ -274,6 +274,24 @@ class ProxyPool:
             self._region_refused.pop(alias, None)
         return set(live)
 
+    def clear_region_refusals(self, alias: str) -> None:
+        """Forget exit-region refusals attached to an account identity.
+
+        Login attempts use this without releasing the account's Mihomo slot:
+        the prospective credentials must get a fresh region probe, while an
+        already-running request under the old credentials must not have its
+        slot reassigned underneath it.
+        """
+        alias = alias_value(alias)
+        self._region_refused.pop(alias, None)
+
+    def forget_account(self, alias: str) -> None:
+        """Drop all proxy-pool state owned by an account that was removed."""
+        alias = alias_value(alias)
+        self.clear_region_refusals(alias)
+        if self.slots is not None:
+            self.slots.release(alias)
+
     def _select(self, alias: str, exclude: Optional[str] = None) -> dict[str, Any]:
         refused = self._refused_ids(alias)
         available = [row for row in self.store.proxy_rows(active_only=True)

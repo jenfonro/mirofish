@@ -1,7 +1,10 @@
 import json
 
+import pytest
+
+from mirofish.errors import RelayError
 from mirofish.translate import (OpenAIStreamTranslator, anthropic_to_openai_response,
-                                openai_to_anthropic)
+                                iter_sse_events, openai_to_anthropic)
 
 
 def test_system_and_params():
@@ -132,3 +135,26 @@ def test_stream_translator_text_and_tools():
     assert final["choices"][0]["finish_reason"] == "tool_calls"
     assert final["usage"] == {"prompt_tokens": 7, "completion_tokens": 3,
                               "total_tokens": 10}
+
+
+async def test_sse_parser_bounds_many_data_lines_without_event_terminator():
+    async def lines():
+        for _ in range(10):
+            yield 'data: {"type":"message_delta"}'
+
+    with pytest.raises(RelayError, match="SSE event is too large"):
+        async for _ in iter_sse_events(lines(), max_event_bytes=64):
+            pass
+
+
+async def test_sse_parser_resets_state_after_malformed_event():
+    async def lines():
+        for line in (
+                "event: stale", "data: not-json", "",
+                'data: {"type":"message_delta","usage":{"output_tokens":2}}', ""):
+            yield line
+
+    events = [item async for item in iter_sse_events(lines())]
+
+    assert events == [("message_delta", {
+        "type": "message_delta", "usage": {"output_tokens": 2}})]

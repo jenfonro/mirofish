@@ -1,0 +1,13 @@
+{
+  "schema": 1,
+  "method": "GET",
+  "path": "/auth/oauth/providers",
+  "query": "",
+  "http_version": "HTTP/1.1",
+  "headers": [
+    {"name": "accept-encoding", "value": "identity"},
+    {"name": "Host", "value": "auth.mirasim.ai"},
+    {"name": "Connection", "value": "keep-alive"}
+  ],
+  "body": {"kind": "empty"}
+}

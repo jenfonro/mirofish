@@ -13,6 +13,7 @@ import time
 from typing import Any, Optional
 
 from .config import Settings
+from .device import DEVICE_KEY_KIND
 from .errors import RelayError
 from .store import Store, utc_now
 from .upstream import Upstream
@@ -139,7 +140,25 @@ class AccountService:
                     "referral": {}, "tenant_response": {}, "quota": {},
                     "last_usage": {}, "profile_pending": True,
                     "checked_at": None}
+        try:
+            previous_email = str(self.store.row(alias)["email"])
+        except RelayError as exc:
+            if exc.status != 404:
+                raise
+            previous_email = ""
+        different_account = bool(
+            previous_email and previous_email.casefold() != email.casefold())
         self.store.save(alias, email, access, renewal, metadata, proxy_id=proxy_id)
+        if different_account:
+            # An alias reused for another login must not inherit the previous
+            # account's persistent Ed25519 device identity. Clear the in-memory
+            # signer too, otherwise it could keep using the deleted key.
+            self.store.vault.delete(alias, DEVICE_KEY_KIND)
+            self.upstream.forget_account(alias)
+        else:
+            # A normal re-login keeps the stable device identity, but tickets
+            # issued for the previous credentials must never be reused.
+            self.upstream.credentials_changed(alias)
 
         try:
             s1, _, me = await self.upstream.json(
@@ -233,8 +252,7 @@ class AccountService:
         accounts list can show it without another live call.
         """
         alias = alias_value(alias)
-        status, _, data = await self.upstream.signed_json(
-            alias, "GET", "/v1/limits", proxy_url=proxy_url)
+        status, _, data = await self.upstream.limits(alias, proxy_url=proxy_url)
         if status < 200 or status >= 300:
             raise RelayError("could not read usage limits", status, data)
         limits = normalize_limits(data, time.time())

@@ -1,0 +1,17 @@
+{
+  "schema": 1,
+  "method": "POST",
+  "path": "/events",
+  "query": "",
+  "http_version": "HTTP/1.1",
+  "headers": [
+    {"name": "content-type", "value": "application/json"},
+    {"name": "content-encoding", "value": "gzip"},
+    {"name": "authorization", "value": "<redacted:authorization>"},
+    {"name": "accept-encoding", "value": "identity"},
+    {"name": "content-length", "value": "<dynamic:content_length>"},
+    {"name": "Host", "value": "relay.mirasim.ai"},
+    {"name": "Connection", "value": "keep-alive"}
+  ],
+  "body": {"kind": "opaque"}
+}

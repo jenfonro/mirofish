@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "method": "GET",
+  "path": "/auth/referral",
+  "query": "",
+  "http_version": "HTTP/1.1",
+  "headers": [
+    {"name": "authorization", "value": "<redacted:authorization>"},
+    {"name": "accept-encoding", "value": "identity"},
+    {"name": "Host", "value": "auth.mirasim.ai"},
+    {"name": "Connection", "value": "keep-alive"}
+  ],
+  "body": {"kind": "empty"}
+}

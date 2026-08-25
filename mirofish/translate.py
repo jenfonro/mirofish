@@ -22,6 +22,7 @@ _DATA_URL_RE = re.compile(r"^data:(?P<media>[\w.+-]+/[\w.+-]+);base64,(?P<data>.
 FINISH_REASONS = {"end_turn": "stop", "stop_sequence": "stop",
                   "max_tokens": "length", "tool_use": "tool_calls",
                   "refusal": "content_filter"}
+MAX_SSE_EVENT_BYTES = 1024 * 1024
 
 
 def _text_of(content: Any) -> str:
@@ -227,19 +228,58 @@ def anthropic_to_openai_response(resp: dict[str, Any], model: str) -> dict[str, 
     }
 
 
-async def iter_sse_events(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str, dict[str, Any]]]:
-    """Parse an SSE line stream into (event_name, data_json) pairs."""
+async def iter_sse_lines(
+        chunks: AsyncIterator[bytes],
+        max_line_bytes: int = MAX_SSE_EVENT_BYTES) -> AsyncIterator[str]:
+    """Decode SSE lines while bounding an unterminated upstream line."""
+    buffer = bytearray()
+    async for chunk in chunks:
+        start = 0
+        while start < len(chunk):
+            newline = chunk.find(b"\n", start)
+            end = newline if newline >= 0 else len(chunk)
+            segment_length = end - start
+            if len(buffer) + segment_length > max_line_bytes:
+                raise RelayError("upstream SSE event is too large", 502)
+            buffer.extend(memoryview(chunk)[start:end])
+            if newline < 0:
+                break
+            raw = bytes(buffer)
+            buffer.clear()
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+            yield raw.decode("utf-8", errors="replace")
+            start = newline + 1
+    if buffer:
+        if buffer.endswith(b"\r"):
+            buffer = buffer[:-1]
+        yield bytes(buffer).decode("utf-8", errors="replace")
+
+
+async def iter_sse_events(
+        lines: AsyncIterator[str],
+        max_event_bytes: int = MAX_SSE_EVENT_BYTES,
+) -> AsyncIterator[tuple[str, dict[str, Any]]]:
+    """Parse a bounded SSE line stream into (event_name, data_json) pairs."""
     event = ""
     data_lines: list[str] = []
+    event_bytes = 0
     async for line in lines:
+        event_bytes += len(line.encode("utf-8"))
+        if event_bytes > max_event_bytes:
+            raise RelayError("upstream SSE event is too large", 502)
         if line.startswith("event:"):
             event = line[6:].strip()
         elif line.startswith("data:"):
             data_lines.append(line[5:].strip())
         elif not line.strip():
-            if data_lines:
-                raw = "\n".join(data_lines)
-                data_lines = []
+            current_event = event
+            current_data = data_lines
+            event = ""
+            data_lines = []
+            event_bytes = 0
+            if current_data:
+                raw = "\n".join(current_data)
                 if raw == "[DONE]":
                     continue
                 try:
@@ -247,8 +287,7 @@ async def iter_sse_events(lines: AsyncIterator[str]) -> AsyncIterator[tuple[str,
                 except json.JSONDecodeError:
                     continue
                 if isinstance(parsed, dict):
-                    yield (event or str(parsed.get("type", "")), parsed)
-            event = ""
+                    yield (current_event or str(parsed.get("type", "")), parsed)
     if data_lines:
         try:
             parsed = json.loads("\n".join(data_lines))

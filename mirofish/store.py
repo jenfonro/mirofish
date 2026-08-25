@@ -111,8 +111,8 @@ class Store:
     def save(self, alias: str, email: str, access: str, refresh: str,
              metadata: dict[str, Any], proxy_id: Optional[str] = None) -> None:
         alias = alias_value(alias)
-        self.vault.put(alias, "access", access)
         self.vault.put(alias, "refresh", refresh)
+        self.vault.put(alias, "access", access)
         stamp = utc_now()
         with self.db_lock:
             self.db.execute("""

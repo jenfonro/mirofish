@@ -1,7 +1,10 @@
+import asyncio
 import base64
 import hashlib
 import json
+import time
 import uuid
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -9,8 +12,13 @@ import respx
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
 
+from mirofish.api.relay import (_MAX_USAGE_LINE_BYTES,
+                                _ManagedStreamingResponse, _UsageWatcher,
+                                _finalize_upstream_stream)
 from mirofish.errors import RelayError
-from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER
+from mirofish.device import DEVICE_KEY_KIND
+from mirofish.translate import MAX_SSE_EVENT_BYTES
+from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, _DeviceTicket
 
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 
@@ -94,6 +102,18 @@ def test_pick_account_order(state):
     assert [first, second, third] == ["alpha", "beta", "alpha"]
 
 
+def test_removed_default_account_falls_back_to_existing_alias(state):
+    add_account(state, "work")
+    add_account(state, "other")
+    state.default_account = "work"
+
+    state.remove_account("work")
+
+    assert state.default_account == "work"  # configuration is unchanged
+    assert state.pick_account("") == "other"
+    assert state.route_account("", "", _conv("new conversation")) == "other"
+
+
 def test_pick_account_skips_exhausted_quota(state):
     add_account(state, "alpha")
     add_account(state, "beta")
@@ -157,8 +177,23 @@ def test_relay_session_id_preserves_claude_id_and_hashes_local_hints(state):
         "claude-session-1"
     first = state.relay_session_id("", "local-secret", _conv("private prompt"))
     second = state.relay_session_id("", "local-secret", _conv("changed prompt"))
-    assert first == second and first.startswith("mirofish_")
+    # Deterministic, and shaped like the bare v4 UUID every official client
+    # sends, so the relay does not name itself in an upstream header.
+    assert first == second
+    assert uuid.UUID(first).version == 4
     assert "local-secret" not in first and "private prompt" not in first
+
+
+def test_record_usage_survives_account_deleted_during_stream(state):
+    add_account(state, "work")
+    state.remove_account("work")
+
+    outgoing = state.record_usage(
+        "work", "claude-fable-5", {"input_tokens": 7, "output_tokens": 3}, {})
+
+    assert outgoing["X-Mirofish-Account"] == "work"
+    assert state.store.usage_summary(1)["totals"] == {
+        "requests": 1, "input_tokens": 7, "output_tokens": 3}
 
 
 @respx.mock
@@ -178,7 +213,8 @@ async def test_messages_non_stream(client, state, auth_headers):
     sent = json.loads(route.calls.last.request.content)
     assert sent["model"] == "claude-haiku-4-5"
     assert sent["system"] == [
-        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
+         "cache_control": {"type": "ephemeral"}},
     ]
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
     assert all(route.calls.last.request.headers.get(name) for name in (
@@ -186,7 +222,8 @@ async def test_messages_non_stream(client, state, auth_headers):
         "x-mirasim-client"))
     assert route.calls.last.request.headers["x-mirasim-client"] == "0.0.220"
     assert route.calls.last.request.headers["x-mirasim-agent"] == "claude"
-    assert route.calls.last.request.headers["x-mirasim-session"].startswith("mirofish_")
+    assert uuid.UUID(
+        route.calls.last.request.headers["x-mirasim-session"]).version == 4
     assert "x-mirasim-probe" not in route.calls.last.request.headers
     assert session.calls.last.request.headers["authorization"] == "Bearer access-work"
     totals = state.store.usage_summary(1)["totals"]
@@ -335,10 +372,151 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
         "0f20cf48-c292-42e9-a99e-994511307deb"
     assert route.calls.last.request.url.query == b"beta=true"
     assert json.loads(route.calls.last.request.content)["system"] == [
-        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
+         "cache_control": {"type": "ephemeral"}},
     ]
     totals = state.store.usage_summary(1)["totals"]
     assert totals["input_tokens"] == 9 and totals["output_tokens"] == 2
+
+
+@respx.mock
+async def test_messages_stream_preserves_fragmented_crlf_bytes(
+        client, state, auth_headers):
+    """Usage inspection must not normalize line endings or append a newline."""
+    add_account(state, "work")
+    mock_device_session()
+    original = (
+        b'event: message_start\r\n'
+        b'data: {"type":"message_start","message":{"usage":'
+        b'{"input_tokens":7}}}\r\n\r\n'
+        b'event: content_block_delta\r\n'
+        b'data: {"type":"content_block_delta","delta":{"type":'
+        b'"text_delta","text":"\xe4\xbd\xa0\xe5\xa5\xbd"}}\r\n\r\n'
+        b'event: message_delta\r\n'
+        b'data: {"type":"message_delta","usage":{"output_tokens":3}}'
+    )
+
+    class FragmentedStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            # Deliberately split inside CRLF, JSON, and the UTF-8 text.
+            cuts = (1, 24, 25, 67, 104, 149, 174, 175, 221, len(original))
+            start = 0
+            for end in cuts:
+                yield original[start:end]
+                start = end
+
+    respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(
+            200, stream=FragmentedStream(),
+            headers={"content-type": "text/event-stream"}))
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-fable-5", "max_tokens": 16, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+
+    assert response.status_code == 200
+    assert response.content == original
+    totals = state.store.usage_summary(1)["totals"]
+    assert totals["input_tokens"] == 7 and totals["output_tokens"] == 3
+
+
+def test_usage_watcher_bounds_oversized_unterminated_line():
+    watcher = _UsageWatcher()
+
+    watcher.feed_bytes(b"x" * (_MAX_USAGE_LINE_BYTES + 1))
+    assert len(watcher._buffer) == 0
+    assert watcher._discard_until_newline is True
+
+    watcher.feed_bytes(
+        b"ignored remainder\n"
+        b'data: {"type":"message_delta","usage":{"output_tokens":5}}')
+    watcher.finish()
+
+    assert watcher.usage == {"output_tokens": 5}
+    assert len(watcher._buffer) == 0
+
+
+async def test_managed_stream_finalizes_when_headers_cannot_be_sent():
+    entered = False
+    finalized = 0
+
+    async def content():
+        nonlocal entered
+        entered = True
+        yield b"never sent"
+
+    async def finalize():
+        nonlocal finalized
+        finalized += 1
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(_message):
+        raise OSError("client disconnected before body iteration")
+
+    response = _ManagedStreamingResponse(content(), finalize=finalize)
+    with pytest.raises(OSError):
+        await response(
+            {"type": "http", "asgi": {"spec_version": "2.3"}},
+            receive, send)
+
+    assert entered is False
+    assert finalized == 1
+
+
+async def test_managed_stream_shields_cleanup_from_cancellation():
+    body_send_started = asyncio.Event()
+    finalized = False
+
+    async def content():
+        yield b"part"
+
+    async def finalize():
+        nonlocal finalized
+        await asyncio.sleep(0.01)
+        finalized = True
+
+    async def receive():
+        await asyncio.Event().wait()
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("more_body"):
+            body_send_started.set()
+            await asyncio.Event().wait()
+
+    response = _ManagedStreamingResponse(content(), finalize=finalize)
+    task = asyncio.create_task(response(
+        {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send))
+    await body_send_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert finalized is True
+
+
+async def test_stream_finalize_records_usage_even_when_stack_close_fails():
+    class FailingStack:
+        async def aclose(self):
+            raise RuntimeError("synthetic close failure")
+
+    class RecordingState:
+        recorded = None
+
+        def record_usage(self, account, model, usage, headers):
+            self.recorded = (account, model, usage, headers)
+
+    watcher = _UsageWatcher()
+    watcher.feed_bytes(
+        b'data: {"type":"message_delta","usage":{"output_tokens":4}}')
+    recording = RecordingState()
+
+    await _finalize_upstream_stream(
+        FailingStack(), recording, "work", "model", watcher, {"quota": "x"})
+
+    assert recording.recorded == (
+        "work", "model", {"output_tokens": 4}, {"quota": "x"})
 
 
 @pytest.mark.parametrize("model,betas", [
@@ -448,11 +626,18 @@ async def test_chat_completions_non_stream(client, state, auth_headers):
     assert data["usage"]["total_tokens"] == 16
     sent = json.loads(route.calls.last.request.content)
     assert sent["model"] == "claude-haiku-4-5"
+    # The marker and the final system block are cache breakpoints, and the last
+    # user turn is promoted to structured content so it can carry the third.
     assert sent["system"] == [
-        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
-        {"type": "text", "text": "terse"},
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
+         "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "terse",
+         "cache_control": {"type": "ephemeral"}},
     ]
-    assert sent["messages"] == [{"role": "user", "content": "hi"}]
+    assert sent["messages"] == [{"role": "user", "content": [
+        {"type": "text", "text": "hi",
+         "cache_control": {"type": "ephemeral"}},
+    ]}]
 
 
 @respx.mock
@@ -495,6 +680,41 @@ async def test_chat_completions_stream(client, state, auth_headers):
     assert text == "Hi"
     assert chunks[-1]["choices"][0]["finish_reason"] == "stop"
     assert chunks[-1]["usage"]["total_tokens"] == 11
+
+
+@respx.mock
+async def test_chat_completions_rejects_oversized_unterminated_sse_event(
+        client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+
+    class OversizedStream(httpx.AsyncByteStream):
+        def __init__(self):
+            self.closed = False
+
+        async def __aiter__(self):
+            yield b"x" * (MAX_SSE_EVENT_BYTES + 1)
+
+        async def aclose(self):
+            self.closed = True
+
+    oversized_stream = OversizedStream()
+    upstream_response = httpx.Response(
+        200, stream=oversized_stream,
+        headers={"content-type": "text/event-stream"})
+    respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=upstream_response)
+
+    response = await client.post(
+        "/v1/chat/completions", headers=auth_headers, json={
+            "model": "m", "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        })
+
+    assert response.status_code == 200
+    assert "upstream SSE event is too large" in response.text
+    assert response.text.rstrip().endswith("data: [DONE]")
+    assert oversized_stream.closed is True
 
 
 @respx.mock
@@ -577,11 +797,120 @@ async def test_login_keeps_credentials_when_profile_has_network_failure(
     assert state.store.credentials("work") == ("saved-access", "saved-refresh")
 
 
+def _mock_login(email: str, access: str = "new-access",
+                refresh: str = "new-refresh") -> None:
+    respx.post(AUTH_BASE + "/auth/code").mock(
+        return_value=httpx.Response(200, json={"sent": True}))
+    respx.post(AUTH_BASE + "/auth/verify").mock(
+        return_value=httpx.Response(200, json={"access_token": access,
+                                               "refresh_token": refresh}))
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "new-user", "email": email}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={"current_plan": "pro"}))
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(200, json={"tenant": "t1"}))
+
+
+def _seed_account_runtime(state, alias: str) -> None:
+    state.model_cache[alias] = (time.time(), {"models": ["stale-model"]})
+    state._exhausted_until[alias] = time.time() + 600
+    state._sessions["old-conversation"] = {"account": alias, "last": time.time()}
+    state._last_assigned[alias] = time.time()
+
+
+@respx.mock
+async def test_relogin_same_email_keeps_device_and_clears_old_runtime(
+        client, state, auth_headers):
+    add_account(state, "work", "x@example.com")
+    signer = state.upstream._signer("work")
+    device_id = signer.device_id
+    key = state.upstream._ticket_key("work", None)
+    state.upstream._ticket_cache[key] = _DeviceTicket(
+        "stale-ticket", time.monotonic() + 900)
+    state.upstream._device_sessions.add(key)
+    _seed_account_runtime(state, "work")
+    state.pool._region_refused["work"] = {"stale-node": time.time() + 1800}
+    _mock_login("x@example.com")
+
+    await client.post("/api/login/start", headers=auth_headers,
+                      json={"alias": "work", "email": "x@example.com"})
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "work", "code": "123456"})
+
+    assert response.status_code == 200
+    assert state.store.credentials("work") == ("new-access", "new-refresh")
+    assert state.upstream._signer("work") is signer
+    assert state.upstream._signer("work").device_id == device_id
+    assert key not in state.upstream._ticket_cache
+    assert key not in state.upstream._device_sessions
+    assert "work" not in state.model_cache
+    assert "work" not in state._exhausted_until
+    assert "work" not in state._last_assigned
+    assert "work" not in state.pool._region_refused
+    assert all(entry["account"] != "work" for entry in state._sessions.values())
+
+
+@respx.mock
+async def test_relogin_different_email_rotates_device_identity(
+        client, state, auth_headers):
+    add_account(state, "work", "old@example.com")
+    old_device_id = state.upstream._signer("work").device_id
+    key = state.upstream._ticket_key("work", None)
+    state.upstream._ticket_cache[key] = _DeviceTicket(
+        "stale-ticket", time.monotonic() + 900)
+    state.upstream._device_sessions.add(key)
+    _mock_login("new@example.com")
+
+    await client.post("/api/login/start", headers=auth_headers,
+                      json={"alias": "work", "email": "new@example.com"})
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "work", "code": "123456"})
+
+    assert response.status_code == 200
+    assert state.store.row("work")["email"] == "new@example.com"
+    assert "work" not in state.upstream._signers
+    assert key not in state.upstream._ticket_cache
+    assert key not in state.upstream._device_sessions
+    with pytest.raises(RelayError):
+        state.store.vault.get("work", DEVICE_KEY_KIND)
+    assert state.upstream._signer("work").device_id != old_device_id
+
+
 async def test_delete_account(client, state, auth_headers):
     add_account(state, "work")
+    old_device_id = state.upstream._signer("work").device_id
+    key = state.upstream._ticket_key("work", None)
+    state.upstream._ticket_cache[key] = _DeviceTicket(
+        "stale-ticket", time.monotonic() + 900)
+    state.upstream._device_sessions.add(key)
+    _seed_account_runtime(state, "work")
+    state.pending_logins["work"] = {
+        "email": "work@example.com", "created": time.time(), "proxy_id": None}
+    state.pool._region_refused["work"] = {"stale-node": time.time() + 1800}
+    released = []
+    state.pool.slots = SimpleNamespace(release=released.append)
+
     response = await client.request("DELETE", "/api/accounts/work", headers=auth_headers)
+
     assert response.status_code == 200
     assert state.store.aliases() == []
+    assert "work" not in state.upstream._signers
+    assert key not in state.upstream._ticket_cache
+    assert key not in state.upstream._device_sessions
+    assert "work" not in state.model_cache
+    assert "work" not in state._exhausted_until
+    assert "work" not in state._last_assigned
+    assert "work" not in state.pending_logins
+    assert "work" not in state.pool._region_refused
+    assert all(entry["account"] != "work" for entry in state._sessions.values())
+    # remove_account delegates slot ownership to ProxyPool exactly once.
+    assert released == ["work"]
+
+    # Reusing a deleted alias creates a fresh device identity rather than
+    # resurrecting the signer object that was cached before deletion.
+    add_account(state, "work")
+    assert state.upstream._signer("work").device_id != old_device_id
 
 
 async def test_usage_endpoint_validation(client, auth_headers):
@@ -643,19 +972,27 @@ async def test_account_limits(client, state, auth_headers):
     mock_device_session()
     route = respx.get(RELAY_BASE + "/v1/limits").mock(
         return_value=httpx.Response(200, json=LIMITS_RESPONSE))
-    response = await client.get("/accounts/work/limits", headers=auth_headers)
-    assert response.status_code == 200
-    body = response.json()
+    first = await client.get("/accounts/work/limits", headers=auth_headers)
+    assert first.status_code == 200
+    body = first.json()
     # Windows are normalized and ordered 5h -> 7d -> 30d.
     assert [w["name"] for w in body["windows"]] == ["5h", "7d", "30d"]
     assert body["windows"][0]["used"] == 5450.59305
     assert body["windows"][0]["label"] == "5 小时窗口"
     assert body["windows"][0]["length"] == 18000
     assert body["suspended"] is False
-    # Signed with the device ticket, and the summary is cached into metadata.
-    assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
-    assert route.calls.last.request.headers["x-mirasim-probe"] == "usage"
-    assert route.calls.last.request.headers["accept-encoding"] == "identity"
+    # The startup probe uses the account token while prewarming a device
+    # session. Later polls use the signed relay-ticket profile.
+    initial = route.calls[0].request
+    assert initial.headers["authorization"] == "Bearer access-work"
+    assert "x-mirasim-device" not in initial.headers
+    second = await client.get("/accounts/work/limits", headers=auth_headers)
+    assert second.status_code == 200
+    signed = route.calls.last.request
+    assert signed.headers["authorization"] == "Bearer device-ticket"
+    assert signed.headers["x-mirasim-device"]
+    assert signed.headers["x-mirasim-probe"] == "usage"
+    assert signed.headers["accept-encoding"] == "identity"
     cached = json.loads(state.store.row("work")["metadata_json"])["limits"]
     assert cached["windows"][0]["name"] == "5h"
 
@@ -673,6 +1010,34 @@ async def test_model_catalog_exposes_configured_default(client, state, auth_head
     assert response.status_code == 200
     assert response.json()["models"] == ["claude-fable-5", "gpt-5.6-luna"]
     assert response.json()["default_model"] == "gpt-5.6-luna"
+
+
+@respx.mock
+async def test_model_catalog_ignores_deleted_default_account(
+        client, state, auth_headers):
+    add_account(state, "work")
+    add_account(state, "other")
+    state.default_account = "work"
+    state.remove_account("work")
+    session = mock_device_session("other-ticket")
+    respx.get(RELAY_BASE + "/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": []}))
+
+    response = await client.get("/v1/models", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert session.calls.last.request.headers["authorization"] == "Bearer access-other"
+
+
+async def test_model_catalog_rejects_explicit_disabled_account(
+        client, state, auth_headers):
+    add_account(state, "work")
+    state.store.merge_metadata("work", {"disabled": True})
+
+    response = await client.get(
+        "/v1/models", headers={**auth_headers, "X-Mirofish-Account": "work"})
+
+    assert response.status_code == 403
 
 
 @respx.mock
@@ -718,9 +1083,10 @@ async def test_model_scan_sends_claude_compatible_work_with_session_not_probe(
     body = json.loads(sent.content)
     assert body["max_tokens"] == 2
     assert body["system"] == [
-        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
+        {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
+         "cache_control": {"type": "ephemeral"}},
     ]
-    assert sent.headers["x-mirasim-session"].startswith("mirofish_")
+    assert uuid.UUID(sent.headers["x-mirasim-session"]).version == 4
     assert "x-mirasim-probe" not in sent.headers
 
 

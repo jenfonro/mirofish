@@ -44,6 +44,24 @@ async def test_remembered_region_exhaustion_fails_over_account(state):
     assert state.exhausted_cooldown("alpha") > 0
 
 
+async def test_new_login_reprobes_regions_refused_for_previous_identity(state):
+    add_account(state, "alpha")
+    proxy = _add_proxy(state, "node-a")
+    state.pool.mark_region_refused("alpha", proxy)
+    used = []
+
+    async def run(proxy_url):
+        used.append(proxy_url)
+        return "sent"
+
+    chosen, result = await state.with_pending_proxy("alpha", run)
+
+    assert chosen == proxy
+    assert result == "sent"
+    assert used == ["http://node-a.example:8080"]
+    assert "alpha" not in state.pool._region_refused
+
+
 async def test_dead_pool_is_not_mislabeled_as_region_exhaustion(state):
     add_account(state, "alpha")
     proxy = _add_proxy(state, "node-a")

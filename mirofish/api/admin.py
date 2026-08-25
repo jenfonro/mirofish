@@ -98,9 +98,7 @@ async def set_account_enabled(alias: str, request: Request) -> dict[str, Any]:
 async def delete_account(alias: str, request: Request) -> dict[str, Any]:
     state = get_state(request)
     alias = alias_value(alias)
-    state.store.remove(alias)
-    if state.pool.slots is not None:
-        state.pool.slots.release(alias)
+    state.remove_account(alias)
     return {"deleted": alias}
 
 
@@ -129,6 +127,7 @@ async def login_finish(request: Request) -> dict[str, Any]:
         lambda url: state.accounts.finish_login(
             alias, pending["email"], str(payload.get("code", "")), proxy_url=url,
             proxy_id=str(proxy["id"]) if proxy and proxy.get("id") else None))
+    state.reset_account_runtime(alias)
     state.pending_logins.pop(alias, None)
     return result
 

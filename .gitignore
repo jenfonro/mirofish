@@ -8,3 +8,24 @@ dist/
 proxy.key
 .DS_Store
 mirofish/static/
+
+# Network captures may contain bearer tokens, device tickets, account data,
+# prompts, and response bodies. Keep raw captures outside the repository; only
+# redacted request-profile fixtures belong in source control.
+flows/
+captures/
+*.flow
+*.flows
+*.mitm
+*.mitmproxy
+*.mitmweb
+*.har
+*.pcap
+*.pcapng
+
+# Local editor/runtime launch settings are user-specific and must not be
+# included in source distributions.
+.claude/
+
+# Mounted proxy subscription inputs often contain node credentials.
+/deploy/mirofish-relay/mihomo-input/

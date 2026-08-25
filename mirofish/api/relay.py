@@ -4,9 +4,11 @@ passthrough) and the cached per-account /v1/models catalog."""
 from __future__ import annotations
 
 import json
+import logging
 import time
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
+import anyio
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -15,6 +17,12 @@ from ..validate import model_value
 from .deps import get_state, read_json_body, require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
+logger = logging.getLogger("mirofish.relay")
+
+# We only need the small message_start/message_delta usage objects. A malformed
+# upstream event must not make the observation side-buffer grow with the full
+# streamed response.
+_MAX_USAGE_LINE_BYTES = 256 * 1024
 
 
 def _beta_enabled(request: Request) -> bool:
@@ -26,6 +34,65 @@ class _UsageWatcher:
 
     def __init__(self) -> None:
         self.usage: dict[str, Any] = {}
+        self._buffer = bytearray()
+        self._discard_until_newline = False
+
+    def feed_bytes(self, chunk: bytes) -> None:
+        """Observe complete SSE lines without changing the relayed bytes.
+
+        HTTP chunks can split a UTF-8 code point or an SSE line anywhere, so
+        parsing happens from a private buffer. The caller still yields the
+        original ``chunk`` byte-for-byte.
+        """
+        start = 0
+        while start < len(chunk):
+            if self._discard_until_newline:
+                newline = chunk.find(b"\n", start)
+                if newline < 0:
+                    return
+                self._discard_until_newline = False
+                start = newline + 1
+                continue
+
+            newline = chunk.find(b"\n", start)
+            end = newline if newline >= 0 else len(chunk)
+            segment_length = end - start
+            if len(self._buffer) + segment_length > _MAX_USAGE_LINE_BYTES:
+                self._buffer.clear()
+                if newline < 0:
+                    self._discard_until_newline = True
+                    return
+                # This oversized line ends inside the current chunk. Skip it
+                # and resume observing the next line without copying it.
+            else:
+                self._buffer.extend(memoryview(chunk)[start:end])
+                if newline >= 0:
+                    raw = bytes(self._buffer)
+                    self._buffer.clear()
+                    if raw.endswith(b"\r"):
+                        raw = raw[:-1]
+                    self._feed_raw_line(raw)
+            if newline < 0:
+                return
+            start = newline + 1
+
+    def finish(self) -> None:
+        """Parse a final SSE line even when the stream has no trailing newline."""
+        if self._buffer and not self._discard_until_newline:
+            raw = bytes(self._buffer)
+            self._buffer.clear()
+            if raw.endswith(b"\r"):
+                raw = raw[:-1]
+            self._feed_raw_line(raw)
+        self._buffer.clear()
+        self._discard_until_newline = False
+
+    def _feed_raw_line(self, raw: bytes) -> None:
+        try:
+            line = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return
+        self.feed_line(line)
 
     def feed_line(self, line: str) -> None:
         if not line.startswith("data:"):
@@ -47,6 +114,55 @@ class _UsageWatcher:
         elif kind == "message_delta":
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
             self.usage.update(usage)
+
+
+class _ManagedStreamingResponse(StreamingResponse):
+    """Always release an already-open upstream stream and proxy route.
+
+    Starlette may cancel response sending before it ever enters the body
+    iterator (for example, a disconnect while sending response headers). An
+    async-generator ``finally`` cannot cover that case, so ownership lives at
+    the outer ASGI response boundary.
+    """
+
+    def __init__(self, *args: Any, finalize: Callable[[], Awaitable[None]],
+                 **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._finalize = finalize
+        self._finalized = False
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            if not self._finalized:
+                self._finalized = True
+                # The disconnect path runs under cancellation. Closing the
+                # response/route lock is cleanup, not optional response work.
+                with anyio.CancelScope(shield=True):
+                    close_iterator = getattr(self.body_iterator, "aclose", None)
+                    if close_iterator is not None:
+                        try:
+                            await close_iterator()
+                        except Exception:  # noqa: BLE001 - still release route
+                            logger.warning("could not close downstream body iterator")
+                    await self._finalize()
+
+
+async def _finalize_upstream_stream(
+        stack: Any, state: Any, account: str, model: str | None,
+        observer: Any, upstream_headers: dict[str, str]) -> None:
+    finish = getattr(observer, "finish", None)
+    if finish is not None:
+        finish()
+    try:
+        await stack.aclose()
+    except Exception:  # noqa: BLE001 - cleanup continues without leaking details
+        logger.warning("could not fully close upstream stream: account=%s", account)
+    try:
+        state.record_usage(account, model, observer.usage, upstream_headers)
+    except Exception:  # noqa: BLE001 - response cleanup must never be undone
+        logger.warning("could not persist streamed usage: account=%s", account)
 
 
 @router.post("/v1/messages")
@@ -88,18 +204,20 @@ async def messages(request: Request) -> Any:
     if quota.get("7d_reset_epoch"):
         outgoing["X-Mirofish-Quota-7d-Reset"] = str(quota["7d_reset_epoch"])
 
-    async def body() -> AsyncIterator[bytes]:
-        watcher = _UsageWatcher()
-        try:
-            async for line in response.aiter_lines():
-                watcher.feed_line(line)
-                yield (line + "\n").encode("utf-8")
-        finally:
-            await stack.aclose()
-            state.record_usage(account, model, watcher.usage, upstream_headers)
+    watcher = _UsageWatcher()
 
-    return StreamingResponse(body(), media_type="text/event-stream",
-                             headers={**outgoing, "Cache-Control": "no-cache"})
+    async def body() -> AsyncIterator[bytes]:
+        async for chunk in response.aiter_bytes():
+            watcher.feed_bytes(chunk)
+            yield chunk
+
+    async def finalize() -> None:
+        await _finalize_upstream_stream(
+            stack, state, account, model, watcher, upstream_headers)
+
+    return _ManagedStreamingResponse(
+        body(), finalize=finalize, media_type="text/event-stream",
+        headers={**outgoing, "Cache-Control": "no-cache"})
 
 
 def _estimate_input_tokens(payload: dict[str, Any]) -> int:
@@ -159,14 +277,7 @@ async def count_tokens(request: Request) -> Any:
 async def models(request: Request) -> Any:
     state = get_state(request)
     requested = request.headers.get("X-Mirofish-Account", "").strip()
-    account = requested or state.default_account
-    if not account:
-        aliases = state.store.aliases()
-        account = aliases[0] if aliases else ""
-    if not account:
-        return JSONResponse({"error": {"type": "relay_error",
-                                       "message": "no account; add one or pass X-Mirofish-Account"}},
-                            status_code=400)
+    account = state.pick_account(requested)
     cached = state.model_cache.get(account)
     if cached and time.time() - cached[0] < state.settings.model_catalog_ttl:
         return {**cached[1], "default_model": state.settings.default_model}

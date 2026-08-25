@@ -6,14 +6,15 @@ import json
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse
 
 from ..errors import RelayError
 from ..translate import (OpenAIStreamTranslator, anthropic_to_openai_response,
-                         iter_sse_events, openai_to_anthropic)
+                         iter_sse_events, iter_sse_lines, openai_to_anthropic)
 from ..upstream import quota_headers
 from ..validate import model_value
 from .deps import get_state, read_json_body, require_auth
+from .relay import _ManagedStreamingResponse, _finalize_upstream_stream
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
@@ -67,15 +68,18 @@ async def chat_completions(request: Request) -> Any:
 
     async def body() -> AsyncIterator[bytes]:
         try:
-            async for event, data in iter_sse_events(response.aiter_lines()):
+            lines = iter_sse_lines(response.aiter_bytes())
+            async for event, data in iter_sse_events(lines):
                 for chunk in translator.feed(event, data):
                     yield _dump(chunk)
         except RelayError as exc:
             yield _dump({"error": {"message": str(exc), "type": "relay_error",
                                    "code": exc.status}})
-        finally:
-            yield b"data: [DONE]\n\n"
-            await stack.aclose()
-            state.record_usage(account, model, translator.usage, upstream_headers)
+        yield b"data: [DONE]\n\n"
 
-    return StreamingResponse(body(), media_type="text/event-stream", headers=outgoing)
+    async def finalize() -> None:
+        await _finalize_upstream_stream(
+            stack, state, account, model, translator, upstream_headers)
+
+    return _ManagedStreamingResponse(
+        body(), finalize=finalize, media_type="text/event-stream", headers=outgoing)

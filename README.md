@@ -143,6 +143,20 @@ SDK system 标记的第三方极简请求误报为 `no upstream available for mo
 标记的 `claude-*` 请求补一个独立的兼容块，原有 system 内容会完整保留，官方客户端请求和其他
 模型的请求体不会被这项兼容逻辑改写。`/v1/models` 中出现某个模型仍不代表上游此刻一定有后端容量。
 
+`claude-*` 请求还会自动补上官方客户端抓包中的 3 个 prompt cache 断点：Agent SDK 标记块、
+最后一个 system 块，以及最后一个 user 轮次的末尾内容块（`tools` 不打断点，与官方一致）。
+调用方自己带了任何 `cache_control` 时整体不改动。同时，非 `claude-cli/...` 调用方的请求头会
+被补全为完整的官方客户端指纹（`User-Agent`、`x-stainless-*`、`x-app`、`accept-encoding`），
+避免出现半真半假、反而更容易识别的指纹；只有 `anthropic-version` 和 `anthropic-beta` 这两个
+会改变请求语义的选项保留调用方的值。上游会话标识同时用于 `x-mirasim-session` 和
+`x-claude-code-session-id`，格式为裸 v4 UUID，对同一对话保持确定性。
+
+指纹中描述机器的 `x-stainless-arch` / `x-stainless-os` 按账号区分：由别名确定性推导，
+同一账号始终不变，不同账号落在不同平台上，避免一批订阅在上游看来共用同一台机器而抵消掉
+每账号独立设备密钥与独立代理出口。调用方自带 CLI 指纹时这一对同样按账号改写，其余槽位
+（runtime、SDK 版本、User-Agent）保持调用方的真实值。arch 与 os 成对抽取，不会拼出未曾
+发行的机型；`x-stainless-runtime-version` 只用抓包证实过的值，不做变化。
+
 ## 常用接口
 
 | 方法 | 路径 | 说明 |
@@ -168,11 +182,16 @@ SDK system 标记的第三方极简请求误报为 `no upstream available for mo
 | `MIROFISH_DEFAULT_ACCOUNT` | 空 | 强制使用的默认账号别名 |
 | `MIROFISH_DEFAULT_MODEL` | `gpt-5.6-luna` | OpenAI 兼容请求未提供模型时使用的上游模型 ID |
 | `MIROFISH_RELAY_BASE` | `https://relay.mirasim.ai` | 官方客户端当前使用的模型 relay 地址 |
+| `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.241 (external, mirasim)` | 为非 CLI 调用方补全的官方客户端 User-Agent |
 | `MIROFISH_PROXY_SUBSCRIPTION_URL` | 空 | Mihomo 代理订阅地址 |
 | `MIROFISH_PROXY_REFRESH_SECONDS` | `600` | 代理池刷新间隔 |
 | `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点停用前的连续失败次数 |
 | `MIROFISH_MIHOMO_SLOTS` | `8` | 独立代理出口槽位数量 |
 | `MIROFISH_SESSION_TTL` | `1800` | 会话亲和有效期，单位为秒 |
+| `MIROFISH_KEEPALIVE_EXPIRY` | `75` | 上游 HTTP/1.1 空闲连接保留秒数 |
+| `MIROFISH_MAX_CONNECTIONS` | `100` | 上游连接池总连接上限 |
+| `MIROFISH_MAX_KEEPALIVE_CONNECTIONS` | `20` | 上游空闲连接上限 |
+| `MIROFISH_STREAM_READ_TIMEOUT` | `600` | 上游流式响应读取超时，单位为秒 |
 
 完整配置项及示例见
 [`deploy/mirofish-relay/.env.example`](deploy/mirofish-relay/.env.example)。
@@ -208,6 +227,16 @@ uv run mirofish remove main
 uv run pytest -q
 cd webui && npm run build
 ```
+
+在已获授权的协议兼容性排查中，可用脱敏工具从本地 mitmproxy flow 生成请求画像：
+
+```bash
+mitmdump -q -nr /path/to/flows -s tools/request_profile.py
+python tools/request_profile.py validate tests/fixtures/request_profiles/messages_beta_official.json
+```
+
+工具只处理 `mirasim.ai` 域名，输出固定端点、头部顺序、动态字段类型和 JSON 结构；凭证、
+会话值、未知路径/查询/头名、正文内容均不会写入画像。原始 flow 不应放入仓库或构建上下文。
 
 ## 数据与安全
 

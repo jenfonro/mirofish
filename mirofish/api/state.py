@@ -109,11 +109,11 @@ class AppState:
         requested = requested.strip()
         if requested:
             return self._explicit_account(requested)
-        if self.default_account and self._selectable(self.default_account):
-            return self.default_account
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
+        if self.default_account in aliases and self._selectable(self.default_account):
+            return self.default_account
         selectable = [alias for alias in aliases if self._selectable(alias)]
         if not selectable:
             raise self._no_selectable_error()
@@ -230,11 +230,11 @@ class AppState:
         requested = (requested or "").strip()
         if requested:
             return self._explicit_account(requested)
-        if self.default_account and self._selectable(self.default_account):
-            return self.default_account
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
+        if self.default_account in aliases and self._selectable(self.default_account):
+            return self.default_account
         key = (session_hint or "").strip() or self._session_key_from_payload(payload)
         if not key:
             return self.pick_account("")
@@ -261,6 +261,37 @@ class AppState:
                      if entry["account"] == alias]
             for key in stale:
                 del self._sessions[key]
+
+    def reset_account_runtime(self, alias: str) -> None:
+        """Clear account-derived routing and catalog state after a login.
+
+        Credentials and device authorization are owned by ``AccountService`` /
+        ``Upstream``. This resets the application-level decisions that must not
+        leak from the previous login occupying the same alias.
+        """
+        alias = alias_value(alias)
+        self.drop_account_sessions(alias)
+        with self._session_lock:
+            self._last_assigned.pop(alias, None)
+        self.model_cache.pop(alias, None)
+        self._exhausted_until.pop(alias, None)
+        # A successful login may represent a different upstream identity under
+        # the same local alias. Region refusals belong to the old identity, but
+        # the alias's slot remains valid (and may still carry an in-flight
+        # request), so do not release it here.
+        self.pool.clear_region_refusals(alias)
+
+    def remove_account(self, alias: str) -> None:
+        """Remove an account and every in-memory identity derived from it."""
+        alias = alias_value(alias)
+        # Validate before mutating runtime state, preserving the existing 404
+        # behavior for an unknown alias.
+        self.store.row(alias)
+        self.upstream.forget_account(alias)
+        self.reset_account_runtime(alias)
+        self.pending_logins.pop(alias, None)
+        self.store.remove(alias)
+        self.pool.forget_account(alias)
 
     @staticmethod
     def _is_region_refused_everywhere(exc: RelayError) -> bool:
@@ -321,6 +352,12 @@ class AppState:
         Preserve Claude Code's own printable session id when available. Other
         local affinity hints are hashed so arbitrary caller values and message
         text never appear in an upstream header.
+
+        The hash is shaped as a v4 UUID rather than a readable prefix: this
+        value is sent as both ``x-mirasim-session`` and, for synthesized client
+        identities, ``x-claude-code-session-id``, where every official client
+        sends a bare UUID.  Determinism is what session affinity needs, and it
+        is unchanged; only the encoding differs.
         """
         direct = (claude_session or "").strip()
         if direct and len(direct) <= 128 \
@@ -328,9 +365,9 @@ class AppState:
             return direct
         key = (session_hint or "").strip() or cls._session_key_from_payload(payload)
         if key:
-            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
-            return "mirofish_" + digest
-        return "mirofish_" + str(uuid.uuid4())
+            digest = hashlib.sha256(key.encode("utf-8")).digest()[:16]
+            return str(uuid.UUID(bytes=digest, version=4))
+        return str(uuid.uuid4())
 
     # --- pending logins -------------------------------------------------------
 
@@ -434,6 +471,13 @@ class AppState:
         """Run a pre-login operation, failing over to another node when the
         picked one cannot reach the upstream (network error or a non-API
         response such as an HTML block page). Returns (proxy, result)."""
+        # Region serviceability is account-tier dependent. A deliberate new
+        # login may replace the identity behind this alias, so it must not be
+        # blocked by the previous identity's refusal history. Clear once before
+        # the retry loop; refusals learned by this login attempt still guide
+        # subsequent rotations below.
+        alias = alias_value(alias)
+        self.pool.clear_region_refusals(alias)
         for attempt in range(attempts):
             proxy = await self.pool.pending_proxy(alias)
             if proxy is None:
@@ -502,10 +546,13 @@ class AppState:
         try:
             self.store.merge_metadata(alias, {"last_usage": usage, "quota": quota,
                                               "last_model": model})
-            if usage:
-                self.store.log_usage(alias, model, usage)
         except RelayError:
             pass
+        if usage:
+            try:
+                self.store.log_usage(alias, model, usage)
+            except RelayError:
+                pass
         outgoing = {"X-Mirofish-Account": alias_value(alias)}
         if quota.get("7d_utilization"):
             outgoing["X-Mirofish-Quota-7d-Utilization"] = str(quota["7d_utilization"])

@@ -29,18 +29,29 @@ def _env_int(name: str, default: int, minimum: int | None = None) -> int:
 
 DEFAULT_DATA_DIR = pathlib.Path.home() / ".config" / "mirofish-relay"
 
+# Captured from an official client's /v1/messages request.  Callers that are
+# not themselves a Claude CLI get this identity synthesized so the relay sees a
+# coherent SDK fingerprint instead of a partial one.  Bump alongside
+# ``mirasim_client_version`` when a newer client build is observed.
+DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.241 (external, mirasim)"
+
 
 @dataclass
 class Settings:
     auth_base: str = ""
     relay_base: str = ""
     anthropic_version: str = "2023-06-01"
+    claude_cli_user_agent: str = DEFAULT_CLAUDE_CLI_USER_AGENT
     mirasim_client_version: str = "0.0.220"
     mirasim_locale: str = "zh-HK"
     keychain_service: str = "open-reverselab.mirofish-relay"
     default_model: str = "gpt-5.6-luna"
     data_dir: pathlib.Path = field(default_factory=lambda: DEFAULT_DATA_DIR)
     timeout: float = 30.0
+    stream_read_timeout: float = 600.0
+    keepalive_expiry: float = 75.0
+    max_connections: int = 100
+    max_keepalive_connections: int = 20
     max_body_bytes: int = 8 * 1024 * 1024
     model_catalog_ttl: float = 300.0
     cred_backend: str = ""
@@ -77,6 +88,11 @@ class Settings:
             # official-shape Claude requests.
             relay_base=os.environ.get(
                 "MIROFISH_RELAY_BASE", "https://relay.mirasim.ai").rstrip("/"),
+            claude_cli_user_agent=(
+                os.environ.get(
+                    "MIROFISH_CLAUDE_CLI_USER_AGENT",
+                    DEFAULT_CLAUDE_CLI_USER_AGENT).strip()
+                or DEFAULT_CLAUDE_CLI_USER_AGENT),
             mirasim_client_version=(
                 os.environ.get("MIROFISH_MIRASIM_CLIENT_VERSION", "0.0.220").strip()
                 or "0.0.220"),
@@ -90,6 +106,14 @@ class Settings:
                 os.environ.get("MIROFISH_DEFAULT_MODEL", "gpt-5.6-luna").strip()
                 or "gpt-5.6-luna"),
             session_ttl=_env_float("MIROFISH_SESSION_TTL", 1800.0, minimum=60.0),
+            stream_read_timeout=_env_float(
+                "MIROFISH_STREAM_READ_TIMEOUT", 600.0, minimum=30.0),
+            keepalive_expiry=_env_float(
+                "MIROFISH_KEEPALIVE_EXPIRY", 75.0, minimum=5.0),
+            max_connections=_env_int(
+                "MIROFISH_MAX_CONNECTIONS", 100, minimum=1),
+            max_keepalive_connections=_env_int(
+                "MIROFISH_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=1),
             proxy_refresh_seconds=_env_float("MIROFISH_PROXY_REFRESH_SECONDS", 600.0, minimum=30.0),
             proxy_fetch_timeout=_env_float("MIROFISH_PROXY_FETCH_TIMEOUT", 10.0, minimum=3.0),
             proxy_subscription_user_agent=(
@@ -107,4 +131,6 @@ class Settings:
         settings.mihomo_controller_timeout = max(
             1.0, min(settings.proxy_fetch_timeout,
                      _env_float("MIROFISH_MIHOMO_CONTROLLER_TIMEOUT", 5.0)))
+        settings.max_keepalive_connections = min(
+            settings.max_keepalive_connections, settings.max_connections)
         return settings
