@@ -5,6 +5,7 @@ weekly window resets tomorrow only half spent -- the rest is thrown away at the
 reset. Reset-first puts that account in front while it still has room.
 """
 
+import asyncio
 import json
 import time
 
@@ -251,3 +252,42 @@ def test_a_spent_account_yields_to_everyone_with_room(state):
     state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
     picks = spread(state, 6)
     assert picks["has-room"] > picks.get("spent-but-expiring", 0)
+
+
+async def test_the_sweep_skips_disabled_accounts(state, monkeypatch):
+    """A switched-off account never takes part in selection, so probing it
+    would contact the upstream for nothing."""
+    add_account(state, "on")
+    add_account(state, "off")
+    state.store.merge_metadata("off", {"disabled": True})
+    probed = []
+
+    async def fake_with_proxy(alias, op):
+        probed.append(alias)
+
+    monkeypatch.setattr(state, "with_proxy", fake_with_proxy)
+    await state.refresh_all_limits()
+    assert probed == ["on"]
+
+
+async def test_switching_on_reset_first_sweeps_immediately(state, monkeypatch):
+    """Enabling the mode must not order on days-old windows for up to five
+    minutes; the settings endpoint kicks the sweep instead."""
+    sweeps = []
+
+    async def fake_refresh():
+        sweeps.append(time.time())
+
+    monkeypatch.setattr(state, "refresh_all_limits", fake_refresh)
+    state.start_limits_refresh()  # app startup, still in balanced mode
+    await asyncio.sleep(0.05)
+    assert not sweeps  # balanced has nothing to keep warm
+
+    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.kick_limits_refresh()
+    for _ in range(200):
+        if sweeps:
+            break
+        await asyncio.sleep(0.01)
+    assert sweeps, "the kick did not trigger a sweep"
+    await state.stop_limits_refresh()

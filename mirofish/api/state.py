@@ -116,6 +116,7 @@ class AppState:
         # (upstream refused it with credit_exhausted_shared).
         self._exhausted_until: dict[str, float] = {}
         self._limits_task: Optional[asyncio.Task[None]] = None
+        self._limits_wake: Optional[asyncio.Event] = None
 
     async def aclose(self) -> None:
         await self.stop_limits_refresh()
@@ -125,11 +126,14 @@ class AppState:
     # --- background limits refresh -------------------------------------------
 
     async def refresh_all_limits(self) -> None:
-        """Re-probe every account's usage windows, one failure at a time.
+        """Re-probe every selectable account's usage windows, one failure at a
+        time.
 
         Scheduling only reads these numbers, so an account that cannot be
         probed keeps its previous values instead of dropping out of the
-        ordering.
+        ordering. Accounts switched off in the panel are skipped: they never
+        take part in automatic selection, so keeping their windows warm would
+        contact the upstream for nothing.
         """
         async def one(alias: str) -> None:
             try:
@@ -138,7 +142,8 @@ class AppState:
             except Exception as exc:  # noqa: BLE001 - one account must not stop the sweep
                 logger.debug("limits refresh failed: account=%s %s", alias, exc)
 
-        aliases = self.store.aliases()
+        aliases = [alias for alias in self.store.aliases()
+                   if not self.account_disabled(alias)]
         if aliases:
             await asyncio.gather(*(one(alias) for alias in aliases))
 
@@ -146,9 +151,13 @@ class AppState:
         """Keep the cached windows warm while reset-first ordering may use them."""
         if self._limits_task is not None:
             return
+        wake = self._limits_wake = asyncio.Event()
 
         async def loop() -> None:
             while True:
+                # Clear before sweeping so a kick that lands mid-sweep still
+                # triggers a fresh pass instead of being swallowed.
+                wake.clear()
                 try:
                     if self.schedule_settings()["mode"] == SCHEDULE_RESET_FIRST:
                         await self.refresh_all_limits()
@@ -156,12 +165,22 @@ class AppState:
                     raise
                 except Exception as exc:  # noqa: BLE001 - the loop must outlive a bad sweep
                     logger.warning("limits refresh sweep failed: %s", exc)
-                await asyncio.sleep(LIMITS_REFRESH_SECONDS)
+                try:
+                    await asyncio.wait_for(wake.wait(), LIMITS_REFRESH_SECONDS)
+                except TimeoutError:
+                    pass
 
         self._limits_task = asyncio.create_task(loop())
 
+    def kick_limits_refresh(self) -> None:
+        """Sweep now instead of waiting out the interval (e.g. right after
+        reset-first is switched on, when the cached windows may be days old)."""
+        if self._limits_wake is not None:
+            self._limits_wake.set()
+
     async def stop_limits_refresh(self) -> None:
         task, self._limits_task = self._limits_task, None
+        self._limits_wake = None
         if task is None:
             return
         task.cancel()
