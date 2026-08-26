@@ -23,7 +23,7 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 ## Architecture
 
 - FastAPI + httpx (async); dependencies managed by uv via `pyproject.toml`.
-- SQLite stores metadata and the usage log only.
+- SQLite stores metadata, non-secret settings (`settings` table, e.g. the schedule mode), and the usage log only.
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
 - Model relay calls use one installation-wide Ed25519 device identity (not one per alias), per-exit
@@ -55,10 +55,14 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   `claude-haiku-4-5`; model catalog presence does not guarantee live upstream capacity.
 - Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts whose 7-day utilization is exhausted). Accounts disabled via
   the WebUI switch (`POST /api/accounts/{alias}/enabled`, `disabled` in metadata) are excluded
-  from automatic selection and return 403 when requested explicitly. An upstream 429
-  `credit_exhausted_shared` is an account property: the request fails over to another account
-  (never when explicitly pinned), the refused account cools down for `SHARED_QUOTA_COOLDOWN`
-  (600s) and its live sessions are reassigned — without rotating its proxy node. Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned the least-loaded eligible account so separate windows fan out. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the plain round-robin used for `/v1/models`.
+  from automatic selection and return 403 when requested explicitly. Any account-scoped 429 —
+  every 429 except the region refusal `shared_quota_unavailable` (`account_scoped_429` in
+  `upstream.py` is the shared definition, applied on the Anthropic, OpenAI, and Codex responses
+  paths alike) — is an account property: the request fails over to another account (never when
+  explicitly pinned) and the account's live sessions are reassigned — without rotating its proxy
+  node. The documented `credit_exhausted_shared` cools the account for `SHARED_QUOTA_COOLDOWN`
+  (600s); any other 429 shape is usually transient rate pressure and cools for
+  `TRANSIENT_429_COOLDOWN` (60s). Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned by the schedule mode (WebUI card; `GET`/`POST /api/schedule`; persisted in the SQLite `settings` table): `balanced` (default) picks the least-loaded eligible account so separate windows fan out; `reset_first` keeps that ordering but treats an account whose 7-day window resets within `URGENCY_HORIZON_HOURS` (48h) as carrying up to `URGENCY_MAX_BONUS` (2) fewer live sessions, so expiring credit is spent first without funneling the whole concurrency onto one account. Accounts above the configurable utilization ceiling (default 0.98) sort behind every account with room but stay serviceable, and fable requests also weigh the model's own `7d_fable` window (the tighter of the two counts). Reset-first reads cached `/v1/limits` windows kept warm by a background sweep (`LIMITS_REFRESH_SECONDS` = 300s, only while the mode is on, skipping disabled accounts, kicked immediately when settings change) — never probed on the request path. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the round-robin used for `/v1/models` (in reset-first mode it applies the same tilted ordering).
 - WebUI is built by Vite into `mirofish/static/` and served by the relay; a fallback page with build instructions appears if it is missing.
 
 ## Common commands
@@ -99,7 +103,7 @@ docker compose logs -f mirofish-relay
 - Keep upstream caller authorization isolated. The relay must use credentials selected from its own credential store and never forward a caller's Authorization upstream.
 - Validate aliases, email addresses, verification codes, model names, request sizes, and JSON payloads at trust boundaries (`mirofish/validate.py`).
 - Maintain both credential backends when changing credential persistence, and keep the v1 file-vault migration path working.
-- Keep SQLite limited to metadata and usage logs. Credentials belong in Keychain or the encrypted file vault.
+- Keep SQLite limited to metadata, non-secret settings, and usage logs. Credentials belong in Keychain or the encrypted file vault.
 - Status probes use zero-cost `/v1/limits`; treat explicit model scans as billable upstream
   requests and document that behavior.
 - Proxy subscription URLs and node credentials must not enter source control; SQLite stores only proxy metadata and account-to-node IDs. Docker writes Mihomo's runtime config and provider cache under `/data/mihomo/` on the data volume.
