@@ -14,7 +14,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..upstream import _claude_compatible_payload, quota_headers
 from ..validate import model_value
-from .deps import get_state, read_json_body, require_auth
+from .deps import get_state, read_json_body, read_json_body_bytes, require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 logger = logging.getLogger("mirofish.relay")
@@ -116,6 +116,35 @@ class _UsageWatcher:
             self.usage.update(usage)
 
 
+class _ResponsesUsageWatcher(_UsageWatcher):
+    """Extract usage numbers from a Codex Responses SSE stream.
+
+    Only the terminal events carry a usage object, and they report cumulative
+    totals, so there is nothing to accumulate across deltas. Reuses the parent's
+    line framing so the relayed bytes stay untouched.
+    """
+
+    _TERMINAL_EVENTS = {"response.completed", "response.incomplete",
+                        "response.failed"}
+
+    def feed_line(self, line: str) -> None:
+        if not line.startswith("data:"):
+            return
+        raw = line[5:].strip()
+        if not raw or raw == "[DONE]":
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(data, dict) or data.get("type") not in self._TERMINAL_EVENTS:
+            return
+        response = data.get("response")
+        usage = response.get("usage") if isinstance(response, dict) else None
+        if isinstance(usage, dict):
+            self.usage.update(usage)
+
+
 class _ManagedStreamingResponse(StreamingResponse):
     """Always release an already-open upstream stream and proxy route.
 
@@ -168,8 +197,13 @@ async def _finalize_upstream_stream(
 @router.post("/v1/messages")
 async def messages(request: Request) -> Any:
     state = get_state(request)
-    payload = await read_json_body(request)
-    payload["model"] = model_value(str(payload.get("model", "")))
+    raw_body, payload = await read_json_body_bytes(request)
+    validated_model = model_value(str(payload.get("model", "")))
+    if payload.get("model") != validated_model:
+        # A configured alias/validation normalization changed the object; the
+        # bytes must be regenerated so the signed body matches that object.
+        raw_body = None
+    payload["model"] = validated_model
     session_hint = request.headers.get("X-Mirofish-Session", "")
     requested = request.headers.get("X-Mirofish-Account", "")
     relay_session = state.relay_session_id(
@@ -183,7 +217,7 @@ async def messages(request: Request) -> Any:
                 account,
                 lambda proxy_url: state.upstream.messages(
                     account, payload, proxy_url, request_headers=request.headers,
-                    session_id=relay_session, beta=beta))
+                    session_id=relay_session, beta=beta, raw_body=raw_body))
         account, (result, headers) = await state.with_account_failover(
             requested, session_hint, payload, run)
         usage = result.get("usage", {}) if isinstance(result, dict) else {}
@@ -193,7 +227,7 @@ async def messages(request: Request) -> Any:
     async def run_stream(account: str):
         return await state.open_messages_stream(
             account, payload, request_headers=request.headers,
-            session_id=relay_session, beta=beta)
+            session_id=relay_session, beta=beta, raw_body=raw_body)
     account, (response, stack) = await state.with_account_failover(
         requested, session_hint, payload, run_stream)
     upstream_headers = {key.lower(): value for key, value in response.headers.items()}

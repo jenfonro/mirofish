@@ -9,7 +9,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from ..errors import RelayError
-from . import admin, openai_compat, relay, webui
+from . import admin, openai_compat, relay, responses, webui
 from .state import AppState
 
 
@@ -30,6 +30,7 @@ def create_app(state: AppState) -> FastAPI:
     app.include_router(webui.router)
     app.include_router(admin.router)
     app.include_router(relay.router)
+    app.include_router(responses.router)
     app.include_router(openai_compat.router)
     # "miku" holds the optional anime-skin character art (webui/public/miku/).
     for sub in ("assets", "miku"):

@@ -25,6 +25,12 @@ OFFICIAL_FIXTURE_NAMES = {
     "limits_signed_official.json",
     "messages_beta_official.json",
 }
+#: Golden profiles with no capture behind them. The desktop's Codex MITM was
+#: read statically, so these record what this relay emits; the ``_official``
+#: suffix is reserved for shapes observed on the wire.
+RELAY_FIXTURE_NAMES = {
+    "codex_responses_relay.json",
+}
 
 
 def _b64url(value: bytes) -> str:
@@ -101,7 +107,7 @@ def _headers(session: str, authorization: str = "Bearer ticket-secret"):
         ("x-mirasim-session", session),
         ("x-mirasim-agent", "claude"),
         ("x-mirasim-device", _b64url(b"d" * 16)[:22]),
-        ("x-mirasim-client", "0.0.220"),
+        ("x-mirasim-client", "0.0.228"),
         ("x-mirasim-locale", "zh-HK"),
         ("x-mirasim-call", str(uuid.uuid4())),
         ("x-mirasim-ts", "1787560634123"),
@@ -129,7 +135,7 @@ def _representative_profile(name: str):
             "GET", "https://cdn-assets.mirasim.ai/mirasim/releases/latest.json",
             "HTTP/1.1", [
                 ("Accept", "application/json"),
-                ("User-Agent", "mirasim-desktop/0.0.220"),
+                ("User-Agent", "mirasim-desktop/0.0.228"),
                 ("accept-encoding", "identity"),
                 ("Host", "cdn-assets.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -139,7 +145,7 @@ def _representative_profile(name: str):
             "GET", "https://relay.mirasim.ai/v1/limits", "HTTP/1.1", [
                 ("x-mirasim-probe", "usage"),
                 ("Authorization", "Bearer synthetic-access-token"),
-                ("x-mirasim-client", "0.0.220"),
+                ("x-mirasim-client", "0.0.228"),
                 ("accept-encoding", "identity"),
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -154,7 +160,7 @@ def _representative_profile(name: str):
                 ("content-type", "application/json"),
                 ("authorization", "Bearer synthetic-access-token"),
                 *_signed_identity_headers(),
-                ("x-mirasim-client", "0.0.220"),
+                ("x-mirasim-client", "0.0.228"),
                 ("accept-encoding", "identity"),
                 ("content-length", str(len(body))),
                 ("Host", "relay.mirasim.ai"),
@@ -203,7 +209,7 @@ def _representative_profile(name: str):
                 ("x-mirasim-probe", "usage"),
                 ("Authorization", "Bearer synthetic-device-ticket"),
                 *_signed_identity_headers(),
-                ("x-mirasim-client", "0.0.220"),
+                ("x-mirasim-client", "0.0.228"),
                 ("accept-encoding", "identity"),
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -214,7 +220,8 @@ def _representative_profile(name: str):
 def test_all_observed_official_profiles_are_sanitized_and_valid():
     fixture_paths = sorted(FIXTURE_DIR.glob("*.json"))
 
-    assert {path.name for path in fixture_paths} == OFFICIAL_FIXTURE_NAMES
+    assert {path.name for path in fixture_paths} == \
+        OFFICIAL_FIXTURE_NAMES | RELAY_FIXTURE_NAMES
     for path in fixture_paths:
         profile = json.loads(path.read_text())
         validate_profile(profile)

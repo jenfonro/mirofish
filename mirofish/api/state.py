@@ -18,7 +18,7 @@ from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool
 from ..store import Store
-from ..upstream import Upstream, quota_headers
+from ..upstream import RESPONSES_PATH, Upstream, quota_headers
 from ..validate import alias_value
 from ..vault import make_credential_store
 
@@ -31,6 +31,20 @@ MAX_NETWORK_PROXY_ATTEMPTS = 4
 # with credit_exhausted_shared. The reset time is unknown to us, so re-probe
 # occasionally instead of blacklisting until restart.
 SHARED_QUOTA_COOLDOWN = 600.0
+
+
+def _is_uuid(value: str) -> bool:
+    """True for a canonically formatted UUID, hyphens and all.
+
+    ``uuid.UUID`` also accepts braces, urn: prefixes and bare hex, none of
+    which an official client would send, so require the round trip.
+    """
+    if len(value) != 36:
+        return False
+    try:
+        return str(uuid.UUID(value)) == value.lower()
+    except ValueError:
+        return False
 
 
 class AppState:
@@ -153,6 +167,60 @@ class AppState:
                     parts.append(block["text"])
         return "\n".join(parts)
 
+    #: Free-form metadata keys that clients use for a per-conversation id.  The
+    #: Responses API declares ``metadata`` as an open string map, so there is no
+    #: single official name to key on.
+    _CONVERSATION_META_KEYS = ("user_id", "conversation_id", "thread_id",
+                               "session_id")
+
+    @classmethod
+    def _explicit_conversation_id(cls, payload: dict[str, Any]) -> str:
+        """An id the client itself treats as identifying the conversation.
+
+        ``previous_response_id`` is deliberately excluded: it chains turns but
+        changes on every one of them, so keying on it would hand each turn of a
+        dialogue to a different account.
+        """
+        for container in ("metadata", "client_metadata"):
+            meta = payload.get(container)
+            if not isinstance(meta, dict):
+                continue
+            for key in cls._CONVERSATION_META_KEYS:
+                value = meta.get(key)
+                if isinstance(value, str) and value.strip():
+                    return "uid:" + value.strip()
+        # Codex sets prompt_cache_key once per conversation and repeats it on
+        # every turn, which is exactly the affinity anchor we want.
+        for key in ("prompt_cache_key", "conversation", "conversation_id"):
+            value = payload.get(key)
+            if isinstance(value, dict):
+                value = value.get("id")
+            if isinstance(value, str) and value.strip():
+                return "uid:" + value.strip()
+        return ""
+
+    @classmethod
+    def _first_user_text(cls, payload: dict[str, Any]) -> str:
+        """Text of the earliest user turn, from an Anthropic or Responses body.
+
+        ``messages`` carries Anthropic/OpenAI chat turns; ``input`` carries the
+        Responses item list, which may also be a bare string.  Items without a
+        user role (tool output, function calls) are skipped so a conversation
+        keeps its key once tools start running.
+        """
+        for field in ("messages", "input"):
+            value = payload.get(field)
+            if isinstance(value, str) and value.strip():
+                return value
+            if not isinstance(value, list):
+                continue
+            for item in value:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    text = cls._message_text(item)
+                    if text:
+                        return text
+        return ""
+
     @classmethod
     def _session_key_from_payload(cls, payload: Any) -> str:
         """Derive a key that is stable across the turns of one conversation but
@@ -163,18 +231,12 @@ class AppState:
         account."""
         if not isinstance(payload, dict):
             return ""
-        meta = payload.get("metadata")
-        if isinstance(meta, dict):
-            uid = meta.get("user_id")
-            if isinstance(uid, str) and uid.strip():
-                return "uid:" + uid.strip()
-        messages = payload.get("messages")
-        if isinstance(messages, list):
-            for message in messages:
-                if isinstance(message, dict) and message.get("role") == "user":
-                    text = cls._message_text(message)
-                    if text:
-                        return "msg:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
+        explicit = cls._explicit_conversation_id(payload)
+        if explicit:
+            return explicit
+        text = cls._first_user_text(payload)
+        if text:
+            return "msg:" + hashlib.sha256(text.encode("utf-8")).hexdigest()
         return ""
 
     def _prune_sessions(self, now: float) -> None:
@@ -287,6 +349,7 @@ class AppState:
         # Validate before mutating runtime state, preserving the existing 404
         # behavior for an unknown alias.
         self.store.row(alias)
+        self.upstream.ensure_device_identity(alias)
         self.upstream.forget_account(alias)
         self.reset_account_runtime(alias)
         self.pending_logins.pop(alias, None)
@@ -358,12 +421,17 @@ class AppState:
         identities, ``x-claude-code-session-id``, where every official client
         sends a bare UUID.  Determinism is what session affinity needs, and it
         is unchanged; only the encoding differs.
+
+        A caller's session id is therefore passed through only when it already
+        *is* a UUID.  Anything else is hashed like any other hint: it still
+        keys the same conversation to the same account, without letting a local
+        caller put an arbitrary label in an upstream header.
         """
         direct = (claude_session or "").strip()
-        if direct and len(direct) <= 128 \
-                and all(0x21 <= ord(char) <= 0x7e for char in direct):
-            return direct
-        key = (session_hint or "").strip() or cls._session_key_from_payload(payload)
+        if _is_uuid(direct):
+            return direct.lower()
+        key = direct or (session_hint or "").strip() \
+            or cls._session_key_from_payload(payload)
         if key:
             digest = hashlib.sha256(key.encode("utf-8")).digest()[:16]
             return str(uuid.UUID(bytes=digest, version=4))
@@ -504,6 +572,7 @@ class AppState:
             payload: dict[str, Any], *,
             request_headers: Optional[Mapping[str, str]] = None,
             session_id: str = "", beta: bool = False,
+            raw_body: Optional[bytes] = None,
     ) -> tuple[httpx.Response, AsyncExitStack]:
         """Open a streaming upstream call inside its proxy route context.
 
@@ -520,7 +589,7 @@ class AppState:
                     self.pool.route(alias, proxy))
                 response = await self.upstream.stream_messages(
                     alias, payload, proxy_url, request_headers=request_headers,
-                    session_id=session_id, beta=beta)
+                    session_id=session_id, beta=beta, raw_body=raw_body)
                 stack.push_async_callback(response.aclose)
                 self.pool.success(proxy)
                 return response, stack
@@ -531,6 +600,46 @@ class AppState:
                 if self._is_proxy_network_failure(exc):
                     network_failures += 1
                 proxy = self._rotate_after_failure(alias, proxy, exc, network_failures)
+                if proxy is None:
+                    raise
+            except BaseException:
+                await stack.aclose()
+                raise
+
+    async def open_responses_stream(
+            self, alias: str, body: bytes, *,
+            request_headers: Optional[Mapping[str, str]] = None,
+            session_id: str = "", account_id: str = "",
+            query_string: str = "", path: str = RESPONSES_PATH,
+    ) -> tuple[httpx.Response, AsyncExitStack]:
+        """Open a Codex relay stream while retaining its proxy route."""
+        proxy = await self.pool.for_account(alias)
+        network_failures = 0
+        while True:
+            stack = AsyncExitStack()
+            try:
+                proxy_url = await stack.enter_async_context(
+                    self.pool.route(alias, proxy))
+                response = await self.upstream.stream_responses(
+                    alias, body, proxy_url, request_headers=request_headers,
+                    session_id=session_id, account_id=account_id,
+                    query_string=query_string, path=path)
+                stack.push_async_callback(response.aclose)
+                # Unlike the Anthropic path, stream_responses *returns* upstream
+                # rejections so the Codex caller sees them verbatim.  Clearing
+                # the node's failure counter on one of those would credit an
+                # exit that never served a request.
+                if response.status_code < 400:
+                    self.pool.success(proxy)
+                return response, stack
+            except RelayError as exc:
+                await stack.aclose()
+                if not proxy:
+                    raise
+                if self._is_proxy_network_failure(exc):
+                    network_failures += 1
+                proxy = self._rotate_after_failure(
+                    alias, proxy, exc, network_failures)
                 if proxy is None:
                     raise
             except BaseException:

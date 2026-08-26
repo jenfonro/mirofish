@@ -42,7 +42,7 @@ class Settings:
     relay_base: str = ""
     anthropic_version: str = "2023-06-01"
     claude_cli_user_agent: str = DEFAULT_CLAUDE_CLI_USER_AGENT
-    mirasim_client_version: str = "0.0.220"
+    mirasim_client_version: str = "0.0.228"
     mirasim_locale: str = "zh-HK"
     keychain_service: str = "open-reverselab.mirofish-relay"
     default_model: str = "gpt-5.6-luna"
@@ -94,8 +94,8 @@ class Settings:
                     DEFAULT_CLAUDE_CLI_USER_AGENT).strip()
                 or DEFAULT_CLAUDE_CLI_USER_AGENT),
             mirasim_client_version=(
-                os.environ.get("MIROFISH_MIRASIM_CLIENT_VERSION", "0.0.220").strip()
-                or "0.0.220"),
+                os.environ.get("MIROFISH_MIRASIM_CLIENT_VERSION", "0.0.228").strip()
+                or "0.0.228"),
             mirasim_locale=(
                 os.environ.get("MIROFISH_MIRASIM_LOCALE", "zh-HK").strip()
                 or "zh-HK"),
@@ -114,6 +114,8 @@ class Settings:
                 "MIROFISH_MAX_CONNECTIONS", 100, minimum=1),
             max_keepalive_connections=_env_int(
                 "MIROFISH_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=1),
+            max_body_bytes=_env_int(
+                "MIROFISH_MAX_BODY_BYTES", 8 * 1024 * 1024, minimum=1024),
             proxy_refresh_seconds=_env_float("MIROFISH_PROXY_REFRESH_SECONDS", 600.0, minimum=30.0),
             proxy_fetch_timeout=_env_float("MIROFISH_PROXY_FETCH_TIMEOUT", 10.0, minimum=3.0),
             proxy_subscription_user_agent=(

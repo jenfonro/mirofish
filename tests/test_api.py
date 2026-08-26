@@ -173,8 +173,9 @@ def test_route_account_session_header_sticky(state):
 
 
 def test_relay_session_id_preserves_claude_id_and_hashes_local_hints(state):
-    assert state.relay_session_id("claude-session-1", "local-secret", _conv("x")) == \
-        "claude-session-1"
+    # A real client session id is already a UUID and passes through verbatim.
+    official = "0f20cf48-c292-42e9-a99e-994511307deb"
+    assert state.relay_session_id(official, "local-secret", _conv("x")) == official
     first = state.relay_session_id("", "local-secret", _conv("private prompt"))
     second = state.relay_session_id("", "local-secret", _conv("changed prompt"))
     # Deterministic, and shaped like the bare v4 UUID every official client
@@ -182,6 +183,75 @@ def test_relay_session_id_preserves_claude_id_and_hashes_local_hints(state):
     assert first == second
     assert uuid.UUID(first).version == 4
     assert "local-secret" not in first and "private prompt" not in first
+
+
+def test_relay_session_id_never_forwards_a_non_uuid_caller_label(state):
+    label = "claude-session-1"
+    derived = state.relay_session_id(label, "", _conv("x"))
+
+    # Only a genuine UUID is relayed as-is; anything else is hashed, so a local
+    # caller cannot choose the value upstream sees.
+    assert derived != label
+    assert uuid.UUID(derived).version == 4
+    # Still deterministic, so affinity for that conversation is unaffected.
+    assert state.relay_session_id(label, "", _conv("different body")) == derived
+    assert state.relay_session_id("other-label", "", _conv("x")) != derived
+    # Case is normalized rather than treated as a different session.
+    upper = "0F20CF48-C292-42E9-A99E-994511307DEB"
+    assert state.relay_session_id(upper, "", _conv("x")) == upper.lower()
+
+
+def test_session_key_follows_a_responses_conversation_across_turns(state):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    turn_one = {
+        "model": "gpt-5.6-codex",
+        "prompt_cache_key": "codex-thread-9",
+        "input": [{"type": "message", "role": "user",
+                   "content": [{"type": "input_text", "text": "first ask"}]}],
+    }
+    # A later turn shares only the cache key: the input has grown, tool output
+    # has been appended, and previous_response_id changes every turn.
+    turn_two = {
+        "model": "gpt-5.6-codex",
+        "prompt_cache_key": "codex-thread-9",
+        "previous_response_id": "resp_abc123",
+        "input": [
+            {"type": "function_call_output", "output": "{}"},
+            {"type": "message", "role": "user",
+             "content": [{"type": "input_text", "text": "follow-up ask"}]},
+        ],
+    }
+    other = {**turn_one, "prompt_cache_key": "codex-thread-10"}
+
+    account = state.route_account("", "", turn_one)
+    assert state.route_account("", "", turn_two) == account
+    assert state.relay_session_id("", "", turn_one) == \
+        state.relay_session_id("", "", turn_two)
+    assert state.relay_session_id("", "", other) != \
+        state.relay_session_id("", "", turn_one)
+    assert "codex-thread-9" not in state.relay_session_id("", "", turn_one)
+
+
+def test_session_key_falls_back_to_the_first_responses_input_turn(state):
+    add_account(state, "alpha")
+    keyless = {"model": "gpt-5.6-codex",
+               "input": [{"role": "user",
+                          "content": [{"type": "input_text", "text": "hello"}]}]}
+    grown = {"model": "gpt-5.6-codex",
+             "input": [
+                 {"role": "user",
+                  "content": [{"type": "input_text", "text": "hello"}]},
+                 {"role": "assistant",
+                  "content": [{"type": "output_text", "text": "hi"}]},
+             ]}
+    plain = {"model": "gpt-5.6-codex", "input": "hello"}
+
+    session = state.relay_session_id("", "", keyless)
+    assert uuid.UUID(session).version == 4
+    assert state.relay_session_id("", "", grown) == session
+    assert state.relay_session_id("", "", plain) == session
+    assert state.relay_session_id("", "", {"model": "gpt-5.6-codex"}) != session
 
 
 def test_record_usage_survives_account_deleted_during_stream(state):
@@ -220,7 +290,7 @@ async def test_messages_non_stream(client, state, auth_headers):
     assert all(route.calls.last.request.headers.get(name) for name in (
         "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig",
         "x-mirasim-client"))
-    assert route.calls.last.request.headers["x-mirasim-client"] == "0.0.220"
+    assert route.calls.last.request.headers["x-mirasim-client"] == "0.0.228"
     assert route.calls.last.request.headers["x-mirasim-agent"] == "claude"
     assert uuid.UUID(
         route.calls.last.request.headers["x-mirasim-session"]).version == 4
@@ -852,10 +922,11 @@ async def test_relogin_same_email_keeps_device_and_clears_old_runtime(
 
 
 @respx.mock
-async def test_relogin_different_email_rotates_device_identity(
+async def test_relogin_different_email_keeps_installation_identity(
         client, state, auth_headers):
     add_account(state, "work", "old@example.com")
-    old_device_id = state.upstream._signer("work").device_id
+    signer = state.upstream._signer("work")
+    old_device_id = signer.device_id
     key = state.upstream._ticket_key("work", None)
     state.upstream._ticket_cache[key] = _DeviceTicket(
         "stale-ticket", time.monotonic() + 900)
@@ -869,12 +940,12 @@ async def test_relogin_different_email_rotates_device_identity(
 
     assert response.status_code == 200
     assert state.store.row("work")["email"] == "new@example.com"
-    assert "work" not in state.upstream._signers
+    assert state.upstream._signer("work") is signer
     assert key not in state.upstream._ticket_cache
     assert key not in state.upstream._device_sessions
     with pytest.raises(RelayError):
         state.store.vault.get("work", DEVICE_KEY_KIND)
-    assert state.upstream._signer("work").device_id != old_device_id
+    assert state.upstream._signer("work").device_id == old_device_id
 
 
 async def test_delete_account(client, state, auth_headers):
@@ -895,7 +966,7 @@ async def test_delete_account(client, state, auth_headers):
 
     assert response.status_code == 200
     assert state.store.aliases() == []
-    assert "work" not in state.upstream._signers
+    assert state.upstream._signer("work").device_id == old_device_id
     assert key not in state.upstream._ticket_cache
     assert key not in state.upstream._device_sessions
     assert "work" not in state.model_cache
@@ -907,10 +978,10 @@ async def test_delete_account(client, state, auth_headers):
     # remove_account delegates slot ownership to ProxyPool exactly once.
     assert released == ["work"]
 
-    # Reusing a deleted alias creates a fresh device identity rather than
-    # resurrecting the signer object that was cached before deletion.
+    # Account deletion removes authorization only. The official device key is
+    # installation-global and therefore survives alias reuse.
     add_account(state, "work")
-    assert state.upstream._signer("work").device_id != old_device_id
+    assert state.upstream._signer("work").device_id == old_device_id
 
 
 async def test_usage_endpoint_validation(client, auth_headers):
@@ -934,7 +1005,9 @@ async def test_count_tokens_proxied(client, state, auth_headers):
     mock_device_session()
     route = respx.post(RELAY_BASE + "/v1/messages/count_tokens?beta=true").mock(
         return_value=httpx.Response(200, json={"input_tokens": 42}))
-    headers = {**auth_headers, "X-Claude-Code-Session-Id": "count-session"}
+    # Claude Code's own session ids are UUIDs, which the relay forwards as-is.
+    count_session = "6f1de6e1-1f3c-4a51-b8cd-0c1cb1c8f4d2"
+    headers = {**auth_headers, "X-Claude-Code-Session-Id": count_session}
     response = await client.post("/v1/messages/count_tokens?beta=true", headers=headers, json={
         "model": "claude-haiku-4-5-20251001",
         "messages": [{"role": "user", "content": "hi"}]})
@@ -946,7 +1019,7 @@ async def test_count_tokens_proxied(client, state, auth_headers):
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
     ]
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
-    assert route.calls.last.request.headers["x-mirasim-session"] == "count-session"
+    assert route.calls.last.request.headers["x-mirasim-session"] == count_session
     assert route.calls.last.request.url.query == b"beta=true"
     verify_relay_signature(state, route.calls.last.request, "/v1/messages/count_tokens")
 

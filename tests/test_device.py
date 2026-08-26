@@ -2,13 +2,15 @@ import base64
 import hashlib
 
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+    Ed25519PrivateKey, Ed25519PublicKey,
+)
 
-from mirofish.device import DeviceSigner
+from mirofish.device import DEVICE_KEY_ALIAS, DEVICE_KEY_KIND, DeviceSigner
 
 
 def test_device_signer_persists_identity_and_verifiable_signature(state):
-    signer = DeviceSigner(state.store, "work", "0.0.220")
+    signer = DeviceSigner(state.store, "0.0.228", ("work",))
     body = b'{"hello":"world"}'
     headers = signer.headers("POST", "/v1/messages", body)
 
@@ -28,8 +30,43 @@ def test_device_signer_persists_identity_and_verifiable_signature(state):
         headers["x-mirasim-sig"] + "=" * (-len(headers["x-mirasim-sig"]) % 4))
     public.verify(signature, payload)
 
-    assert headers["x-mirasim-client"] == "0.0.220"
+    assert headers["x-mirasim-client"] == "0.0.228"
 
-    reloaded = DeviceSigner(state.store, "work", "0.0.220")
+    reloaded = DeviceSigner(state.store, "0.0.228", ("another-account",))
     assert reloaded.device_id == signer.device_id
     assert reloaded.public_key == signer.public_key
+
+
+def test_device_signer_migrates_one_legacy_account_key(state):
+    legacy = Ed25519PrivateKey.generate()
+    pem = legacy.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("ascii")
+    state.store.vault.put("work", DEVICE_KEY_KIND, pem)
+
+    signer = DeviceSigner(state.store, "0.0.228", ("work",))
+    public_key = signer.public_key
+
+    assert state.store.vault.get(DEVICE_KEY_ALIAS, DEVICE_KEY_KIND) == pem
+    assert public_key == base64.b64encode(legacy.public_key().public_bytes(
+        encoding=serialization.Encoding.DER,
+        format=serialization.PublicFormat.SubjectPublicKeyInfo,
+    )).decode("ascii")
+
+
+def test_device_id_shape_is_identical_signed_and_unsigned(state):
+    """One installation, one device id.
+
+    ``x-mirasim-device`` carries the Ed25519-derived id whether or not the
+    request ends up signed, so the unsigned fallback path cannot be told apart
+    by the field's shape.
+    """
+    device_id = state.upstream._signer("work").device_id
+
+    assert len(device_id) == 22
+    assert set(device_id) <= set(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    assert state.upstream._signer("work").headers(
+        "POST", "/v1/responses", b"{}")["x-mirasim-device"] == device_id

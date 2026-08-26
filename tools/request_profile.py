@@ -32,14 +32,19 @@ _CACHE_BREAKPOINT = re.compile(
     r"(?:tools|system)\[[0-9]+\]|messages\[[0-9]+\]\.content\[[0-9]+\]")
 _SAFE_METHODS = frozenset({"DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"})
 _SAFE_HTTP_VERSIONS = frozenset({"HTTP/1.0", "HTTP/1.1", "HTTP/2", "HTTP/2.0", "HTTP/3"})
-_SAFE_ROLES = {"assistant", "system", "tool", "user"}
+_SAFE_ROLES = {"assistant", "developer", "system", "tool", "user"}
 _SAFE_BLOCK_TYPES = {
-    "document", "image", "redacted_thinking", "server_tool_use", "text",
-    "thinking", "tool_result", "tool_use", "web_search_tool_result",
+    "document", "function_call", "function_call_output", "image", "input_image",
+    "input_text", "message", "output_text", "reasoning", "redacted_thinking",
+    "server_tool_use", "text", "thinking", "tool_result", "tool_use",
+    "web_search_tool_result",
 }
+#: Conversation arrays, by the name each protocol gives them.  Anthropic sends
+#: ``messages``; the Codex Responses body sends ``input``.
+_SAFE_TURN_KEYS = ("messages", "input")
 _SAFE_HEADER_EXACT_VALUES = {
-    "accept": frozenset({"application/json"}),
-    "accept-encoding": frozenset({"gzip, deflate, br, zstd", "identity"}),
+    "accept": frozenset({"application/json", "text/event-stream"}),
+    "accept-encoding": frozenset({"gzip", "gzip, deflate, br, zstd", "identity"}),
     "anthropic-dangerous-direct-browser-access": frozenset({"true"}),
     "anthropic-version": frozenset({"2023-06-01"}),
     "connection": frozenset({"keep-alive"}),
@@ -48,13 +53,15 @@ _SAFE_HEADER_EXACT_VALUES = {
     "host": frozenset({
         "auth.mirasim.ai", "cdn-assets.mirasim.ai", "relay.mirasim.ai",
     }),
+    "openai-beta": frozenset({"responses=experimental"}),
+    "originator": frozenset({"codex_cli_rs", "mirasim"}),
     "user-agent": frozenset({
         "claude-cli/2.1.241 (external, mirasim)",
-        "mirasim-desktop/0.0.220",
+        "mirasim-desktop/0.0.228",
     }),
     "x-app": frozenset({"cli"}),
-    "x-mirasim-agent": frozenset({"claude"}),
-    "x-mirasim-client": frozenset({"0.0.220"}),
+    "x-mirasim-agent": frozenset({"claude", "codex"}),
+    "x-mirasim-client": frozenset({"0.0.228"}),
     "x-mirasim-locale": frozenset({"zh-HK"}),
     "x-mirasim-probe": frozenset({"usage"}),
     "x-stainless-arch": frozenset({"arm64"}),
@@ -72,17 +79,34 @@ _SAFE_ANTHROPIC_BETAS = frozenset({
     "context-1m-2025-08-07",
     "context-management-2025-06-27",
     "effort-2025-11-24",
+    "fallback-credit-2026-06-01",
     "interleaved-thinking-2025-05-14",
     "mid-conversation-system-2026-04-07",
     "oauth-2025-04-20",
     "prompt-caching-scope-2026-01-05",
     "thinking-token-count-2026-05-13",
 })
+_VERSION_TEXT = r"[0-9]{1,4}(?:\.[0-9]{1,4}){1,3}"
+#: Build numbers are the one part of the fingerprint that legitimately moves.
+#: Recognising their shape keeps a capture taken from an older or newer build
+#: profileable; enumerating them instead would silently redact the very version
+#: that identifies the capture, in both the fixture and the comparison.
+_SAFE_HEADER_VALUE_PATTERNS = {
+    "user-agent": re.compile(
+        rf"claude-cli/{_VERSION_TEXT} \(external, mirasim\)"
+        rf"|mirasim-desktop/{_VERSION_TEXT}"),
+    "x-mirasim-client": re.compile(_VERSION_TEXT),
+    "x-stainless-package-version": re.compile(_VERSION_TEXT),
+    "x-stainless-runtime-version": re.compile(rf"v{_VERSION_TEXT}"),
+}
 _SAFE_HEADER_VALUE_NAMES = frozenset(_SAFE_HEADER_EXACT_VALUES) | {"anthropic-beta"}
 _SAFE_JSON_KEYS = {
-    "code", "context_management", "deviceId", "email", "events", "max_tokens",
-    "messages", "metadata", "model", "output_config", "publicKey", "stream",
-    "system", "thinking", "tools",
+    "client_metadata", "code", "context_management", "deviceId", "email",
+    "events", "include", "input", "instructions", "max_output_tokens",
+    "max_tokens", "messages", "metadata", "model", "output_config",
+    "parallel_tool_calls", "previous_response_id", "prompt",
+    "prompt_cache_key", "publicKey", "query", "reasoning", "store", "stream",
+    "system", "text", "thinking", "tool_choice", "tools", "truncation",
 }
 _SAFE_PATHS = {
     "/",
@@ -94,11 +118,13 @@ _SAFE_PATHS = {
     "/auth/verify",
     "/events",
     "/mirasim/releases/latest.json",
+    "/v1/alpha/search",
     "/v1/device/session",
     "/v1/limits",
     "/v1/messages",
     "/v1/messages/count_tokens",
     "/v1/models",
+    "/v1/responses",
 }
 _REDACTED_PATH = "/<redacted:path>"
 _REDACTED_QUERY_FIELD = "<redacted:query-field>"
@@ -117,11 +143,16 @@ _REDACTED_HEADERS = {
     "x-refresh-token": "token",
     "x-relay-ticket": "ticket",
 }
-_DYNAMIC_HEADER_NAMES = frozenset({
-    "content-length", "x-claude-code-session-id", "x-mirasim-call",
-    "x-mirasim-device", "x-mirasim-nonce", "x-mirasim-session",
-    "x-mirasim-sig", "x-mirasim-ts",
+#: Conversation identifiers.  Each distinct value gets its own label, so a
+#: profile shows whether two of these headers carry the same id or different
+#: ones without recording either.  ``session_id`` is Codex's own spelling.
+_SESSION_HEADER_NAMES = frozenset({
+    "session_id", "x-claude-code-session-id", "x-mirasim-session",
 })
+_DYNAMIC_HEADER_NAMES = frozenset({
+    "content-length", "x-mirasim-call", "x-mirasim-device", "x-mirasim-nonce",
+    "x-mirasim-sig", "x-mirasim-ts",
+}) | _SESSION_HEADER_NAMES
 _SAFE_HEADER_NAMES = (
     _SAFE_HEADER_VALUE_NAMES | frozenset(_REDACTED_HEADERS) | _DYNAMIC_HEADER_NAMES)
 _REDACTED_HEADER_NAME = "<redacted:header-name>"
@@ -136,7 +167,10 @@ def _safe_literal_header_value(name: str, value: str) -> bool:
         features = value.split(",")
         return bool(features) and all(
             feature in _SAFE_ANTHROPIC_BETAS for feature in features)
-    return value in _SAFE_HEADER_EXACT_VALUES.get(name, ())
+    if value in _SAFE_HEADER_EXACT_VALUES.get(name, ()):
+        return True
+    pattern = _SAFE_HEADER_VALUE_PATTERNS.get(name)
+    return pattern is not None and bool(pattern.fullmatch(value))
 
 
 def _base64url_bytes(value: str, expected: int, label: str) -> bytes:
@@ -201,10 +235,12 @@ def _body_shape(body: bytes) -> dict[str, Any]:
         "keys": [key if key in _SAFE_JSON_KEYS else "<other>" for key in payload],
         "types": [_json_type(value) for value in payload.values()],
     }
-    messages = payload.get("messages")
-    if isinstance(messages, list):
+    for turn_key in _SAFE_TURN_KEYS:
+        turns = payload.get(turn_key)
+        if not isinstance(turns, list):
+            continue
         message_shapes = []
-        for message in messages:
+        for message in turns:
             if not isinstance(message, dict):
                 message_shapes.append({"kind": "other"})
                 continue
@@ -214,11 +250,16 @@ def _body_shape(body: bytes) -> dict[str, Any]:
                 "role": role if role in _SAFE_ROLES else "<other>",
                 "content_type": _json_type(content),
             }
+            # Responses turns are typed as well as roled, and a tool call
+            # carries no role at all, so the type is what distinguishes them.
+            kind = message.get("type")
+            if isinstance(kind, str):
+                shape["item_type"] = kind if kind in _SAFE_BLOCK_TYPES else "<other>"
             blocks = _block_types(content)
             if blocks is not None:
                 shape["block_types"] = blocks
             message_shapes.append(shape)
-        result["messages"] = message_shapes
+        result[turn_key] = message_shapes
     system = payload.get("system")
     system_blocks = _block_types(system)
     if system_blocks is not None:
@@ -272,7 +313,7 @@ def _normalize_header_value(
         raise UnsafeProfile(f"unsafe or empty header value: {name}")
     if lower in _REDACTED_HEADERS:
         return f"<redacted:{_REDACTED_HEADERS[lower]}>"
-    if lower in {"x-claude-code-session-id", "x-mirasim-session"}:
+    if lower in _SESSION_HEADER_NAMES:
         if len(value) > 256:
             raise UnsafeProfile(f"invalid {name}: session id is too long")
         label = session_labels.setdefault(value, f"session:{len(session_labels) + 1}")
@@ -428,11 +469,11 @@ def validate_profile(profile: dict[str, Any]) -> None:
         }
         if lower in exact_dynamic and value != exact_dynamic[lower]:
             raise UnsafeProfile(f"dynamic header has an invalid marker: {name}")
-        if lower in {"x-claude-code-session-id", "x-mirasim-session"} \
+        if lower in _SESSION_HEADER_NAMES \
                 and not re.fullmatch(r"<dynamic:session:[1-9][0-9]*>", value):
             raise UnsafeProfile(f"session header has an invalid marker: {name}")
         classified = lower in _REDACTED_HEADERS or lower in exact_dynamic \
-            or lower in {"x-claude-code-session-id", "x-mirasim-session"}
+            or lower in _SESSION_HEADER_NAMES
         if lower in _SAFE_HEADER_VALUE_NAMES:
             if value != "<redacted:opaque>" \
                     and not _safe_literal_header_value(lower, value):
@@ -440,8 +481,8 @@ def validate_profile(profile: dict[str, Any]) -> None:
         elif not classified and value != "<redacted:opaque>":
             raise UnsafeProfile(f"unknown header value was not redacted: {name}")
     allowed_body = {
-        "cache_breakpoints", "kind", "keys", "messages", "root_type",
-        "system_block_types", "tool_count", "types",
+        "cache_breakpoints", "kind", "keys", "root_type",
+        "system_block_types", "tool_count", "types", *_SAFE_TURN_KEYS,
     }
     body = profile["body"]
     if not set(body).issubset(allowed_body):
@@ -467,8 +508,10 @@ def validate_profile(profile: dict[str, Any]) -> None:
                 "array", "boolean", "null", "number", "object", "string", "unknown",
             } for item in types):
         raise UnsafeProfile("invalid JSON key/type profile")
-    messages = body.get("messages")
-    if messages is not None:
+    for turn_key in _SAFE_TURN_KEYS:
+        messages = body.get(turn_key)
+        if messages is None:
+            continue
         if not isinstance(messages, list):
             raise UnsafeProfile("invalid message-shape profile")
         for message in messages:
@@ -476,14 +519,19 @@ def validate_profile(profile: dict[str, Any]) -> None:
                 raise UnsafeProfile("invalid message-shape entry")
             if message == {"kind": "other"}:
                 continue
-            if set(message) not in ({"role", "content_type"},
-                                    {"role", "content_type", "block_types"}):
+            fields = set(message)
+            if not {"role", "content_type"} <= fields <= {
+                    "block_types", "content_type", "item_type", "role"}:
                 raise UnsafeProfile("message profile contains body data")
             if message["role"] not in _SAFE_ROLES | {"<other>"} \
                     or message["content_type"] not in {
                         "array", "boolean", "null", "number", "object", "string", "unknown",
                     }:
                 raise UnsafeProfile("invalid message role/content type")
+            item_type = message.get("item_type")
+            if item_type is not None \
+                    and item_type not in _SAFE_BLOCK_TYPES | {"<other>"}:
+                raise UnsafeProfile("invalid message item-type profile")
             blocks = message.get("block_types")
             if blocks is not None and (not isinstance(blocks, list) or not all(
                     item in _SAFE_BLOCK_TYPES | {"<other>"} for item in blocks)):

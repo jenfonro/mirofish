@@ -2,10 +2,12 @@
 
 import asyncio
 import time
+import uuid
 
 import httpx
 import respx
 
+from mirofish.errors import RelayError
 from mirofish.proxy.mihomo import RoutedProxyURL
 from mirofish.upstream import LIMITS_PATH, MESSAGES_PATH, _DeviceTicket
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
@@ -151,6 +153,28 @@ async def test_stale_ticket_mint_is_discarded_after_relogin_generation(
     assert state.upstream._ticket_cache[key].value == ticket
 
 
+async def test_near_expiry_ticket_is_kept_during_transient_refresh_failure(
+        state, monkeypatch):
+    add_account(state, "work")
+    key = state.upstream._ticket_key("work", None)
+    state.upstream._ticket_cache[key] = _DeviceTicket(
+        "still-valid", time.monotonic() + 90.0)
+    calls = 0
+
+    async def unavailable(_alias, _access, _proxy_url=None):
+        nonlocal calls
+        calls += 1
+        raise RelayError("device session request rejected", 503)
+
+    monkeypatch.setattr(state.upstream, "_mint_device_ticket", unavailable)
+
+    first = await state.upstream._device_ticket("work")
+    second = await state.upstream._device_ticket("work")
+
+    assert first == second == "still-valid"
+    assert calls == 1
+
+
 async def test_stale_access_refresh_cannot_overwrite_relogin(state, monkeypatch):
     add_account(state, "work")
     refresh_started = asyncio.Event()
@@ -182,7 +206,7 @@ async def test_stale_access_refresh_cannot_overwrite_relogin(state, monkeypatch)
 
 
 @respx.mock
-async def test_401_retry_keeps_session_and_call_but_resigns_request(state):
+async def test_401_retry_keeps_the_session_but_renews_the_call(state):
     add_account(state, "work")
     device = respx.post(RELAY_BASE + "/v1/device/session").mock(side_effect=[
         _device_response("ticket-before-401"),
@@ -203,7 +227,10 @@ async def test_401_retry_keeps_session_and_call_but_resigns_request(state):
     assert second.headers["authorization"] == "Bearer ticket-after-401"
     assert first.headers["x-mirasim-session"] == \
         second.headers["x-mirasim-session"] == session_id
-    assert first.headers["x-mirasim-call"] == second.headers["x-mirasim-call"]
+    # x-mirasim-session spans a conversation; x-mirasim-call identifies one HTTP
+    # request. A credential-refresh retry is a second request and gets its own.
+    assert first.headers["x-mirasim-call"] != second.headers["x-mirasim-call"]
+    assert uuid.UUID(second.headers["x-mirasim-call"]).version == 4
     assert first.headers["x-mirasim-nonce"] != second.headers["x-mirasim-nonce"]
     assert first.headers["x-mirasim-sig"] != second.headers["x-mirasim-sig"]
     assert first.content == second.content
@@ -239,4 +266,3 @@ async def test_route_identity_scopes_session_and_401_invalidation(
     assert replacement_a != ticket_a
     assert await state.upstream._device_ticket("work", route_b) == ticket_b
     assert minted == ["route-a", "route-b", "route-a"]
-

@@ -150,9 +150,10 @@ class AccountService:
             previous_email and previous_email.casefold() != email.casefold())
         self.store.save(alias, email, access, renewal, metadata, proxy_id=proxy_id)
         if different_account:
-            # An alias reused for another login must not inherit the previous
-            # account's persistent Ed25519 device identity. Clear the in-memory
-            # signer too, otherwise it could keep using the deleted key.
+            # Upgrade old per-account keys into the installation slot before
+            # cleaning up the legacy secret. Re-login rotates authorization and
+            # tickets, never the official installation-wide Ed25519 identity.
+            self.upstream.ensure_device_identity(alias)
             self.store.vault.delete(alias, DEVICE_KEY_KIND)
             self.upstream.forget_account(alias)
         else:

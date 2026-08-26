@@ -26,7 +26,7 @@
     {"name": "x-mirasim-session", "value": "<dynamic:session:1>"},
     {"name": "x-mirasim-agent", "value": "claude"},
     {"name": "x-mirasim-device", "value": "<dynamic:device_id>"},
-    {"name": "x-mirasim-client", "value": "0.0.220"},
+    {"name": "x-mirasim-client", "value": "0.0.228"},
     {"name": "x-mirasim-locale", "value": "zh-HK"},
     {"name": "x-mirasim-call", "value": "<dynamic:uuid4>"},
     {"name": "x-mirasim-ts", "value": "<dynamic:unix_ms>"},

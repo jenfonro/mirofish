@@ -16,9 +16,7 @@ import pytest
 import respx
 from cryptography.hazmat.primitives import serialization
 
-from mirofish.upstream import (CLAUDE_AGENT_SYSTEM_MARKER,
-                               _CLI_MACHINE_PROFILES, _machine_profile,
-                               LIMITS_PATH)
+from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, LIMITS_PATH
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 from tests.test_request_profile import _body as captured_messages_body
 from tests.test_request_profile import _headers as captured_messages_headers
@@ -315,12 +313,10 @@ async def test_generic_messages_get_the_captured_cli_identity(state):
         "Connection",
     ]
     for name, value in CLAUDE_HEADERS:
-        if name in ("anthropic-beta", "x-claude-code-session-id", *_MACHINE_SLOT):
+        if name in ("anthropic-beta", "x-claude-code-session-id"):
             continue
         assert request.headers[name] == value
-    # Every slot but the machine one is the captured constant; that one is the
-    # account's, so a set of accounts is not one workstation.
-    assert _machine_slot(request) == _machine_profile("work")
+    assert _machine_slot(request) == ("arm64", "MacOS")
     # The official client pairs these two exactly; keeping them equal preserves
     # that correlation without inventing a second session identifier.
     assert request.headers["x-claude-code-session-id"] == "mirofish-session"
@@ -370,9 +366,8 @@ async def test_caller_sdk_fingerprint_cannot_survive_beside_the_cli_identity(sta
     assert request.headers["x-stainless-lang"] == "js"
     assert request.headers["x-stainless-runtime"] == "node"
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
-    # The machine slot resolves to the account's platform, not to the Linux/x64
-    # box the caller claimed, so a caller cannot pick its accounts' machines.
-    assert _machine_slot(request) == _machine_profile("work")
+    # A non-CLI caller receives the one captured coherent CLI profile.
+    assert _machine_slot(request) == ("arm64", "MacOS")
     assert _machine_slot(request) != ("x64", "Linux")
     assert len(request.headers.get_list("x-stainless-lang")) == 1
     # Caller-owned protocol choices survive; the routing beta is added, the
@@ -445,20 +440,15 @@ async def _messages_request(state, alias: str, **kwargs) -> httpx.Request:
 
 
 @respx.mock
-async def test_each_account_reaches_upstream_from_its_own_machine(state):
-    """The fingerprint's whole purpose fails if a fleet reads as one desktop."""
+async def test_synthesized_cli_profile_is_installation_wide(state):
+    """The desktop does not manufacture a different machine per account."""
     _mock_device_session()
 
     first = await _messages_request(state, "work")
     second = await _messages_request(state, "main")
 
-    assert _machine_slot(first) != _machine_slot(second)
-    # ...while every slot that describes the client build rather than the box
-    # it runs on stays identical, so neither account looks bespoke.
-    assert {name: value for name, value in _stainless_block(first).items()
-            if name not in _MACHINE_SLOT} == \
-        {name: value for name, value in _stainless_block(second).items()
-         if name not in _MACHINE_SLOT}
+    assert _machine_slot(first) == _machine_slot(second) == ("arm64", "MacOS")
+    assert _stainless_block(first) == _stainless_block(second)
     assert first.headers["user-agent"] == second.headers["user-agent"]
 
 
@@ -474,75 +464,32 @@ async def test_an_accounts_machine_is_the_same_on_every_request(state):
 
 
 @respx.mock
-async def test_cross_checkable_fingerprint_fields_stay_shared_on_purpose(state):
-    """The complement of the machine axis: locale and the client/runtime
-    versions are held identical across accounts deliberately.
-
-    Each is verifiable by upstream against an external fact — locale against the
-    exit IP's geography, the versions against the set of builds that ever
-    shipped — so a per-account value would forge a mismatch that is a sharper
-    tell than the shared value.  This guards that boundary: a future change that
-    "diversifies" one of these to match the arch/os treatment must justify
-    itself against this test rather than pass silently.
-    """
+async def test_installation_fingerprint_fields_stay_shared(state):
     _mock_device_session()
 
     first = await _messages_request(state, "work")
     second = await _messages_request(state, "main")
 
-    # Precondition: these two do land on different machines, so any shared value
-    # below is a real choice and not an artifact of identical inputs.
-    assert _machine_slot(first) != _machine_slot(second)
-    for header in ("x-mirasim-locale", "x-mirasim-client",
+    for header in (*_MACHINE_SLOT, "x-mirasim-locale", "x-mirasim-client",
                    "x-stainless-runtime-version", "x-stainless-package-version"):
         assert first.headers[header] == second.headers[header]
     assert first.headers["x-mirasim-locale"] == state.settings.mirasim_locale
 
 
 @respx.mock
-async def test_a_real_cli_caller_reports_its_accounts_machine_not_its_own(state):
-    """One CLI in front of N accounts must not stamp all N with one desktop."""
+async def test_a_real_cli_caller_keeps_its_own_machine_headers(state):
     _mock_device_session()
-    cli_headers = httpx.Headers(dict(CLAUDE_HEADERS))
+    cli_headers = httpx.Headers(dict(CLAUDE_HEADERS) | {
+        "x-stainless-arch": "x64",
+        "x-stainless-os": "Linux",
+    })
 
     request = await _messages_request(state, "work", request_headers=cli_headers)
 
-    assert _machine_slot(request) == _machine_profile("work")
-    assert _machine_slot(request) != ("arm64", "MacOS")
-    # Only the machine slot is rewritten; what the CLI reports about itself is
-    # real and stays its own.
+    assert _machine_slot(request) == ("x64", "Linux")
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
     assert request.headers["x-stainless-package-version"] == "0.112.1"
     assert request.headers["user-agent"] == "claude-cli/2.1.241 (external, mirasim)"
-
-
-@pytest.mark.parametrize("alias", [
-    "", "work", "personal", "team", "a", "b", "c", "d", "e",
-    "acct-1", "acct-2", "acct-3", "acct-4", "acct-5", "acct-6",
-    "用户", "a" * 200,
-])
-def test_every_machine_identity_is_a_platform_node_actually_ships(alias):
-    assert _machine_profile(alias) in _CLI_MACHINE_PROFILES
-
-
-def test_the_capture_is_reachable_and_the_table_spreads_accounts():
-    aliases = [f"account-{n}" for n in range(60)]
-    drawn = {_machine_profile(alias) for alias in aliases}
-
-    # Nothing here is random, so this is a fact about the table, not a flake.
-    assert drawn == set(_CLI_MACHINE_PROFILES)
-    assert ("arm64", "MacOS") in _CLI_MACHINE_PROFILES
-
-
-def test_no_machine_profile_describes_a_box_that_was_never_built():
-    """arch and os are drawn as a unit precisely to keep this true."""
-    assert len(set(_CLI_MACHINE_PROFILES)) == len(_CLI_MACHINE_PROFILES)
-    for arch, os_name in _CLI_MACHINE_PROFILES:
-        assert arch in ("arm64", "x64")
-        assert os_name in ("MacOS", "Linux", "Windows")
-        # Windows on ARM exists but is rare enough to be a fingerprint in
-        # itself, which is the opposite of what this table is for.
-        assert (arch, os_name) != ("arm64", "Windows")
 
 
 @respx.mock
@@ -553,12 +500,10 @@ async def test_runtime_requests_bridge_to_capture_derived_golden_profiles(state)
     requests. This bridge prevents those reconstructions and the actual httpx
     requests from drifting together without anyone noticing.
 
-    The golden body pins the capture's own arch/os, which the relay now treats
-    as an account property, so this runs on an alias that draws that pair. The
-    assertion below is what keeps that choice honest if the table changes.
+    The golden body pins the capture's own arch/os, which generic callers now
+    receive as one coherent official-client profile.
     """
     alias = "capture"
-    assert _machine_profile(alias) == ("arm64", "MacOS")
     add_account(state, alias)
     state.settings.auth_base = OFFICIAL_AUTH_BASE
     state.settings.relay_base = OFFICIAL_RELAY_BASE
@@ -604,3 +549,64 @@ async def test_runtime_requests_bridge_to_capture_derived_golden_profiles(state)
         limits.calls[1].request, "limits_signed_official.json")
     _assert_matches_golden(
         messages.calls.last.request, "messages_beta_official.json")
+
+
+CODEX_CLI_HEADERS: tuple[tuple[str, str], ...] = (
+    ("host", "chatgpt.com"),
+    ("accept", "text/event-stream"),
+    ("content-type", "application/json"),
+    ("authorization", "Bearer codex-caller-token"),
+    ("openai-beta", "responses=experimental"),
+    ("originator", "codex_cli_rs"),
+    ("session_id", "6b2a0f9c-2c2b-4a08-a9d4-6b0a1f4c8f11"),
+    ("user-agent", "codex_cli_rs/0.104.0 (Mac OS 26.0.0; arm64) Apple_Terminal"),
+    ("accept-encoding", "gzip"),
+)
+
+
+@respx.mock
+async def test_codex_relay_request_matches_the_transparent_proxy_profile(state):
+    """Pin the Codex envelope's field set and order.
+
+    Unlike the other fixtures this one has no packet capture behind it: the
+    desktop's Codex MITM was read statically, so the golden file records what
+    this relay emits and is named ``_relay`` rather than ``_official``. It still
+    catches the thing that breaks accidentally — a field appearing, vanishing or
+    moving.
+    """
+    alias = "capture"
+    add_account(state, alias)
+    state.settings.relay_base = OFFICIAL_RELAY_BASE
+    respx.post(OFFICIAL_RELAY_BASE + "/v1/device/session").mock(
+        return_value=httpx.Response(
+            200, json={"ticket": "device-ticket", "expiresIn": 900}))
+    route = respx.post(OFFICIAL_RELAY_BASE + "/v1/responses").mock(
+        return_value=httpx.Response(200, json={"id": "response"}))
+    body = json.dumps({
+        "model": "gpt-5.6-codex",
+        "instructions": "You are Codex.",
+        "input": [{
+            "type": "message", "role": "user",
+            "content": [{"type": "input_text", "text": "private prompt"}],
+        }],
+        "tools": [{"type": "function", "name": "shell"}],
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "store": False,
+        "stream": True,
+        "prompt_cache_key": "6b2a0f9c-2c2b-4a08-a9d4-6b0a1f4c8f11",
+    }, separators=(",", ":")).encode()
+
+    response = await state.upstream.stream_responses(
+        alias, body, request_headers=httpx.Headers(CODEX_CLI_HEADERS),
+        session_id="0f20cf48-c292-42e9-a99e-994511307deb",
+        account_id="u-capture")
+    await response.aclose()
+
+    request = route.calls.last.request
+    _assert_matches_golden(request, "codex_responses_relay.json")
+    # The caller's own agent string is relayed untouched: this path impersonates
+    # nothing but the transport, and the profile redacts the value it carries.
+    assert request.headers["user-agent"] == dict(CODEX_CLI_HEADERS)["user-agent"]
+    assert request.headers["originator"] == "mirasim"
+    assert "codex-caller-token" not in request.headers.values()

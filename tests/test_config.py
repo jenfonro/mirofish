@@ -9,6 +9,7 @@ def test_default_upstream_endpoints_match_current_official_client(monkeypatch):
 
     assert settings.auth_base == "https://auth.mirasim.ai"
     assert settings.relay_base == "https://relay.mirasim.ai"
+    assert settings.mirasim_client_version == "0.0.228"
 
 
 def test_relay_endpoint_can_be_overridden(monkeypatch):
@@ -62,6 +63,7 @@ def test_transport_limits_are_configurable_and_keepalive_is_capped(monkeypatch):
     monkeypatch.setenv("MIROFISH_MAX_CONNECTIONS", "7")
     monkeypatch.setenv("MIROFISH_MAX_KEEPALIVE_CONNECTIONS", "12")
     monkeypatch.setenv("MIROFISH_STREAM_READ_TIMEOUT", "720")
+    monkeypatch.setenv("MIROFISH_MAX_BODY_BYTES", "4096")
 
     settings = Settings.from_env()
 
@@ -69,3 +71,4 @@ def test_transport_limits_are_configurable_and_keepalive_is_capped(monkeypatch):
     assert settings.max_connections == 7
     assert settings.max_keepalive_connections == 7
     assert settings.stream_read_timeout == 720.0
+    assert settings.max_body_bytes == 4096

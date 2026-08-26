@@ -3,18 +3,20 @@
 - One httpx.AsyncClient per proxy URL (connection pooling per exit).
 - Token refresh is single-flight per alias so concurrent 401s do not stampede
   the refresh endpoint or clobber each other's rotated refresh token.
-- /v1/messages supports true streaming: the upstream SSE response is handed to
-  the caller unbuffered.
+- /v1/messages and Codex /v1/responses support true streaming: successful
+  upstream responses are handed to the caller unbuffered.
 """
 
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
+import math
+import ssl
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -28,7 +30,25 @@ from .store import Store
 DEVICE_SESSION_PATH = "/v1/device/session"
 MESSAGES_PATH = "/v1/messages"
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
+RESPONSES_PATH = "/v1/responses"
+ALPHA_SEARCH_PATH = "/v1/alpha/search"
 LIMITS_PATH = "/v1/limits"
+#: Upstream endpoints the Codex agent reaches through the transparent MITM path.
+CODEX_PATHS = (RESPONSES_PATH, ALPHA_SEARCH_PATH)
+
+TICKET_REFRESH_LEAD_SECONDS = 120.0
+TICKET_MINT_TIMEOUT_SECONDS = 10.0
+TICKET_BACKOFF_BASE_SECONDS = 1.0
+TICKET_BACKOFF_MAX_SECONDS = 30.0
+TICKET_REFUSED_RETRY_SECONDS = 30.0
+SIGNING_UNSUPPORTED_CACHE_SECONDS = 15.0 * 60.0
+# Only used when the mint response omits an expiry.  The observed relay answers
+# 900s, and guessing shorter than the real TTL just re-mints early.
+DEFAULT_TICKET_LIFETIME_SECONDS = 15.0 * 60.0
+#: Expiry fields seen across relay builds, in the order they are preferred.
+#: ``*In`` values are durations; ``*At`` values are absolute unix seconds.
+_TICKET_LIFETIME_FIELDS = ("expiresIn", "expires_in", "ttl", "ttlSeconds")
+_TICKET_DEADLINE_FIELDS = ("expiresAt", "expires_at", "expiry", "exp")
 
 # The current product relay only advertises Claude capacity when the request
 # carries the short Agent SDK system marker emitted by official clients.  It
@@ -54,6 +74,12 @@ _FORWARDED_MESSAGE_HEADERS = {
     "user-agent",
     "x-app",
     "x-claude-code-session-id",
+    # The Stainless SDK generator may add fields in a future release, and each
+    # new name has to be added here deliberately.  Accepting the whole
+    # ``x-stainless-*`` namespace by prefix would be less maintenance, but it
+    # would also forward any future caller-supplied field in that namespace
+    # upstream unread; the golden request profiles catch a dropped field, while
+    # nothing would catch a forwarded secret.
     "x-stainless-arch",
     "x-stainless-lang",
     "x-stainless-os",
@@ -83,44 +109,58 @@ _CLI_STAINLESS_FINGERPRINT: tuple[tuple[str, str], ...] = (
     ("x-stainless-timeout", "600"),
 )
 
-# arch/os is the one fingerprint slot that is a property of the machine rather
-# than of the client build.  Emitting the captured pair for every account would
-# present a whole set of subscriptions as one workstation — the correlation the
-# per-account device key and per-account proxy exit exist to avoid — so each
-# alias picks a pair and keeps it.
-#
-# The general rule for whether a fingerprint field may vary per account: only
-# when upstream has no independent way to cross-check it.  A CPU/OS claim cannot
-# be verified over a TLS connection, so diversifying it is free.  The two
-# neighbouring fields that stay shared on purpose fail that test and are held
-# constant deliberately (see _signed_relay_response for the locale note):
-#   - x-mirasim-locale is checkable against the exit IP's geography, so a
-#     per-alias value would manufacture IP<->locale mismatches — a sharper tell
-#     than the shared value it replaced.  With a zh-HK default the pool is an
-#     Asia one, where a shared Asian locale is what independent users send.
-#   - x-mirasim-client / x-stainless-runtime-version are real software versions
-#     upstream knows; a fabricated one is a never-shipped build, and real user
-#     populations genuinely cluster on a current version.
-#
-# arch and os move together as a unit because they are not independent: sampling
-# each on its own yields machines that were never shipped (arm64 Windows
-# desktops, say), and an impossible fingerprint is more distinctive than a
-# repeated one.  Every pair here is an ordinary Node desktop target; the
-# captured pair leads.
-_CLI_MACHINE_PROFILES: tuple[tuple[str, str], ...] = (
-    ("arm64", "MacOS"),
-    ("x64", "MacOS"),
-    ("arm64", "Linux"),
-    ("x64", "Linux"),
-    ("x64", "Windows"),
-)
-_MACHINE_PROFILE_DOMAIN = b"mirofish/cli-machine-profile\0"
-
 logger = logging.getLogger("mirofish.upstream")
+
+_HOP_BY_HOP_REQUEST_HEADERS = {
+    "host", "connection", "content-length", "transfer-encoding",
+    "keep-alive", "proxy-authenticate", "proxy-authorization", "te",
+    "trailer", "upgrade", "expect",
+}
+_LOCAL_REQUEST_HEADERS = {
+    "authorization", "proxy-authorization", "x-api-key",
+    "x-mirofish-account", "x-mirofish-proxy-key", "x-mirofish-session",
+}
+_BODY_INTEGRITY_REQUEST_HEADERS = {
+    # Codex requests may arrive compressed.  The desktop signs and forwards
+    # the decompressed bytes, so caller-provided digests describe the wrong
+    # representation and must be removed together with Content-Encoding.
+    "content-encoding", "content-md5", "content-digest", "digest",
+}
+# The relay owns its signing envelope and must never relay a caller's copy of
+# it; see forwarded_codex_headers.
+_MIRASIM_HEADER_PREFIX = "x-mirasim-"
+_RELAY_OWNED_REQUEST_HEADERS = {"cookie", "cookie2"}
+# Every observed official Codex request reaches the relay with this exact
+# originator, so pin it rather than trusting whatever the local caller sends.
+_CODEX_ORIGINATOR = "mirasim"
+_HOP_BY_HOP_RESPONSE_HEADERS = {
+    "connection", "content-length", "keep-alive", "proxy-authenticate",
+    "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
+}
+
+
+def _header_pairs(
+        headers: Optional[Mapping[str, str] | Iterable[tuple[Any, Any]]],
+) -> Iterable[tuple[str, str]]:
+    if headers is None:
+        return ()
+    raw = getattr(headers, "raw", None)
+    source = raw if raw is not None else (
+        headers.items() if isinstance(headers, Mapping) else headers)
+
+    def decoded() -> Iterable[tuple[str, str]]:
+        for raw_name, raw_value in source:
+            name = (raw_name.decode("latin1") if isinstance(raw_name, bytes)
+                    else str(raw_name))
+            value = (raw_value.decode("latin1") if isinstance(raw_value, bytes)
+                     else str(raw_value))
+            yield name, value
+    return decoded()
 
 
 def _forwarded_message_headers(
-        headers: Optional[Mapping[str, str]]) -> list[tuple[str, str]]:
+        headers: Optional[Mapping[str, str] | Iterable[tuple[Any, Any]]]
+) -> list[tuple[str, str]]:
     """Copy only non-secret Claude SDK fingerprint headers, in wire order.
 
     The official client removes the obsolete OAuth beta token before relaying,
@@ -130,7 +170,7 @@ def _forwarded_message_headers(
     """
     forwarded: list[tuple[str, str]] = []
     positions: dict[str, int] = {}
-    for raw_name, raw_value in (headers or {}).items():
+    for raw_name, raw_value in _header_pairs(headers):
         name = str(raw_name).lower()
         if name not in _FORWARDED_MESSAGE_HEADERS:
             continue
@@ -159,6 +199,96 @@ def _forwarded_message_headers(
     return forwarded
 
 
+def forwarded_codex_headers(
+        headers: Optional[Mapping[str, str] | Iterable[tuple[Any, Any]]]
+) -> list[tuple[str, str]]:
+    """Preserve Codex's evolving protocol headers while isolating local secrets.
+
+    The desktop MITM uses a blocklist, not a fixed allowlist: Codex frequently
+    adds routing and beta headers, and dropping a new one can change the request.
+    Authentication and hop-by-hop fields are always rebuilt locally.
+
+    Two namespaces are refused outright even though the desktop forwards them.
+    ``x-mirasim-*`` belongs to the relay's own signing envelope: the desktop
+    assigns into Node's already-coalesced request-header object, where a caller
+    cannot produce a duplicate, but a list-based rebuild would emit the caller's
+    value *ahead* of the genuine one.  ``cookie`` is retained by the desktop
+    only because it is a single-user process; this relay multiplexes accounts,
+    so a caller's cookie would travel upstream attached to a different
+    account's device ticket.
+    """
+    pairs = list(_header_pairs(headers))
+    connection_fields = {
+        item.strip().lower()
+        for name, value in pairs if name.lower() == "connection"
+        for item in value.split(",") if item.strip()
+    }
+    forwarded: list[tuple[str, str]] = []
+    positions: dict[str, int] = {}
+    for raw_name, raw_value in pairs:
+        name = raw_name.lower()
+        if name in {"authorization", "x-api-key"}:
+            # Keep the first credential field's object-order slot without ever
+            # retaining its value.  Assigning a replacement to an existing JS
+            # object key does not move it; the desktop MITM has the same shape.
+            if "authorization" not in positions:
+                positions["authorization"] = len(forwarded)
+                forwarded.append(("authorization", ""))
+            continue
+        if name in _HOP_BY_HOP_REQUEST_HEADERS or name in connection_fields \
+                or name in _LOCAL_REQUEST_HEADERS \
+                or name in _BODY_INTEGRITY_REQUEST_HEADERS \
+                or name in _RELAY_OWNED_REQUEST_HEADERS \
+                or name.startswith("x-forwarded-") \
+                or name == "forwarded" or name.startswith("x-mirofish-") \
+                or name.startswith(_MIRASIM_HEADER_PREFIX):
+            continue
+        value = raw_value.strip()
+        if not value or len(value) > 16384 or any(char in value for char in "\r\n\0"):
+            continue
+        previous = positions.get(name)
+        if previous is None:
+            positions[name] = len(forwarded)
+            forwarded.append((name, value))
+        else:
+            # Node's IncomingMessage.headers exposes the last/coalesced value at
+            # the original field position.  Keep the same replacement behavior.
+            forwarded[previous] = (name, value)
+    content_type = next((value for name, value in forwarded
+                         if name.lower() == "content-type"), "")
+    if content_type.partition(";")[0].strip().lower() != "application/json":
+        _set_ordered_header(forwarded, "content-type", "application/json")
+    _set_ordered_header(forwarded, "originator", _CODEX_ORIGINATOR)
+    return forwarded
+
+
+def forwarded_response_headers(response: httpx.Response) -> list[tuple[str, str]]:
+    """Return end-to-end upstream headers safe for an ASGI response.
+
+    Repeated fields (notably Set-Cookie) remain repeated and in order.  Error
+    bodies that were buffered for routing decisions have already been decoded
+    by HTTPX, so their now-invalid Content-Encoding is omitted as well.
+    """
+    pairs = [(name.decode("latin1"), value.decode("latin1"))
+             for name, value in response.headers.raw]
+    connection_fields = {
+        item.strip().lower()
+        for name, value in pairs if name.lower() == "connection"
+        for item in value.split(",") if item.strip()
+    }
+    blocked = {*_HOP_BY_HOP_RESPONSE_HEADERS, *connection_fields}
+    if response.extensions.get("mirofish_body_decoded") is True:
+        blocked.add("content-encoding")
+    result: list[tuple[str, str]] = []
+    for name, value in pairs:
+        if name.lower() in blocked:
+            continue
+        if any(char in name or char in value for char in "\r\n\0"):
+            continue
+        result.append((name, value))
+    return result
+
+
 def _has_header(headers: Sequence[tuple[str, str]], name: str) -> bool:
     lowered = name.lower()
     return any(header_name.lower() == lowered for header_name, _ in headers)
@@ -169,27 +299,6 @@ def _is_cli_caller(headers: Sequence[tuple[str, str]]) -> bool:
     return any(name.lower() == "user-agent"
                and value.lower().startswith(_CLI_USER_AGENT_PREFIX)
                for name, value in headers)
-
-
-def _machine_profile(alias: str) -> tuple[str, str]:
-    """The (arch, os) pair this account presents, stable for its lifetime.
-
-    Derived from the alias so it survives restarts with no stored state and
-    never depends on which other accounts exist: a fingerprint that moved
-    between requests would describe a user who changes computer mid-conversation,
-    which is worse than sharing one with another account.  The Ed25519 device id
-    would be the more natural seed, but it is loaded asynchronously from the
-    vault, after these headers are built.
-
-    Only arch and os vary.  ``x-stainless-runtime-version`` stays at the single
-    value a capture attests, because a real population running one current Node
-    across several platforms is unremarkable while an invented patch number is
-    a fact upstream can check and this relay cannot.
-    """
-    digest = hashlib.sha256(
-        _MACHINE_PROFILE_DOMAIN + alias.encode("utf-8")).digest()
-    index = int.from_bytes(digest[:8], "big") % len(_CLI_MACHINE_PROFILES)
-    return _CLI_MACHINE_PROFILES[index]
 
 
 def _set_ordered_header(
@@ -203,27 +312,77 @@ def _set_ordered_header(
     headers.append((name, value))
 
 
-def _apply_machine_profile(
-        headers: list[tuple[str, str]], alias: str) -> None:
-    """Rewrite an existing arch/os pair as this account's machine identity.
-
-    One Claude CLI relaying several accounts sends its own real fingerprint on
-    every one of them, so without this the accounts differ in device key and
-    exit IP while still reporting a single shared workstation.
-
-    Absent headers stay absent.  A probe that deliberately sends no fingerprint
-    must not acquire two thirds of one, and only the machine slot is touched:
-    the caller's own runtime and version remain its to report.
-    """
-    arch, os_name = _machine_profile(alias)
-    for name, value in (("x-stainless-arch", arch), ("x-stainless-os", os_name)):
-        if _has_header(headers, name):
-            _set_ordered_header(headers, name, value)
-
-
 def _authority(url: str) -> str:
     """HTTP Host value, including a non-default port when present."""
     return httpx.URL(url).netloc.decode("ascii")
+
+
+def _ticket_lifetime(data: Any) -> float:
+    """Seconds a freshly minted device ticket remains valid.
+
+    Relay builds have spelled the expiry several ways, and a numeric field may
+    arrive as a JSON string.  Anything unparseable falls back to the default
+    rather than pinning the ticket to a bogus deadline.
+    """
+    if not isinstance(data, dict):
+        return DEFAULT_TICKET_LIFETIME_SECONDS
+    for field in _TICKET_LIFETIME_FIELDS:
+        value = _as_float(data.get(field))
+        if value is not None and value > 0:
+            return value
+    for field in _TICKET_DEADLINE_FIELDS:
+        value = _as_float(data.get(field))
+        if value is not None:
+            # Some builds report milliseconds; both scales are far outside each
+            # other's plausible range, so the magnitude disambiguates them.
+            if value > 1e11:
+                value /= 1000.0
+            remaining = value - time.time()
+            if remaining > 0:
+                return remaining
+    return DEFAULT_TICKET_LIFETIME_SECONDS
+
+
+def _as_float(value: Any) -> Optional[float]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        candidate = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            candidate = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return candidate if math.isfinite(candidate) else None
+
+
+def _relay_envelope(
+        token: str, session_id: str, agent: str, account_id: str, call_id: str,
+        device_id: str, client_version: str, locale: str,
+        probe: bool) -> list[tuple[str, str]]:
+    """The relay-owned request metadata, in the order the desktop emits it.
+
+    Probe requests carry a deliberately reduced envelope: no session, agent,
+    device, account, locale or call id, because a usage probe is not part of a
+    conversation and the product does not attribute one.
+    """
+    if probe:
+        return [("x-mirasim-probe", "usage"),
+                ("authorization", "Bearer " + token),
+                ("x-mirasim-client", client_version)]
+    envelope = [("authorization", "Bearer " + token),
+                ("x-mirasim-session", session_id),
+                ("x-mirasim-agent", agent),
+                ("x-mirasim-device", device_id)]
+    if account_id:
+        envelope.append(("x-mirasim-account", account_id))
+    envelope.append(("x-mirasim-client", client_version))
+    if locale:
+        envelope.append(("x-mirasim-locale", locale))
+    envelope.append(("x-mirasim-call", call_id))
+    return envelope
 
 
 def _wire_tail(url: str, body: bytes = b"") -> list[tuple[str, str]]:
@@ -252,6 +411,15 @@ def _is_region_blocked(status: int, body: Any) -> bool:
     error = body.get("error")
     return (isinstance(error, dict)
             and str(error.get("type")) == "shared_quota_unavailable")
+
+
+def _is_account_exhausted(body: Any) -> bool:
+    """True when another account, rather than another proxy exit, can recover."""
+    if not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    return (isinstance(error, dict)
+            and str(error.get("type")) == "credit_exhausted_shared")
 
 
 def _region_block_error(status: int, body: Any,
@@ -486,10 +654,58 @@ def _with_cache_breakpoints(payload: dict[str, Any]) -> dict[str, Any]:
     return prepared
 
 
+#: The elliptic-curve groups a BoringSSL-based client offers, in its order.
+#: OpenSSL 3.5 instead leads with X25519MLKEM768 and appends the finite-field
+#: ffdhe2048/ffdhe3072 groups, which no browser-derived client sends -- the
+#: clearest stack tell in the ClientHello that is reachable from Python at all.
+_BORINGSSL_GROUPS = "x25519:secp256r1:secp384r1"
+_tls_context_cache: ssl.SSLContext | None = None
+
+
+def tls_context() -> ssl.SSLContext:
+    """Return the shared client TLS context, narrowed where Python allows it.
+
+    Only the group list is adjusted, and only on interpreters exposing
+    ``SSLContext.set_groups`` (3.13+); elsewhere this is httpx's own context
+    unchanged.  Two things deliberately are *not* attempted:
+
+    ALPN is left alone.  httpcore assigns ``http/1.1`` into whatever context it
+    is handed, and the official client sends the extension too (with an empty
+    protocol list), so both hellos carry extension 16 and a JA3 hash sees no
+    difference.  Suppressing it would remove an extension the official client
+    has and make the fingerprint *less* similar, not more.
+
+    Nothing tries to reproduce the official JA3 exactly.  That hash covers the
+    cipher list, extension order and GREASE values, all of which belong to the
+    TLS library rather than to this code; matching it means replacing the TLS
+    stack, not configuring OpenSSL.  Fidelity here is header- and body-level.
+    """
+    global _tls_context_cache
+    if _tls_context_cache is None:
+        context = httpx.create_ssl_context()
+        set_groups = getattr(context, "set_groups", None)
+        if set_groups is not None:
+            try:
+                set_groups(_BORINGSSL_GROUPS)
+            except (ssl.SSLError, ValueError, OSError):
+                # A build without one of these curves keeps its own defaults;
+                # a narrower list is cosmetic, a failed handshake is not.
+                logger.debug("keeping default TLS groups")
+        _tls_context_cache = context
+    return _tls_context_cache
+
+
 @dataclass
 class _DeviceTicket:
     value: str
     expires_at: float
+
+
+@dataclass(frozen=True)
+class _RelayCredential:
+    value: str
+    kind: str
+    signed: bool
 
 
 class Upstream:
@@ -501,11 +717,14 @@ class Upstream:
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._ticket_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._ticket_cache: dict[tuple[str, str], _DeviceTicket] = {}
+        self._ticket_retry_after: dict[tuple[str, str], float] = {}
+        self._ticket_failures: dict[tuple[str, str], int] = {}
+        self._signing_unsupported_until: dict[tuple[str, str], float] = {}
         # A route enters signed-limits mode after its first successful device
         # session. New process/route pairs begin with the captured account-token
         # limits profile and switch once model traffic mints a ticket.
         self._device_sessions: set[tuple[str, str]] = set()
-        self._signers: dict[str, DeviceSigner] = {}
+        self._device_signer: DeviceSigner | None = None
         # Monotonic per-alias epoch. In-flight ticket/refresh work may finish
         # after a re-login or deletion; only results from the current epoch may
         # write account-bound caches or credentials.
@@ -540,6 +759,7 @@ class Upstream:
             if client is None:
                 client = httpx.AsyncClient(
                     proxy=transport_url or None, trust_env=False,
+                    verify=tls_context(),
                     http2=False,
                     follow_redirects=False,
                     timeout=httpx.Timeout(self.settings.timeout, connect=10.0, pool=30.0),
@@ -645,12 +865,17 @@ class Upstream:
             lock = self._ticket_locks.setdefault(key, asyncio.Lock())
         return lock
 
-    def _signer(self, alias: str) -> DeviceSigner:
-        signer = self._signers.get(alias)
-        if signer is None:
-            signer = DeviceSigner(self.store, alias, self.settings.mirasim_client_version)
-            self._signers[alias] = signer
-        return signer
+    def _signer(self, alias: str = "") -> DeviceSigner:
+        """Return the installation signer; ``alias`` is only a migration hint."""
+        if self._device_signer is None:
+            legacy = (alias,) if alias else ()
+            self._device_signer = DeviceSigner(
+                self.store, self.settings.mirasim_client_version, legacy)
+        return self._device_signer
+
+    def ensure_device_identity(self, legacy_alias: str = "") -> str:
+        """Persist/migrate the installation key before account data is removed."""
+        return self._signer(legacy_alias).device_id
 
     def _advance_credentials(self, alias: str, *, clear_device: bool) -> None:
         self._credential_generations[alias] = (
@@ -665,9 +890,8 @@ class Upstream:
         self._advance_credentials(alias, clear_device=True)
 
     def forget_account(self, alias: str) -> None:
-        """Forget authorization and in-memory device identity after deletion."""
+        """Forget account authorization without rotating the installation key."""
         self._advance_credentials(alias, clear_device=True)
-        self._signers.pop(alias, None)
 
     def has_device_session(
             self, alias: str, proxy_url: Optional[str] = None) -> bool:
@@ -675,7 +899,7 @@ class Upstream:
 
     def _cli_identity_headers(
             self, forwarded: Sequence[tuple[str, str]],
-            session_id: str, alias: str) -> list[tuple[str, str]]:
+            session_id: str) -> list[tuple[str, str]]:
         """Rebuild a non-CLI caller's headers as the captured official profile.
 
         Only ``anthropic-version`` and ``anthropic-beta`` survive from the
@@ -703,7 +927,6 @@ class Upstream:
         if session_id:
             headers.append(("x-claude-code-session-id", session_id))
         headers.extend(_CLI_STAINLESS_FINGERPRINT)
-        _apply_machine_profile(headers, alias)
         headers.extend((
             ("anthropic-beta", ",".join(betas)),
             ("anthropic-dangerous-direct-browser-access", "true"),
@@ -715,14 +938,15 @@ class Upstream:
         return headers
 
     def _message_request_headers(
-            self, request_headers: Optional[Mapping[str, str]],
+            self, request_headers: Optional[
+                Mapping[str, str] | Iterable[tuple[Any, Any]]],
             probe: bool, session_id: str = "",
             alias: str = "") -> list[tuple[str, str]]:
         headers = _forwarded_message_headers(request_headers)
         if not probe and not _is_cli_caller(headers):
             # Probes stay lean on purpose; every other caller gets the full
             # official fingerprint instead of a partial one.
-            return self._cli_identity_headers(headers, session_id, alias)
+            return self._cli_identity_headers(headers, session_id)
         if not _has_header(headers, "accept"):
             # Accept and anthropic-version are Messages protocol semantics,
             # not a fabricated Claude CLI/SDK fingerprint. Internal OpenAI
@@ -743,20 +967,19 @@ class Upstream:
             # The product's explicit usage probe is intentionally a lean
             # request and does not carry per-conversation relay metadata.
             _set_ordered_header(headers, "accept-encoding", "identity")
-        else:
-            # A real CLI reached us with its own machine identity. It is one
-            # client in front of several accounts, so the machine it reports
-            # becomes the account's rather than its own.
-            _apply_machine_profile(headers, alias)
         return headers
 
     def _invalidate_ticket(self, alias: str) -> None:
         # Access refresh and a relay 401 invalidate every route-scoped ticket
         # for this account.  Tickets are cached per route because the upstream
         # may bind a short-lived device session to its source exit.
-        stale = [key for key in self._ticket_cache if key[0] == alias]
+        stale = {key for mapping in (
+            self._ticket_cache, self._ticket_retry_after, self._ticket_failures,
+        ) for key in mapping if key[0] == alias}
         for key in stale:
             self._ticket_cache.pop(key, None)
+            self._ticket_retry_after.pop(key, None)
+            self._ticket_failures.pop(key, None)
 
     def _invalidate_route_ticket(
             self, alias: str, proxy_url: Optional[str], expected: str) -> None:
@@ -770,6 +993,8 @@ class Upstream:
         cached = self._ticket_cache.get(key)
         if cached is not None and cached.value == expected:
             self._ticket_cache.pop(key, None)
+            self._ticket_retry_after.pop(key, None)
+            self._ticket_failures.pop(key, None)
 
     async def refresh_access(self, alias: str, stale_access: str,
                              proxy_url: Optional[str] = None) -> str:
@@ -869,7 +1094,8 @@ class Upstream:
         ]
         try:
             response = await self.send_explicit(
-                "POST", url, headers, body, proxy_url)
+                "POST", url, headers, body, proxy_url,
+                timeout=httpx.Timeout(TICKET_MINT_TIMEOUT_SECONDS))
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
                              {"proxy_network": bool(proxy_url),
@@ -881,38 +1107,100 @@ class Upstream:
         ticket = data.get("ticket") if isinstance(data, dict) else None
         if not isinstance(ticket, str) or not ticket:
             raise RelayError("device session response is missing a ticket", 502, data)
-        try:
-            lifetime = float(data.get("expiresIn", 900)) if isinstance(data, dict) else 900.0
-        except (TypeError, ValueError):
-            lifetime = 900.0
-        return _DeviceTicket(ticket, time.monotonic() + max(60.0, lifetime))
+        return _DeviceTicket(
+            ticket, time.monotonic() + max(1.0, _ticket_lifetime(data)))
+
+    def _note_ticket_failure(self, key: tuple[str, str], transient: bool) -> None:
+        now = time.monotonic()
+        if transient:
+            failures = self._ticket_failures.get(key, 0)
+            delay = min(
+                TICKET_BACKOFF_BASE_SECONDS * (2 ** failures),
+                TICKET_BACKOFF_MAX_SECONDS,
+            )
+            self._ticket_failures[key] = failures + 1
+        else:
+            delay = TICKET_REFUSED_RETRY_SECONDS
+        self._ticket_retry_after[key] = now + delay
+
+    @staticmethod
+    def _mint_failure_is_rotatable(exc: RelayError) -> bool:
+        return isinstance(exc.data, dict) and (
+            exc.data.get("region_blocked") is True
+            or exc.data.get("proxy_network") is True
+        )
+
+    def _ticket_fallback(
+            self, key: tuple[str, str], alias: str,
+            cached: _DeviceTicket | None, exc: RelayError) -> Optional[str]:
+        """Record a mint failure and return a still-valid old ticket if possible."""
+        if self._mint_failure_is_rotatable(exc):
+            raise exc
+        if exc.status in (404, 501):
+            self._signing_unsupported_until[key] = (
+                time.monotonic() + SIGNING_UNSUPPORTED_CACHE_SECONDS)
+            logger.info(
+                "device signing unsupported; using account token: account=%s status=%s",
+                alias, exc.status)
+        else:
+            self._note_ticket_failure(key, transient=exc.status >= 500)
+            logger.warning(
+                "device session unavailable; temporarily using account token: "
+                "account=%s status=%s", alias, exc.status)
+        if cached is not None and time.monotonic() < cached.expires_at:
+            return cached.value
+        return None
 
     async def _device_ticket(self, alias: str,
-                             proxy_url: Optional[str] = None) -> str:
+                             proxy_url: Optional[str] = None) -> Optional[str]:
         key = self._ticket_key(alias, proxy_url)
         async with self._ticket_lock(alias, proxy_url):
             while True:
+                now = time.monotonic()
                 cached = self._ticket_cache.get(key)
-                if cached and time.monotonic() < cached.expires_at - 60.0:
+                if cached and now < cached.expires_at - TICKET_REFRESH_LEAD_SECONDS:
                     return cached.value
+                if now < self._signing_unsupported_until.get(key, 0.0) \
+                        or now < self._ticket_retry_after.get(key, 0.0):
+                    return (cached.value if cached and now < cached.expires_at else None)
                 generation = self._credential_generations.get(alias, 0)
                 access, _ = self.store.credentials(alias)
-                try:
-                    ticket = await self._mint_device_ticket(alias, access, proxy_url)
-                except RelayError as exc:
-                    # A stale access token can only be diagnosed by the session
-                    # endpoint. Refresh once, then mint with the new generation.
-                    if exc.status != 401:
-                        raise
-                    access = await self.refresh_access(alias, access, proxy_url)
-                    generation = self._credential_generations.get(alias, 0)
-                    ticket = await self._mint_device_ticket(alias, access, proxy_url)
+                ticket: _DeviceTicket | None = None
+                for auth_attempt in range(2):
+                    try:
+                        ticket = await self._mint_device_ticket(alias, access, proxy_url)
+                        break
+                    except RelayError as exc:
+                        # A stale account token can only be diagnosed by the
+                        # session endpoint. Refresh it once; all other failures
+                        # follow the desktop's plain-token fallback behavior.
+                        if exc.status == 401 and auth_attempt == 0:
+                            access = await self.refresh_access(alias, access, proxy_url)
+                            generation = self._credential_generations.get(alias, 0)
+                            continue
+                        fallback = self._ticket_fallback(key, alias, cached, exc)
+                        if generation != self._credential_generations.get(alias, 0):
+                            break
+                        return fallback
                 if generation != self._credential_generations.get(alias, 0):
                     # Re-login/delete raced this request; discard its old ticket.
                     continue
+                if ticket is None:
+                    continue
                 self._ticket_cache[key] = ticket
                 self._device_sessions.add(key)
+                self._ticket_retry_after.pop(key, None)
+                self._ticket_failures.pop(key, None)
+                self._signing_unsupported_until.pop(key, None)
                 return ticket.value
+
+    async def _relay_credential(
+            self, alias: str, proxy_url: Optional[str]) -> _RelayCredential:
+        ticket = await self._device_ticket(alias, proxy_url)
+        if ticket:
+            return _RelayCredential(ticket, "ticket", True)
+        access, _ = self.store.credentials(alias)
+        return _RelayCredential(access, "account", False)
 
     async def _signed_relay_response(self, alias: str, method: str, path: str,
                                      body: bytes, proxy_url: Optional[str],
@@ -923,48 +1211,51 @@ class Upstream:
                                      session_id: str = "",
                                      call_id: str = "",
                                      probe: bool = False,
+                                     agent: str = "claude",
+                                     account_id: str = "",
     ) -> httpx.Response:
-        ticket = await self._device_ticket(alias, proxy_url)
-        signer = self._signer(alias)
+        credential = await self._relay_credential(alias, proxy_url)
         # Credentials and signature metadata always win over caller-derived
         # headers. The signature covers the canonical pathname only; the
         # product preserves ?beta=true on the URL but excludes it here.
-        signature = signer.headers(method, path, body)
+        signature = (self._signer(alias).headers(method, path, body)
+                     if credential.signed else None)
         url = self.settings.relay_base + (url_path or path)
-        if path in (MESSAGES_PATH, COUNT_TOKENS_PATH):
+        if signature is not None and httpx.URL(url).path != path:
+            # A relay base carrying its own path prefix would make the signed
+            # pathname disagree with the one upstream actually receives, and
+            # every request would fail verification for a non-obvious reason.
+            raise RelayError(
+                "relay base must not add a URL path prefix", 500,
+                {"signed_path": path})
+        model_request = path in (MESSAGES_PATH, COUNT_TOKENS_PATH, *CODEX_PATHS)
+        if model_request:
+            # ``extra_headers`` is caller-derived, so every relay-owned field is
+            # assigned rather than appended: the desktop mutates an already
+            # coalesced header object, where assignment replaces in place and a
+            # caller cannot end up with a second copy. Appending to a list would
+            # emit a smuggled duplicate *ahead* of the genuine value, and which
+            # copy upstream reads is not ours to decide.
             headers = list(extra_headers or ())
-            if probe:
-                headers.append(("x-mirasim-probe", "usage"))
-            headers.append(("authorization", "Bearer " + ticket))
-            if not probe:
-                headers.extend((
-                    ("x-mirasim-session", session_id),
-                    ("x-mirasim-agent", "claude"),
-                ))
-            headers.extend((
-                ("x-mirasim-device", signature["x-mirasim-device"]),
-                ("x-mirasim-client", signature["x-mirasim-client"]),
-            ))
-            if not probe and self.settings.mirasim_locale:
-                # Deliberately one shared value, not per-account: locale is
-                # cross-checkable against the exit IP's geography, so a
-                # per-alias locale uncorrelated with this request's proxy exit
-                # would introduce an IP<->locale mismatch — a stronger tell than
-                # the shared value.  The only correct per-account locale tracks
-                # the exit region, which the node metadata does not carry
-                # reliably; an operator who knows an account's geography sets it
-                # globally via MIROFISH_MIRASIM_LOCALE.  Contrast the arch/os
-                # slot, which has no such external correlate and so is
-                # per-account (see _CLI_MACHINE_PROFILES).
-                headers.append(("x-mirasim-locale", self.settings.mirasim_locale))
-            if not probe:
-                headers.append(("x-mirasim-call", call_id))
-            headers.extend((
-                ("x-mirasim-ts", signature["x-mirasim-ts"]),
-                ("x-mirasim-nonce", signature["x-mirasim-nonce"]),
-                ("x-mirasim-sig", signature["x-mirasim-sig"]),
-                *_wire_tail(url, body),
-            ))
+            for name, value in _relay_envelope(
+                    credential.value, session_id, agent, account_id, call_id,
+                    # The device id is derived from the Ed25519 public key and
+                    # is the same value whether or not this request ends up
+                    # signed.  Substituting an unrelated install UUID on the
+                    # unsigned fallback path would change the field's shape
+                    # (36-char UUID vs 22-char base64url) and identify the
+                    # relay outright.
+                    self._signer(alias).device_id,
+                    self.settings.mirasim_client_version,
+                    self.settings.mirasim_locale, probe):
+                _set_ordered_header(headers, name, value)
+            if signature is not None:
+                # Signing overwrites device/client in place, preserving each
+                # metadata field's official header position.
+                for name in ("x-mirasim-device", "x-mirasim-client",
+                             "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig"):
+                    _set_ordered_header(headers, name, signature[name])
+            headers.extend(_wire_tail(url, body))
         else:
             headers: list[tuple[str, str]] = []
             if body:
@@ -972,12 +1263,17 @@ class Upstream:
             if path == LIMITS_PATH:
                 headers.append(("x-mirasim-probe", "usage"))
             headers.extend((
-                ("Authorization", "Bearer " + ticket),
-                ("x-mirasim-device", signature["x-mirasim-device"]),
-                ("x-mirasim-ts", signature["x-mirasim-ts"]),
-                ("x-mirasim-nonce", signature["x-mirasim-nonce"]),
-                ("x-mirasim-sig", signature["x-mirasim-sig"]),
-                ("x-mirasim-client", signature["x-mirasim-client"]),
+                ("Authorization", "Bearer " + credential.value),
+            ))
+            if signature is not None:
+                headers.extend((
+                    ("x-mirasim-device", signature["x-mirasim-device"]),
+                    ("x-mirasim-ts", signature["x-mirasim-ts"]),
+                    ("x-mirasim-nonce", signature["x-mirasim-nonce"]),
+                    ("x-mirasim-sig", signature["x-mirasim-sig"]),
+                ))
+            headers.extend((
+                ("x-mirasim-client", self.settings.mirasim_client_version),
                 ("accept-encoding", "identity"),
                 *_wire_tail(url, body),
             ))
@@ -993,17 +1289,43 @@ class Upstream:
             response = await self.send_explicit(
                 method, url, headers, body, proxy_url,
                 stream=stream, timeout=timeout)
-            response.extensions["mirofish_device_ticket"] = ticket
+            response.extensions["mirofish_device_ticket"] = (
+                credential.value if credential.kind == "ticket" else "")
+            response.extensions["mirofish_relay_credential"] = credential.value
+            response.extensions["mirofish_relay_credential_kind"] = credential.kind
             return response
         except httpx.HTTPError as exc:
             raise RelayError("relay network error", 502,
                              {"proxy_network": bool(proxy_url),
                               "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
 
+    async def _retry_relay_401(
+            self, alias: str, proxy_url: Optional[str],
+            response: httpx.Response) -> None:
+        """Invalidate exactly the credential that produced a relay 401.
+
+        Signed requests remint their route ticket.  In plain-token fallback
+        mode, the account access token itself is refreshed once instead.
+        """
+        await response.aread()
+        await response.aclose()
+        kind = str(response.extensions.get(
+            "mirofish_relay_credential_kind", ""))
+        credential = str(response.extensions.get(
+            "mirofish_relay_credential", ""))
+        if kind == "ticket":
+            self._invalidate_route_ticket(alias, proxy_url, credential)
+            return
+        if kind == "account" and credential:
+            await self.refresh_access(alias, credential, proxy_url)
+            return
+        raise RelayError("relay rejected an unknown credential", 401)
+
     async def signed_json(self, alias: str, method: str, path: str,
                           payload: Optional[dict[str, Any]] = None,
                           proxy_url: Optional[str] = None, *,
-                          request_headers: Optional[Mapping[str, str]] = None,
+                          request_headers: Optional[
+                              Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
                           session_id: str = "", beta: bool = False,
                           probe: bool = False) -> tuple[int, dict[str, str], Any]:
         """Call a relay control/model endpoint using device auth."""
@@ -1011,12 +1333,11 @@ class Upstream:
         url_path = path
         extra_headers: Optional[list[tuple[str, str]]] = None
         relay_session = session_id
-        call_id = ""
-        if path in (MESSAGES_PATH, COUNT_TOKENS_PATH):
+        model_call = path in (MESSAGES_PATH, COUNT_TOKENS_PATH)
+        if model_call:
             relay_session = session_id or str(uuid.uuid4())
             extra_headers = self._message_request_headers(
                 request_headers, probe, relay_session, alias)
-            call_id = str(uuid.uuid4())
             if beta:
                 url_path += "?beta=true"
         for attempt in range(2):
@@ -1024,13 +1345,12 @@ class Upstream:
                 alias, method, path, request_body, proxy_url,
                 url_path=url_path,
                 extra_headers=extra_headers, session_id=relay_session,
-                call_id=call_id, probe=probe)
+                # x-mirasim-call identifies one HTTP request, not one logical
+                # call: a credential-refresh retry is a second request and gets
+                # its own id, as the session id stays put across both.
+                call_id=str(uuid.uuid4()) if model_call else "", probe=probe)
             if response.status_code == 401 and attempt == 0:
-                await response.aread()
-                await response.aclose()
-                self._invalidate_route_ticket(
-                    alias, proxy_url,
-                    str(response.extensions.get("mirofish_device_ticket", "")))
+                await self._retry_relay_401(alias, proxy_url, response)
                 continue
             data = _parse_body(response)
             headers = _lower_headers(response)
@@ -1041,29 +1361,29 @@ class Upstream:
 
     async def messages(self, alias: str, payload: dict[str, Any],
                        proxy_url: Optional[str] = None, *,
-                       request_headers: Optional[Mapping[str, str]] = None,
+                       request_headers: Optional[
+                           Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
                        session_id: str = "", beta: bool = False,
-                       probe: bool = False) -> tuple[dict[str, Any], dict[str, str]]:
+                       probe: bool = False,
+                       raw_body: Optional[bytes] = None,
+    ) -> tuple[dict[str, Any], dict[str, str]]:
         """Buffered (non-stream) Messages call with ticket/signature retry."""
+        original = payload
         payload = _with_cache_breakpoints(_claude_compatible_payload(payload))
-        request_body = _json_bytes(payload)
+        request_body = (raw_body if raw_body is not None and payload is original
+                        else _json_bytes(payload))
         url_path = MESSAGES_PATH + ("?beta=true" if beta else "")
         relay_session = session_id or str(uuid.uuid4())
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
-        call_id = str(uuid.uuid4())
         for attempt in range(2):
             response = await self._signed_relay_response(
                 alias, "POST", MESSAGES_PATH, request_body, proxy_url,
                 url_path=url_path,
                 extra_headers=extra_headers, session_id=relay_session,
-                call_id=call_id, probe=probe)
+                call_id=str(uuid.uuid4()), probe=probe)
             if response.status_code == 401 and attempt == 0:
-                await response.aread()
-                await response.aclose()
-                self._invalidate_route_ticket(
-                    alias, proxy_url,
-                    str(response.extensions.get("mirofish_device_ticket", "")))
+                await self._retry_relay_401(alias, proxy_url, response)
                 continue
             response_body = _parse_body(response)
             headers = _lower_headers(response)
@@ -1081,33 +1401,33 @@ class Upstream:
 
     async def stream_messages(self, alias: str, payload: dict[str, Any],
                               proxy_url: Optional[str] = None, *,
-                              request_headers: Optional[Mapping[str, str]] = None,
+                              request_headers: Optional[
+                                  Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
                               session_id: str = "", beta: bool = False,
-                              probe: bool = False) -> httpx.Response:
+                              probe: bool = False,
+                              raw_body: Optional[bytes] = None,
+    ) -> httpx.Response:
         """Open a streaming Anthropic Messages call; caller must aclose() it.
 
         Returns after upstream status/headers are known, so proxy rotation can
         still happen on connect failure; the body streams afterwards.
         """
+        original = payload
         payload = _with_cache_breakpoints(_claude_compatible_payload(payload))
-        request_body = _json_bytes(payload)
+        request_body = (raw_body if raw_body is not None and payload is original
+                        else _json_bytes(payload))
         url_path = MESSAGES_PATH + ("?beta=true" if beta else "")
         relay_session = session_id or str(uuid.uuid4())
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
-        call_id = str(uuid.uuid4())
         for attempt in range(2):
             response = await self._signed_relay_response(
                 alias, "POST", MESSAGES_PATH, request_body, proxy_url,
                 stream=True, url_path=url_path,
                 extra_headers=extra_headers, session_id=relay_session,
-                call_id=call_id, probe=probe)
+                call_id=str(uuid.uuid4()), probe=probe)
             if response.status_code == 401 and attempt == 0:
-                await response.aread()
-                await response.aclose()
-                self._invalidate_route_ticket(
-                    alias, proxy_url,
-                    str(response.extensions.get("mirofish_device_ticket", "")))
+                await self._retry_relay_401(alias, proxy_url, response)
                 continue
             if response.status_code >= 400:
                 await response.aread()
@@ -1122,3 +1442,58 @@ class Upstream:
                 raise RelayError("model request rejected", response.status_code, response_body)
             return response
         raise RelayError("model request failed after ticket refresh", 401)
+
+    async def stream_responses(
+            self, alias: str, body: bytes,
+            proxy_url: Optional[str] = None, *,
+            request_headers: Optional[
+                Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
+            session_id: str = "", account_id: str = "",
+            query_string: str = "", path: str = RESPONSES_PATH,
+    ) -> httpx.Response:
+        """Open a Codex relay call without rebuilding its JSON body.
+
+        Several local paths collapse onto each upstream endpoint.  The query is
+        retained on the request URL but deliberately excluded from the signing
+        pathname, matching the desktop MITM's canonicalization.
+        """
+        if path not in CODEX_PATHS:
+            raise RelayError("unsupported codex endpoint", 404)
+        url_path = path + ("?" + query_string if query_string else "")
+        relay_session = session_id or str(uuid.uuid4())
+        extra_headers = forwarded_codex_headers(request_headers)
+        for attempt in range(2):
+            response = await self._signed_relay_response(
+                alias, "POST", path, body, proxy_url,
+                stream=True, url_path=url_path, extra_headers=extra_headers,
+                session_id=relay_session, call_id=str(uuid.uuid4()),
+                agent="codex", account_id=account_id)
+            if response.status_code == 401 and attempt == 0:
+                await self._retry_relay_401(alias, proxy_url, response)
+                continue
+            if response.status_code >= 400:
+                # Buffer only rejected responses so routing/account decisions
+                # can inspect their small JSON envelope.  Successful Responses
+                # streams remain byte-for-byte passthroughs.
+                await response.aread()
+                response.extensions["mirofish_body_decoded"] = True
+                response_body = _parse_body(response)
+                try:
+                    _raise_if_region_blocked(
+                        alias, response.status_code, response_body, proxy_url)
+                    if _is_account_exhausted(response_body):
+                        raise RelayError(
+                            "model request rejected", response.status_code,
+                            response_body)
+                except BaseException:
+                    await response.aclose()
+                    raise
+                logger.warning(
+                    "upstream rejected %s: account=%s status=%s %s",
+                    path, alias, response.status_code,
+                    _rejection_detail(response_body))
+                # Protocol errors such as unsupported_model belong to the
+                # Codex caller. Preserve their status, body, and end-to-end
+                # headers instead of translating them into our error schema.
+            return response
+        raise RelayError("model request failed after credential refresh", 401)

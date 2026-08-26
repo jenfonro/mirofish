@@ -26,8 +26,15 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - SQLite stores metadata and the usage log only.
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
-- Model relay calls use a per-alias Ed25519 device identity, per-exit `/v1/device/session` tickets, and
-  `mrs-sig-v1` signatures over the exact request body; the private key lives in the encrypted vault.
+- Model relay calls use one installation-wide Ed25519 device identity (not one per alias), per-exit
+  `/v1/device/session` tickets, and `mrs-sig-v1` signatures over the exact request body; the private
+  key lives in the encrypted vault and `x-mirasim-device` is derived from it on both the signed and
+  the unsigned fallback path.
+- Impersonation fidelity is header- and body-level. The TLS ClientHello is OpenSSL's, not the
+  official client's BoringSSL one, and matching its JA3 would mean replacing the TLS stack rather
+  than configuring it; `upstream.tls_context()` documents the two knobs that exist and why ALPN is
+  deliberately left alone. `tests/test_tls_profile.py` measures the hello on loopback so a
+  dependency bump cannot change it silently.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
 - Docker runs a single container: `docker-entrypoint.sh` generates the Mihomo config and starts the bundled Mihomo engine (skipped when no subscription is set), then starts the relay; the relay reaches the engine over loopback (`127.0.0.1:9090`/`7890`). If either process exits the container restarts. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Configs without slots fall back to the legacy single-selector mode automatically. Mihomo config + provider cache live under `/data/mihomo/`.
 - Each account binds persistently to one proxy node, rotating on proxy network failure, on an

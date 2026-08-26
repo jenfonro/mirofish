@@ -2,7 +2,8 @@
 
 容器化运行 `mirofish/` Python 包：多账号管理、邮箱验证码登录、凭证加密持久化、
 按账号固定 Mihomo 节点（多槽位并发出口）、Anthropic-compatible `/v1/messages` 真流式中转、
-OpenAI-compatible `/v1/chat/completions` 翻译（含 tool calls / 图片 / 流式），以及内置 Vue 管理 WebUI。
+OpenAI-compatible `/v1/chat/completions` 翻译（含 tool calls / 图片 / 流式）、Codex Responses
+透明代理，以及内置 Vue 管理 WebUI。
 
 relay 与 Mihomo 代理引擎打包在**同一个容器**里，由入口脚本先生成 Mihomo 配置并启动引擎，
 再启动 relay（未配置订阅时跳过 Mihomo，纯直连）；任一进程退出即整体重启。不再有独立的
@@ -43,11 +44,19 @@ sidecar 与 init 容器。
 - SQLite `/data/accounts.sqlite3` 只保存元数据（邮箱、plan、租户、用量日志）；
 - 丢失主密钥将无法解密已有账号凭证，需要重新登录。
 
-模型 relay 还要求设备签名：每个本地账号首次发起模型请求时生成一个 Ed25519 设备密钥，
-并为当前出口申请约 15 分钟的 device ticket，再为每个请求生成 `mrs-sig-v1` 签名。私钥与账号
-token 一样只进入加密凭证存储，不写入 SQLite 或日志。当前默认客户端标识为抓包确认的
-`0.0.220`。Anthropic 请求会保留 `?beta=true` 与白名单内的 Claude SDK 特征头；查询串不会
-错误地并入签名，调用方的 `Authorization` / `X-Api-Key` 也绝不会转发给上游。模型流量默认发往
+模型 relay 还要求设备签名：0.0.228 客户端在整个安装范围内持久化一个 Ed25519 密钥，
+并按「账号 × 出口」申请约 15 分钟的 device ticket，再为每个请求生成 `mrs-sig-v1` 签名。
+私钥与账号 token 一样只进入加密凭证存储，不写入 SQLite 或日志。旧版按账号保存的设备密钥会
+自动迁移一个到安装级槽位。当前默认客户端标识为抓包确认的 `0.0.228`。ticket 会提前 120 秒
+刷新；申请端点返回 404/501 时缓存 15 分钟“不支持签名”，其他失败按 1–30 秒退避。没有 ticket
+时严格改用账号 token 且不发送伪签名，后续自动恢复。
+
+Anthropic 请求会保留 `?beta=true` 与白名单内的 Claude SDK 特征头；Codex 的 `/v1/responses`
+和 `/backend-api/codex/responses` 都映射到上游 `/v1/responses`，`/v1/alpha/search` 与
+`/backend-api/codex/alpha/search` 映射到上游 `/v1/alpha/search`；两组路径各自用自己的上游
+pathname 签名，保留查询串但签名只包含 pathname。
+压缩的 Codex 请求体先有界解压，再以最终精确字节计算长度、哈希和签名。调用方的
+`Authorization` / `X-Api-Key` 绝不会转发给上游。模型流量默认发往
 官方客户端当前使用的 `https://relay.mirasim.ai`；旧的 `mirasim-relay.mirofish.ai` 分发可能仍返回
 模型目录；当前观察到它可能对同一 Claude 请求返回 `no upstream available for model`。
 
@@ -122,6 +131,10 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
     POST   /v1/chat/completions      # OpenAI 兼容；支持 tools/图片/流式
                                      # 注意：上游以 thinking 模式服务，仅接受 temperature=1
                                      # 且不接受 top_p；其他采样参数会被自动丢弃而非转发
+    POST   /v1/responses             # Codex Responses 原始字节/状态/响应头透传
+    POST   /backend-api/codex/responses # Codex 原生路径，映射到 /v1/responses
+    POST   /v1/alpha/search          # Codex 检索透传
+    POST   /backend-api/codex/alpha/search # Codex 原生路径，映射到 /v1/alpha/search
     POST   /api/login/start          # {"alias","email"} 发送验证码
     POST   /api/login/finish         # {"alias","code"} 完成登录
     POST   /api/accounts/<alias>/enabled # {"enabled":true|false} 面板启用/停用开关
@@ -183,7 +196,8 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
 ## 从旧版（单文件 relay）升级
 
 数据卷完全兼容：SQLite 结构自动迁移（新增用量日志表），`secrets.enc` v1 自动升级为 v2，
-账号与节点绑定关系保留。直接 `docker compose up -d --build` 即可。
+旧版账号设备密钥首次使用时迁移为安装级密钥，账号与节点绑定关系保留。直接
+`docker compose up -d --build` 即可。
 
 ## 注意
 
@@ -205,20 +219,15 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   避免出现 `lang: python` 与 `runtime: node` 并存这种任何真实客户端都不会发出的组合；
   只有 `anthropic-version` 和 `anthropic-beta` 这两个会改变请求语义的选项保留调用方的值。
   `MIROFISH_CLAUDE_CLI_USER_AGENT` 可覆盖 User-Agent。
-- 判断某个指纹字段能否按账号变化，规则是：只有上游无法从别处独立核对的字段才可以。
-  据此：
-  - 描述「机器」的 `x-stainless-arch` / `x-stainless-os` **按账号区分**——CPU/操作系统
-    无法通过 TLS 连接核对，由别名确定性推导，同一账号终生不变，不同账号落在不同平台。
-    否则一批订阅在上游看来是同一台工作站，正好抵消每账号独立设备密钥与独立代理出口的
-    作用。调用方自带 CLI 指纹时这一对同样按账号改写（一个客户端在前、多账号在后时，
-    机器应属于账号而非客户端）。arch 与 os 成对抽取，不会拼出从未发行的机型。
-  - `x-mirasim-locale`、`x-mirasim-client`、`x-stainless-runtime-version` 等**刻意保持
-    全账号一致**。locale 可被上游拿出口 IP 的地理位置核对，按别名随机分散会造出
-    IP 与 locale 不匹配，反而比统一值更显眼；默认 `zh-HK` 时代理池本身就是亚洲池，
-    统一的亚洲 locale 恰是独立用户会发的值。真正正确的做法是让 locale 跟随出口地区，
-    但节点元数据并不可靠地携带地区信息，所以由运营者按需通过 `MIROFISH_MIRASIM_LOCALE`
-    统一设置。版本类字段同理：上游知道实际发行过哪些版本，伪造会变成「从未发行的
-    版本」这一破绽，而真实用户群本就聚集在当前版本上。
+- 设备与机器字段遵循 0.0.228 的安装级边界，不按账号虚构。非 CLI 调用方统一补全为抓包中的
+  `arm64 / MacOS` Claude CLI 组合；真实 `claude-cli/...` 调用方的 arch / os 原样保留。
+  `x-mirasim-device` 始终是公钥派生的 22 字符安装 ID，签名与无签名降级发出的是同一个值；
+  降级路径不会改用形状不同的替代标识，否则单看这个字段就能区分两条路径。
+- 仿真范围只到请求头与请求体。TLS ClientHello 出自 OpenSSL，官方客户端是 Electron 的
+  BoringSSL：cipher 列表、扩展顺序与 GREASE 由 TLS 库决定，要对齐 JA3 得换掉 TLS 栈，
+  配置 OpenSSL 做不到。因此 ALPN 扩展被刻意保留（官方也带这个扩展，去掉反而更显眼），
+  只有在 Python 3.13+ 上会把 supported_groups 收窄成浏览器那三个曲线，去掉 OpenSSL 3.5
+  默认的 X25519MLKEM768 与 ffdhe。回环抓包测试固定了这些字段，依赖升级不会悄悄改掉。
 - 上游会话标识（`x-mirasim-session`）现在是裸 v4 UUID，不再带 `mirofish_` 前缀：该值同时用作
   `x-claude-code-session-id`，官方客户端在这里发的一直是 UUID。对同一对话仍然是确定性的，
   会话亲和行为不变。
@@ -229,6 +238,7 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
 - 上游固定使用 HTTP/1.1 连接池；`MIROFISH_KEEPALIVE_EXPIRY`（默认 75 秒）、
   `MIROFISH_MAX_CONNECTIONS`（默认 100）和 `MIROFISH_MAX_KEEPALIVE_CONNECTIONS`
   （默认 20）控制连接复用，`MIROFISH_STREAM_READ_TIMEOUT`（默认 600 秒）控制流式读取超时。
+  `MIROFISH_MAX_BODY_BYTES`（默认 8388608）同时限制压缩输入与解压后的正文，防止解压炸弹。
 - `status?probe=1` 使用 `/v1/limits`，不产生模型调用；显式模型扫描会发送最小工作请求，
   可能消耗少量额度。
 - 删除账号只清除本地凭证，不注销远端账号。

@@ -11,6 +11,7 @@ Mirofish Relay 是一个面向本地或自托管环境的多账号中转服务�
 - 多账号邮箱验证码登录、状态查看与本地凭证管理。
 - Anthropic-compatible `/v1/messages`，支持真实 SSE 流式传输。
 - OpenAI-compatible `/v1/chat/completions`，支持流式响应、工具调用与图片消息。
+- Codex Responses 透明代理：`/v1/responses` 与 `/backend-api/codex/responses`。
 - `/v1/messages/count_tokens` token 计数接口。
 - 会话亲和与配额感知路由，让同一对话持续使用同一账号。
 - Mihomo 代理池：账号固定节点、失败自动轮换、多槽位并发出口。
@@ -21,7 +22,7 @@ Mirofish Relay 是一个面向本地或自托管环境的多账号中转服务�
 ## 工作方式
 
 ```text
-Anthropic / OpenAI 客户端
+Anthropic / OpenAI / Codex 客户端
             │
             ▼
     FastAPI Relay + WebUI
@@ -130,6 +131,32 @@ curl -N http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
+### Codex Responses（透明转发）
+
+```bash
+curl -N 'http://127.0.0.1:8787/v1/responses?beta=true' \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer <proxy-key>' \
+  -d '{
+    "model": "gpt-5.6-codex",
+    "stream": true,
+    "input": "你好"
+  }'
+```
+
+两个 Responses 路径映射到上游 `/v1/responses`，`/v1/alpha/search` 与
+`/backend-api/codex/alpha/search` 映射到上游 `/v1/alpha/search`；签名用的 pathname 是各自的
+上游路径，不会被另一条路径顶替。查询串会保留在 URL 中，但签名只使用 pathname。
+gzip / deflate / br / zstd 请求体会先按大小上限解压，随后以解压后的精确字节重算
+`Content-Length`、正文 SHA-256 与 Ed25519 签名；JSON 不会被重排。调用方的鉴权头和
+`x-mirasim-*` 不能覆盖代理生成的字段，其余 Codex 协议头按 blocklist 方式透传。
+请求体只带 `prompt`（引用已存储的 prompt）而不带 `model` 也是合法的，本地不会拦下来：
+由上游决定，拒绝原样回传。`model` 字段本身仍会校验格式。
+
+Codex 流是原始字节透传，同时会旁路读取 `response.completed` / `response.incomplete` /
+`response.failed` 事件里的 `usage`，把 token 数写入用量日志，转发出去的字节不受影响。
+上游返回 4xx/5xx 时错误原样回传，但不会给出口节点记成一次成功。
+
 如需指定账号，可增加请求头：
 
 ```text
@@ -151,11 +178,17 @@ SDK system 标记的第三方极简请求误报为 `no upstream available for mo
 会改变请求语义的选项保留调用方的值。上游会话标识同时用于 `x-mirasim-session` 和
 `x-claude-code-session-id`，格式为裸 v4 UUID，对同一对话保持确定性。
 
-指纹中描述机器的 `x-stainless-arch` / `x-stainless-os` 按账号区分：由别名确定性推导，
-同一账号始终不变，不同账号落在不同平台上，避免一批订阅在上游看来共用同一台机器而抵消掉
-每账号独立设备密钥与独立代理出口。调用方自带 CLI 指纹时这一对同样按账号改写，其余槽位
-（runtime、SDK 版本、User-Agent）保持调用方的真实值。arch 与 os 成对抽取，不会拼出未曾
-发行的机型；`x-stainless-runtime-version` 只用抓包证实过的值，不做变化。
+0.0.228 客户端使用“每安装一个 Ed25519 密钥”，不会按账号伪造不同机器。非 CLI 调用方补全为
+同一套抓包确认的 Claude CLI 指纹；真实 `claude-cli/...` 调用方的 arch / os 等字段保持原值。
+`x-mirasim-device` 始终是那个密钥公钥派生出的 22 字符安装 ID：签名请求与降级到账号 token 的
+请求发出同一个值，只有时间戳、nonce 与签名三个头是签名路径独有的。若降级路径改用形状不同的
+标识（例如 36 字符 UUID），单看这一个字段就能区分两条路径。
+
+以上仿真都发生在请求头与请求体层面。TLS 层不在其中：ClientHello 由 OpenSSL 生成，官方客户端
+是 Electron 的 BoringSSL，cipher 列表、扩展顺序与 GREASE 都属于 TLS 库而非本项目，要对齐 JA3
+只能替换 TLS 栈。`upstream.tls_context()` 说明了 Python 能调的两个旋钮，以及为什么 ALPN 扩展
+被刻意保留（官方同样带这个扩展，去掉反而更显眼）；`tests/test_tls_profile.py` 在本机回环上抓
+ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是悄悄改变。
 
 ## 常用接口
 
@@ -172,6 +205,10 @@ SDK system 标记的第三方极简请求误报为 `no upstream available for mo
 | `POST` | `/v1/messages` | Anthropic Messages |
 | `POST` | `/v1/messages/count_tokens` | Token 计数 |
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
+| `POST` | `/v1/responses` | Codex Responses 原始流式转发 |
+| `POST` | `/backend-api/codex/responses` | Codex 原生兼容路径，映射到 `/v1/responses` |
+| `POST` | `/v1/alpha/search` | Codex 检索透传 |
+| `POST` | `/backend-api/codex/alpha/search` | Codex 原生兼容路径，映射到 `/v1/alpha/search` |
 | `GET` | `/api/usage?hours=24` | 用量统计 |
 
 ## 关键配置
@@ -192,6 +229,7 @@ SDK system 标记的第三方极简请求误报为 `no upstream available for mo
 | `MIROFISH_MAX_CONNECTIONS` | `100` | 上游连接池总连接上限 |
 | `MIROFISH_MAX_KEEPALIVE_CONNECTIONS` | `20` | 上游空闲连接上限 |
 | `MIROFISH_STREAM_READ_TIMEOUT` | `600` | 上游流式响应读取超时，单位为秒 |
+| `MIROFISH_MAX_BODY_BYTES` | `8388608` | 压缩体与解压后请求体的最大字节数 |
 
 完整配置项及示例见
 [`deploy/mirofish-relay/.env.example`](deploy/mirofish-relay/.env.example)。
@@ -242,7 +280,8 @@ python tools/request_profile.py validate tests/fixtures/request_profiles/message
 
 Docker 数据默认保存在 `mirofish-data` 数据卷：
 
-- `/data/secrets.enc`：加密后的账号 token 与设备私钥。
+- `/data/secrets.enc`：加密后的账号 token 与安装级 Ed25519 私钥。设备标识由该私钥派生，
+  不额外落盘。
 - `/data/accounts.sqlite3`：账号元数据、代理绑定和用量日志。
 - `/data/proxy.key`：调用本地 API 所需的代理密钥。
 - `/data/mihomo/`：Mihomo 配置与 provider 缓存。
