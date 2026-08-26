@@ -1,6 +1,6 @@
 import { reactive } from "vue";
 import { api } from "./api";
-import type { Account, Health, LimitsSummary, ProxySummary, UsageSummary } from "./types";
+import type { Account, Health, LimitsSummary, ProxySummary, ScheduleSettings, UsageSummary } from "./types";
 
 interface Toast {
   id: number;
@@ -19,6 +19,7 @@ export const store = reactive({
   usage: null as UsageSummary | null,
   limits: null as LimitsSummary | null,
   limitsLoading: false,
+  schedule: null as ScheduleSettings | null,
   toasts: [] as Toast[],
 });
 
@@ -37,6 +38,10 @@ export async function loadAccounts(): Promise<void> {
 
 export async function loadProxies(): Promise<void> {
   store.proxies = await api<ProxySummary>("/proxies");
+}
+
+export async function loadSchedule(): Promise<void> {
+  store.schedule = await api<ScheduleSettings>("/api/schedule");
 }
 
 export async function loadUsage(hours = 24): Promise<void> {

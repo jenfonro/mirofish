@@ -144,6 +144,28 @@ async def set_subscription(request: Request) -> dict[str, Any]:
     return await state.pool.set_subscription(str(payload.get("url", "")))
 
 
+@router.get("/api/schedule")
+async def get_schedule(request: Request) -> dict[str, Any]:
+    """Current account-scheduling mode and its utilization ceiling."""
+    return get_state(request).schedule_settings()
+
+
+@router.post("/api/schedule")
+async def set_schedule(request: Request) -> dict[str, Any]:
+    state = get_state(request)
+    payload = await read_json_body(request)
+    current = state.schedule_settings()
+    try:
+        ceiling = float(payload.get("max_utilization", current["max_utilization"]))
+    except (TypeError, ValueError) as exc:
+        raise RelayError("max_utilization must be a number", 400) from exc
+    settings = state.set_schedule_settings(
+        str(payload.get("mode", current["mode"])), ceiling)
+    # Reset-first reads the cached windows, so make sure the sweep is running.
+    state.start_limits_refresh()
+    return settings
+
+
 @router.post("/api/proxies/refresh")
 async def refresh_proxies(request: Request) -> dict[str, Any]:
     return await get_state(request).pool.refresh(force=True)

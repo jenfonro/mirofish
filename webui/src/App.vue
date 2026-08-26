@@ -8,6 +8,7 @@ import AddAccountCard from "./components/AddAccountCard.vue";
 import LimitsCard from "./components/LimitsCard.vue";
 import PlaygroundCard from "./components/PlaygroundCard.vue";
 import ProxyCard from "./components/ProxyCard.vue";
+import ScheduleCard from "./components/ScheduleCard.vue";
 import UsageCard from "./components/UsageCard.vue";
 
 const keyInput = ref("");
@@ -89,6 +90,7 @@ onMounted(async () => {
     <LimitsCard class="span2" />
     <AddAccountCard />
     <UsageCard />
+    <ScheduleCard class="span2" />
     <ProxyCard class="span2" />
     <PlaygroundCard class="span2" />
   </main>

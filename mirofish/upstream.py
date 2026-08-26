@@ -245,13 +245,16 @@ def _rejection_detail(body: Any) -> str:
     return str(body)[:300]
 
 
+REGION_REFUSAL_TYPE = "shared_quota_unavailable"
+
+
 def _is_region_blocked(status: int, body: Any) -> bool:
     """The upstream refuses to serve requests from this exit's network region."""
     if status != 429 or not isinstance(body, dict):
         return False
     error = body.get("error")
     return (isinstance(error, dict)
-            and str(error.get("type")) == "shared_quota_unavailable")
+            and str(error.get("type")) == REGION_REFUSAL_TYPE)
 
 
 def _region_block_error(status: int, body: Any,
