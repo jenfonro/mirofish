@@ -405,6 +405,7 @@ def _rejection_detail(body: Any) -> str:
 
 
 REGION_REFUSAL_TYPE = "shared_quota_unavailable"
+CREDIT_EXHAUSTED_TYPE = "credit_exhausted_shared"
 
 
 def _is_region_blocked(status: int, body: Any) -> bool:
@@ -416,13 +417,22 @@ def _is_region_blocked(status: int, body: Any) -> bool:
             and str(error.get("type")) == REGION_REFUSAL_TYPE)
 
 
-def _is_account_exhausted(body: Any) -> bool:
-    """True when another account, rather than another proxy exit, can recover."""
-    if not isinstance(body, dict):
+def account_scoped_429(status: int, body: Any) -> bool:
+    """A 429 another account, rather than another proxy exit, can recover from.
+
+    ``credit_exhausted_shared`` is the refusal the product documents, but a
+    window that fills up can surface under other 429 types too, so every 429
+    except the region refusal counts. The single definition is shared by all
+    relay paths; account-level failover keys off it.
+    """
+    if status != 429:
         return False
+    if not isinstance(body, dict):
+        return True
     error = body.get("error")
-    return (isinstance(error, dict)
-            and str(error.get("type")) == "credit_exhausted_shared")
+    if not isinstance(error, dict):
+        return True
+    return str(error.get("type")) != REGION_REFUSAL_TYPE
 
 
 def _region_block_error(status: int, body: Any,
@@ -1484,7 +1494,7 @@ class Upstream:
                 try:
                     _raise_if_region_blocked(
                         alias, response.status_code, response_body, proxy_url)
-                    if _is_account_exhausted(response_body):
+                    if account_scoped_429(response.status_code, response_body):
                         raise RelayError(
                             "model request rejected", response.status_code,
                             response_body)
@@ -1495,8 +1505,8 @@ class Upstream:
                     "upstream rejected %s: account=%s status=%s %s",
                     path, alias, response.status_code,
                     _rejection_detail(response_body))
-                # Protocol errors such as unsupported_model belong to the
-                # Codex caller. Preserve their status, body, and end-to-end
+                # Non-429 protocol errors such as unsupported_model belong to
+                # the Codex caller. Preserve their status, body, and end-to-end
                 # headers instead of translating them into our error schema.
             return response
         raise RelayError("model request failed after credential refresh", 401)

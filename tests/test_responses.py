@@ -143,6 +143,33 @@ async def test_codex_stream_records_usage_and_leaves_bytes_untouched(
 
 
 @respx.mock
+async def test_codex_account_scoped_429_fails_over_to_another_account(
+        client, state, auth_headers):
+    """A 429 on the Codex path moves the conversation to another account.
+
+    Passing the refusal through verbatim would leave the session pinned to
+    the refused account, so the caller's retry lands straight back on it.
+    """
+    add_account(state, "first")
+    add_account(state, "second")
+    _device_session()
+    route = respx.post(RELAY_BASE + RESPONSES_PATH).mock(side_effect=[
+        httpx.Response(429, json={"error": {"type": "usage_limit_reached"}}),
+        httpx.Response(200, content=b'event: response.completed\ndata: {}\n\n',
+                       headers={"content-type": "text/event-stream"}),
+    ])
+
+    response = await client.post(
+        "/v1/responses", headers=auth_headers,
+        content=b'{"model":"gpt-5.6-codex","stream":true,"input":"hi"}')
+
+    assert response.status_code == 200
+    assert response.headers["x-mirofish-account"] == "second"
+    assert route.call_count == 2
+    assert state.exhausted_cooldown("first") > 0
+
+
+@respx.mock
 async def test_alpha_search_relays_under_both_local_paths(
         client, state, auth_headers):
     add_account(state, "work")

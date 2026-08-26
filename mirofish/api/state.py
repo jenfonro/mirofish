@@ -19,7 +19,8 @@ from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool
 from ..store import Store
-from ..upstream import REGION_REFUSAL_TYPE, RESPONSES_PATH, Upstream, quota_headers
+from ..upstream import (CREDIT_EXHAUSTED_TYPE, RESPONSES_PATH, Upstream,
+                        account_scoped_429, quota_headers)
 from ..validate import alias_value
 from ..vault import make_credential_store
 
@@ -32,6 +33,11 @@ MAX_NETWORK_PROXY_ATTEMPTS = 4
 # with credit_exhausted_shared. The reset time is unknown to us, so re-probe
 # occasionally instead of blacklisting until restart.
 SHARED_QUOTA_COOLDOWN = 600.0
+# Cooldown for a 429 the relay does not recognize. Those are usually transient
+# rate pressure that clears in seconds, so the account only needs to sit out
+# long enough for its dropped sessions to land elsewhere; the full cooldown
+# would bench a single-account deployment for 10 minutes over one hiccup.
+TRANSIENT_429_COOLDOWN = 60.0
 
 # Account scheduling. "balanced" spreads new conversations over the accounts
 # carrying the fewest live sessions. "reset_first" instead prefers the account
@@ -515,24 +521,23 @@ class AppState:
     def _is_account_exhausted(exc: RelayError) -> bool:
         """The upstream refused to serve this ACCOUNT rather than this exit.
 
-        ``credit_exhausted_shared`` is the refusal the product documents, but a
-        window that fills up can surface under other 429 types too. Treating
-        every account-scoped 429 the same way costs one extra attempt when the
-        guess is wrong; not treating it leaves the conversation pinned to an
-        account that answers 429 until its window resets, because affinity
-        keeps routing the client's retry straight back to it.
-
-        Region refusals are excluded: those belong to the proxy exit, and the
-        pool already rotates nodes for them.
+        Treating every account-scoped 429 this way costs one extra attempt
+        when the guess is wrong; not treating it leaves the conversation
+        pinned to an account that answers 429 until its window resets,
+        because affinity keeps routing the client's retry straight back to it.
         """
-        if exc.status != 429:
-            return False
+        return account_scoped_429(exc.status, exc.data)
+
+    @staticmethod
+    def _is_credit_exhausted(exc: RelayError) -> bool:
+        """The documented shared-credit exhaustion, which holds until the
+        weekly window resets — unlike other 429 shapes, which are usually
+        transient rate pressure."""
         if not isinstance(exc.data, dict):
-            return True
+            return False
         error = exc.data.get("error")
-        if not isinstance(error, dict):
-            return True
-        return str(error.get("type")) != REGION_REFUSAL_TYPE
+        return (isinstance(error, dict)
+                and str(error.get("type")) == CREDIT_EXHAUSTED_TYPE)
 
     def drop_account_sessions(self, alias: str) -> None:
         """Detach live sessions pinned to an account so each conversation's next
@@ -586,18 +591,29 @@ class AppState:
 
     def note_account_unserviceable(self, alias: str, exc: RelayError) -> bool:
         """Record an account-scoped upstream refusal so automatic selection
-        avoids the account for a while. Returns True when the error was one."""
+        avoids the account for a while. Returns True when the error was one.
+
+        The cooldown length depends on what the refusal was: shared-credit
+        exhaustion holds until the window resets, so re-probing every 10
+        minutes is enough, while an unrecognized 429 is usually transient
+        rate pressure — benching the account (and, with a single account,
+        the whole relay) for 10 minutes over one of those would turn a
+        seconds-long hiccup into a self-inflicted outage.
+        """
         if self._is_account_exhausted(exc):
-            reason = "shared-quota refusal"
+            if self._is_credit_exhausted(exc):
+                cooldown, reason = SHARED_QUOTA_COOLDOWN, "shared-quota refusal"
+            else:
+                cooldown, reason = TRANSIENT_429_COOLDOWN, "account-scoped 429"
         elif self._is_region_refused_everywhere(exc):
-            reason = "region refusal from every exit"
+            cooldown, reason = SHARED_QUOTA_COOLDOWN, "region refusal from every exit"
         else:
             return False
-        self._exhausted_until[alias] = time.time() + SHARED_QUOTA_COOLDOWN
+        self._exhausted_until[alias] = time.time() + cooldown
         self.drop_account_sessions(alias)
         logger.warning(
             "account cooling down for %ds after %s: account=%s",
-            int(SHARED_QUOTA_COOLDOWN), reason, alias)
+            int(cooldown), reason, alias)
         return True
 
     async def with_account_failover(

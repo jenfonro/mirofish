@@ -11,7 +11,8 @@ import time
 import pytest
 
 from mirofish.api.state import (DEFAULT_SCHEDULE_MAX_UTILIZATION,
-                                SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST)
+                                SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST,
+                                SHARED_QUOTA_COOLDOWN, TRANSIENT_429_COOLDOWN)
 from mirofish.errors import RelayError
 
 from tests.conftest import add_account
@@ -157,6 +158,24 @@ def test_any_account_scoped_429_frees_the_conversation(state):
         assert state.note_account_unserviceable("work", refusal(429, error_type)), \
             f"429 {error_type} left the account selectable"
         assert state.exhausted_cooldown("work") > 0
+
+
+def test_credit_exhaustion_cools_much_longer_than_a_transient_429(state):
+    """Only the documented credit exhaustion earns the full cooldown.
+
+    An unrecognized 429 is usually transient rate pressure; benching the
+    account for the full 10 minutes would turn a seconds-long hiccup into an
+    outage for a single-account deployment.
+    """
+    add_account(state, "work")
+    state.note_account_unserviceable(
+        "work", refusal(429, "credit_exhausted_shared"))
+    assert state.exhausted_cooldown("work") == \
+        pytest.approx(SHARED_QUOTA_COOLDOWN, abs=5)
+    state._exhausted_until.clear()
+    state.note_account_unserviceable("work", refusal(429, "rate_limit_error"))
+    assert state.exhausted_cooldown("work") == \
+        pytest.approx(TRANSIENT_429_COOLDOWN, abs=5)
 
 
 def test_region_refusal_stays_with_the_proxy_pool(state):
