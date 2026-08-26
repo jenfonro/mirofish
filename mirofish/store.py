@@ -71,6 +71,11 @@ class Store:
             )
         """)
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_log(created_at)")
+        self.db.execute("""
+            CREATE TABLE IF NOT EXISTS settings (
+              key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+            )
+        """)
         self.db.commit()
 
     # --- local proxy key ----------------------------------------------------
@@ -189,6 +194,21 @@ class Store:
             self.vault.put(PROXY_POOL_ALIAS, "subscription_url", proxy_subscription_value(value))
         else:
             self.vault.delete(PROXY_POOL_ALIAS, "subscription_url")
+
+    # --- non-secret settings -------------------------------------------------
+
+    def setting(self, key: str, default: str = "") -> str:
+        row = self.db.execute(
+            "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+        return str(row["value"]) if row is not None else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (key, value, utc_now()))
+        self.db.commit()
 
     def proxy_configs(self) -> dict[str, dict[str, Any]]:
         raw = self._optional_secret(PROXY_POOL_ALIAS, "configs")

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -18,7 +19,7 @@ from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool
 from ..store import Store
-from ..upstream import RESPONSES_PATH, Upstream, quota_headers
+from ..upstream import REGION_REFUSAL_TYPE, RESPONSES_PATH, Upstream, quota_headers
 from ..validate import alias_value
 from ..vault import make_credential_store
 
@@ -31,6 +32,40 @@ MAX_NETWORK_PROXY_ATTEMPTS = 4
 # with credit_exhausted_shared. The reset time is unknown to us, so re-probe
 # occasionally instead of blacklisting until restart.
 SHARED_QUOTA_COOLDOWN = 600.0
+
+# Account scheduling. "balanced" spreads new conversations over the accounts
+# carrying the fewest live sessions. "reset_first" instead prefers the account
+# whose 7-day window resets soonest, so credit that is about to expire unused
+# is spent before it is thrown away; the balanced key stays as the tie-break.
+SCHEDULE_BALANCED = "balanced"
+SCHEDULE_RESET_FIRST = "reset_first"
+SCHEDULE_MODES = (SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST)
+SETTING_SCHEDULE_MODE = "schedule_mode"
+SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
+# Above this utilization an account drops out of the reset-first preference, so
+# one nearly-spent account does not absorb every new conversation. It is a
+# preference, not a gate: the upstream 429 is what actually stops a request,
+# and failover already moves the conversation on when that happens.
+DEFAULT_SCHEDULE_MAX_UTILIZATION = 0.98
+# The model whose spend is metered against its own weekly window as well.
+FABLE_WINDOW = "7d_fable"
+# Reset-first is a tilt on the balanced ordering, not a replacement for it.
+# An account is treated as carrying up to this many fewer sessions than it
+# really does as its weekly window approaches expiry, so it takes the next few
+# conversations and then rejoins the rotation once its real count catches up.
+# Keeping the bonus small is deliberate: a large one would hand it every
+# conversation and concentrate the concurrency on one account.
+URGENCY_MAX_BONUS = 2.0
+# Only a window closing within this many hours is worth diverting toward; the
+# rest of the week there is time to spend the credit at the normal rate.
+URGENCY_HORIZON_HOURS = 48.0
+# Reset-first ordering reads the cached /v1/limits windows, so they are
+# refreshed in the background rather than on the request path: probing there
+# would put an upstream round-trip in front of every new conversation. The
+# probe costs no model tokens, and stale numbers only ever cost one extra
+# attempt, since the upstream 429 plus failover is what actually stops a
+# request.
+LIMITS_REFRESH_SECONDS = 300.0
 
 
 def _is_uuid(value: str) -> bool:
@@ -74,12 +109,147 @@ class AppState:
         # alias -> epoch until which automatic selection avoids the account
         # (upstream refused it with credit_exhausted_shared).
         self._exhausted_until: dict[str, float] = {}
+        self._limits_task: Optional[asyncio.Task[None]] = None
 
     async def aclose(self) -> None:
+        await self.stop_limits_refresh()
         await self.upstream.aclose()
         await self.pool.aclose()
 
+    # --- background limits refresh -------------------------------------------
+
+    async def refresh_all_limits(self) -> None:
+        """Re-probe every account's usage windows, one failure at a time.
+
+        Scheduling only reads these numbers, so an account that cannot be
+        probed keeps its previous values instead of dropping out of the
+        ordering.
+        """
+        async def one(alias: str) -> None:
+            try:
+                await self.with_proxy(
+                    alias, lambda url: self.accounts.fetch_limits(alias, proxy_url=url))
+            except Exception as exc:  # noqa: BLE001 - one account must not stop the sweep
+                logger.debug("limits refresh failed: account=%s %s", alias, exc)
+
+        aliases = self.store.aliases()
+        if aliases:
+            await asyncio.gather(*(one(alias) for alias in aliases))
+
+    def start_limits_refresh(self) -> None:
+        """Keep the cached windows warm while reset-first ordering may use them."""
+        if self._limits_task is not None:
+            return
+
+        async def loop() -> None:
+            while True:
+                try:
+                    if self.schedule_settings()["mode"] == SCHEDULE_RESET_FIRST:
+                        await self.refresh_all_limits()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - the loop must outlive a bad sweep
+                    logger.warning("limits refresh sweep failed: %s", exc)
+                await asyncio.sleep(LIMITS_REFRESH_SECONDS)
+
+        self._limits_task = asyncio.create_task(loop())
+
+    async def stop_limits_refresh(self) -> None:
+        task, self._limits_task = self._limits_task, None
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
     # --- account selection ----------------------------------------------------
+
+    def schedule_settings(self) -> dict[str, Any]:
+        mode = self.store.setting(SETTING_SCHEDULE_MODE, SCHEDULE_BALANCED)
+        if mode not in SCHEDULE_MODES:
+            mode = SCHEDULE_BALANCED
+        try:
+            ceiling = float(self.store.setting(
+                SETTING_SCHEDULE_MAX_UTILIZATION,
+                str(DEFAULT_SCHEDULE_MAX_UTILIZATION)))
+        except ValueError:
+            ceiling = DEFAULT_SCHEDULE_MAX_UTILIZATION
+        return {"mode": mode, "max_utilization": ceiling}
+
+    def set_schedule_settings(self, mode: str, max_utilization: float) -> dict[str, Any]:
+        if mode not in SCHEDULE_MODES:
+            raise RelayError("unknown schedule mode: " + str(mode), 400)
+        if not 0.0 < max_utilization <= 2.0:
+            raise RelayError("max_utilization must be within (0, 2]", 400)
+        self.store.set_setting(SETTING_SCHEDULE_MODE, mode)
+        self.store.set_setting(SETTING_SCHEDULE_MAX_UTILIZATION, repr(max_utilization))
+        return self.schedule_settings()
+
+    def _windows(self, alias: str) -> dict[str, dict[str, Any]]:
+        """Cached per-window usage from the last /v1/limits probe."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except (RelayError, json.JSONDecodeError):
+            return {}
+        windows = (metadata.get("limits") or {}).get("windows")
+        if not isinstance(windows, list):
+            return {}
+        return {str(window.get("name")): window for window in windows
+                if isinstance(window, dict)}
+
+    @staticmethod
+    def _window_utilization(window: Optional[dict[str, Any]]) -> Optional[float]:
+        if not isinstance(window, dict):
+            return None
+        used, budget = window.get("used"), window.get("budget")
+        if not isinstance(used, (int, float)) or not isinstance(budget, (int, float)):
+            return None
+        return (used / budget) if budget > 0 else None
+
+    def _reset_at(self, alias: str) -> Optional[float]:
+        """Epoch the 7-day window resets at, or None when it is unknown."""
+        reset = (self._windows(alias).get("7d") or {}).get("reset_at")
+        try:
+            return float(reset) if reset is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _urgency_bonus(self, alias: str) -> float:
+        """How many live sessions of head start an expiring window is worth.
+
+        Expressed in the same unit the balanced ordering counts in, so the two
+        combine instead of one overriding the other: an account resetting
+        within the hour is handed the next few conversations, but once it has
+        taken them its real session count catches up and the others get their
+        turn. Accounts with no probe yet, or resets beyond the horizon, get
+        nothing and simply sort by session count.
+        """
+        reset_at = self._reset_at(alias)
+        if reset_at is None:
+            return 0.0
+        hours = (reset_at - time.time()) / 3600.0
+        if hours >= URGENCY_HORIZON_HOURS:
+            return 0.0
+        if hours <= 0:
+            return URGENCY_MAX_BONUS
+        return URGENCY_MAX_BONUS * (1.0 - hours / URGENCY_HORIZON_HOURS)
+
+    def _load(self, alias: str, model: Optional[str]) -> float:
+        """How full this account is for the requested model.
+
+        A fable request also draws on the model's own weekly window, so take
+        whichever of the two is tighter; the spend lands on both.
+        """
+        windows = self._windows(alias)
+        names = ["7d"]
+        if model and "fable" in model.lower():
+            names.append(FABLE_WINDOW)
+        loads = [value for value in
+                 (self._window_utilization(windows.get(name)) for name in names)
+                 if value is not None]
+        return max(loads) if loads else 0.0
 
     def _quota_ok(self, alias: str) -> bool:
         try:
@@ -118,7 +288,7 @@ class AppState:
         return RelayError("all accounts are disabled or cooling down after a "
                           "shared-quota refusal; enable one in the panel or retry later", 503)
 
-    def pick_account(self, requested: str) -> str:
+    def pick_account(self, requested: str, model: Optional[str] = None) -> str:
         """Explicit header > default account > quota-aware round-robin."""
         requested = requested.strip()
         if requested:
@@ -131,6 +301,19 @@ class AppState:
         selectable = [alias for alias in aliases if self._selectable(alias)]
         if not selectable:
             raise self._no_selectable_error()
+        schedule = self.schedule_settings()
+        if schedule["mode"] == SCHEDULE_RESET_FIRST:
+            # There is no session key to stay stable for, but the live session
+            # counts still say where the load already is, so reuse the same
+            # tilted ordering instead of sending every keyless request to the
+            # one account with the nearest reset.
+            counts = self.session_counts()
+            with self._rr_lock:
+                chosen = min(selectable,
+                             key=lambda alias: self._assignment_key(
+                                 alias, counts, schedule, model))
+                self._last_assigned[chosen] = time.time()
+                return chosen
         with self._rr_lock:
             start = self._rr_index
             chosen = None
@@ -245,7 +428,29 @@ class AppState:
         for key in stale:
             del self._sessions[key]
 
-    def _sticky_account(self, key: str, aliases: list[str]) -> str:
+    def _assignment_key(self, alias: str, counts: dict[str, int],
+                        schedule: dict[str, Any], model: Optional[str]):
+        """Ordering for a new conversation; lowest wins.
+
+        Both modes spread conversations by live session count, so no single
+        account absorbs the concurrency. Reset-first only tilts that count: an
+        account whose weekly window expires sooner is treated as carrying fewer
+        sessions than it really does, so it picks up the next conversation
+        earlier and its about-to-expire credit gets spent. Ordering by the reset
+        time itself would not spread at all, because the timestamps never tie.
+        """
+        live = counts.get(alias, 0)
+        recency = self._last_assigned.get(alias, 0.0)
+        if schedule["mode"] != SCHEDULE_RESET_FIRST:
+            return (float(live), recency)
+        if self._load(alias, model) >= schedule["max_utilization"]:
+            # Nearly spent: keep it in service, but let every account with room
+            # take a turn first.
+            return (float(live) + URGENCY_MAX_BONUS + 1.0, recency)
+        return (float(live) - self._urgency_bonus(alias), recency)
+
+    def _sticky_account(self, key: str, aliases: list[str],
+                        model: Optional[str] = None) -> str:
         with self._session_lock:
             now = time.time()
             self._prune_sessions(now)
@@ -254,9 +459,7 @@ class AppState:
                     and self._quota_ok(entry["account"]):
                 entry["last"] = now
                 return entry["account"]
-            # New window: assign the eligible account carrying the fewest live
-            # sessions (ties broken by least-recently assigned) so windows fan
-            # out across accounts instead of piling onto one.
+            # New window: order the eligible accounts by the configured mode.
             serviceable = [alias for alias in aliases if self._selectable(alias)]
             if not serviceable:
                 raise self._no_selectable_error()
@@ -265,8 +468,10 @@ class AppState:
             for existing in self._sessions.values():
                 if existing["account"] in counts:
                     counts[existing["account"]] += 1
+            schedule = self.schedule_settings()
             chosen = min(eligible,
-                         key=lambda alias: (counts[alias], self._last_assigned.get(alias, 0.0)))
+                         key=lambda alias: self._assignment_key(
+                             alias, counts, schedule, model))
             self._sessions[key] = {"account": chosen, "last": now}
             self._last_assigned[chosen] = now
             return chosen
@@ -298,22 +503,36 @@ class AppState:
         if self.default_account in aliases and self._selectable(self.default_account):
             return self.default_account
         key = (session_hint or "").strip() or self._session_key_from_payload(payload)
+        model = payload.get("model") if isinstance(payload, dict) else None
         if not key:
-            return self.pick_account("")
-        return self._sticky_account(key, aliases)
+            return self.pick_account("", model if isinstance(model, str) else None)
+        return self._sticky_account(key, aliases,
+                                    model if isinstance(model, str) else None)
 
     # --- account-level failover -----------------------------------------------
 
     @staticmethod
     def _is_account_exhausted(exc: RelayError) -> bool:
-        """The upstream refused to serve this ACCOUNT (its shared credit pool is
-        used up). An account property, not an exit property: rotating proxies
-        cannot fix it, but another account can still serve the request."""
-        if not isinstance(exc.data, dict):
+        """The upstream refused to serve this ACCOUNT rather than this exit.
+
+        ``credit_exhausted_shared`` is the refusal the product documents, but a
+        window that fills up can surface under other 429 types too. Treating
+        every account-scoped 429 the same way costs one extra attempt when the
+        guess is wrong; not treating it leaves the conversation pinned to an
+        account that answers 429 until its window resets, because affinity
+        keeps routing the client's retry straight back to it.
+
+        Region refusals are excluded: those belong to the proxy exit, and the
+        pool already rotates nodes for them.
+        """
+        if exc.status != 429:
             return False
+        if not isinstance(exc.data, dict):
+            return True
         error = exc.data.get("error")
-        return (isinstance(error, dict)
-                and str(error.get("type")) == "credit_exhausted_shared")
+        if not isinstance(error, dict):
+            return True
+        return str(error.get("type")) != REGION_REFUSAL_TYPE
 
     def drop_account_sessions(self, alias: str) -> None:
         """Detach live sessions pinned to an account so each conversation's next
