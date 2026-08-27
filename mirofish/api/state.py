@@ -48,10 +48,12 @@ SCHEDULE_RESET_FIRST = "reset_first"
 SCHEDULE_MODES = (SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST)
 SETTING_SCHEDULE_MODE = "schedule_mode"
 SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
-# Above this utilization an account drops out of the reset-first preference, so
-# one nearly-spent account does not absorb every new conversation. It is a
-# preference, not a gate: the upstream 429 is what actually stops a request,
-# and failover already moves the conversation on when that happens.
+# Above this utilization an account sorts behind every account with room, in
+# both schedule modes, so one nearly-spent account does not absorb every new
+# conversation. The ceiling is a soft preference; QUOTA_EXHAUSTED is the hard
+# skip (a ceiling deliberately set above it raises the skip mark too). Both
+# matter because the upstream meters lazily enough that a window kept in
+# rotation can be driven far past 100% before a 429 ever lands.
 DEFAULT_SCHEDULE_MAX_UTILIZATION = 0.98
 # The model whose spend is metered against its own weekly window as well.
 FABLE_WINDOW = "7d_fable"
@@ -65,12 +67,12 @@ URGENCY_MAX_BONUS = 2.0
 # Only a window closing within this many hours is worth diverting toward; the
 # rest of the week there is time to spend the credit at the normal rate.
 URGENCY_HORIZON_HOURS = 48.0
-# Reset-first ordering reads the cached /v1/limits windows, so they are
-# refreshed in the background rather than on the request path: probing there
-# would put an upstream round-trip in front of every new conversation. The
-# probe costs no model tokens, and stale numbers only ever cost one extra
-# attempt, since the upstream 429 plus failover is what actually stops a
-# request.
+# Account ordering in both modes reads the cached /v1/limits windows (the
+# fable window has no response header to keep it fresh), so they are refreshed
+# in the background rather than on the request path: probing there would put
+# an upstream round-trip in front of every new conversation. The probe costs
+# no model tokens, and stale numbers only ever cost one extra attempt, since
+# the upstream 429 plus failover is what actually stops a request.
 LIMITS_REFRESH_SECONDS = 300.0
 
 
@@ -148,7 +150,9 @@ class AppState:
             await asyncio.gather(*(one(alias) for alias in aliases))
 
     def start_limits_refresh(self) -> None:
-        """Keep the cached windows warm while reset-first ordering may use them."""
+        """Keep the cached windows warm: both schedule modes read them to keep
+        exhausted windows out of automatic selection, and the fable window has
+        no response header that could refresh it between probes."""
         if self._limits_task is not None:
             return
         wake = self._limits_wake = asyncio.Event()
@@ -159,8 +163,7 @@ class AppState:
                 # triggers a fresh pass instead of being swallowed.
                 wake.clear()
                 try:
-                    if self.schedule_settings()["mode"] == SCHEDULE_RESET_FIRST:
-                        await self.refresh_all_limits()
+                    await self.refresh_all_limits()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:  # noqa: BLE001 - the loop must outlive a bad sweep
@@ -231,6 +234,11 @@ class AppState:
         used, budget = window.get("used"), window.get("budget")
         if not isinstance(used, (int, float)) or not isinstance(budget, (int, float)):
             return None
+        reset_at = window.get("reset_at")
+        if isinstance(reset_at, (int, float)) and reset_at <= time.time():
+            # The window has reset since the probe: the cached spend is
+            # history, not load, and would bench a freshly refilled account.
+            return None
         return (used / budget) if budget > 0 else None
 
     def _reset_at(self, alias: str) -> Optional[float]:
@@ -276,11 +284,30 @@ class AppState:
                  if value is not None]
         return max(loads) if loads else 0.0
 
-    def _quota_ok(self, alias: str) -> bool:
+    def _quota_ok(self, alias: str, model: Optional[str] = None) -> bool:
+        """Below the exhaustion mark on every window this model draws on.
+
+        The cached /v1/limits windows are the model-aware source — a fable
+        request also spends the model's own weekly window, and skipping that
+        check is how a 7d_fable window ends up at 130%. The header-fed scalar
+        still covers the 7d window between sweeps, since every response
+        refreshes it. A ceiling deliberately configured above 100% raises the
+        skip mark with it (the operator chose to overspend). No usable data
+        means the account is assumed to have room; the upstream 429 stays the
+        final authority either way.
+        """
+        mark = max(QUOTA_EXHAUSTED, self.schedule_settings()["max_utilization"])
+        if self._load(alias, model) >= mark:
+            return False
         try:
-            metadata = json.loads(self.store.row(alias)["metadata_json"])
-            utilization = metadata.get("quota", {}).get("7d_utilization")
-            return utilization is None or float(utilization) < QUOTA_EXHAUSTED
+            quota = json.loads(self.store.row(alias)["metadata_json"]).get("quota", {})
+            utilization = quota.get("7d_utilization")
+            if utilization is None:
+                return True
+            reset = quota.get("7d_reset_epoch")
+            if reset is not None and float(reset) <= time.time():
+                return True  # that window has since reset; the number is history
+            return float(utilization) < mark
         except (RelayError, ValueError, TypeError, json.JSONDecodeError):
             return True
 
@@ -344,7 +371,7 @@ class AppState:
             chosen = None
             for offset in range(len(aliases)):
                 candidate = aliases[(start + offset) % len(aliases)]
-                if candidate in selectable and self._quota_ok(candidate):
+                if candidate in selectable and self._quota_ok(candidate, model):
                     chosen = candidate
                     self._rr_index = (start + offset + 1) % len(aliases)
                     break
@@ -458,20 +485,23 @@ class AppState:
         """Ordering for a new conversation; lowest wins.
 
         Both modes spread conversations by live session count, so no single
-        account absorbs the concurrency. Reset-first only tilts that count: an
-        account whose weekly window expires sooner is treated as carrying fewer
-        sessions than it really does, so it picks up the next conversation
-        earlier and its about-to-expire credit gets spent. Ordering by the reset
-        time itself would not spread at all, because the timestamps never tie.
+        account absorbs the concurrency, and both demote an account above the
+        utilization ceiling — spreading by session count alone is what let a
+        nearly-dead window keep attracting conversations until it overshot its
+        budget. Reset-first additionally tilts the count: an account whose
+        weekly window expires sooner is treated as carrying fewer sessions
+        than it really does, so it picks up the next conversation earlier and
+        its about-to-expire credit gets spent. Ordering by the reset time
+        itself would not spread at all, because the timestamps never tie.
         """
         live = counts.get(alias, 0)
         recency = self._last_assigned.get(alias, 0.0)
-        if schedule["mode"] != SCHEDULE_RESET_FIRST:
-            return (float(live), recency)
         if self._load(alias, model) >= schedule["max_utilization"]:
             # Nearly spent: keep it in service, but let every account with room
             # take a turn first.
             return (float(live) + URGENCY_MAX_BONUS + 1.0, recency)
+        if schedule["mode"] != SCHEDULE_RESET_FIRST:
+            return (float(live), recency)
         return (float(live) - self._urgency_bonus(alias), recency)
 
     def _sticky_account(self, key: str, aliases: list[str],
@@ -481,14 +511,15 @@ class AppState:
             self._prune_sessions(now)
             entry = self._sessions.get(key)
             if entry and entry["account"] in aliases and self._selectable(entry["account"]) \
-                    and self._quota_ok(entry["account"]):
+                    and self._quota_ok(entry["account"], model):
                 entry["last"] = now
                 return entry["account"]
             # New window: order the eligible accounts by the configured mode.
             serviceable = [alias for alias in aliases if self._selectable(alias)]
             if not serviceable:
                 raise self._no_selectable_error()
-            eligible = [alias for alias in serviceable if self._quota_ok(alias)] or serviceable
+            eligible = [alias for alias in serviceable
+                        if self._quota_ok(alias, model)] or serviceable
             counts = {alias: 0 for alias in eligible}
             for existing in self._sessions.values():
                 if existing["account"] in counts:
@@ -905,10 +936,15 @@ class AppState:
     def record_usage(self, alias: str, model: Optional[str], usage: dict[str, Any],
                      response_headers: dict[str, str]) -> dict[str, str]:
         """Persist usage/quota metadata and return the outgoing relay headers."""
-        quota = quota_headers(response_headers)
+        # Only merge the quota values this response actually carried. A
+        # headerless response (e.g. the Codex path) must not wipe the
+        # utilization cached by /v1/limits probes — a None there reads as
+        # "has room" and would put an exhausted account back into rotation.
+        quota = {key: value for key, value in quota_headers(response_headers).items()
+                 if value is not None}
         try:
             self.store.merge_metadata(alias, {"last_usage": usage, "quota": quota,
-                                              "last_model": model})
+                                              "last_model": model}, deep=("quota",))
         except RelayError:
             pass
         if usage:

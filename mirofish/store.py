@@ -141,8 +141,12 @@ class Store:
                  json.dumps(metadata, ensure_ascii=False), utc_now(), alias_value(alias)))
             self.db.commit()
 
-    def merge_metadata(self, alias: str, patch: dict[str, Any]) -> dict[str, Any]:
-        """Atomic read-modify-write so concurrent requests do not clobber each other."""
+    def merge_metadata(self, alias: str, patch: dict[str, Any],
+                       deep: tuple[str, ...] = ()) -> dict[str, Any]:
+        """Atomic read-modify-write so concurrent requests do not clobber each
+        other. Keys named in ``deep`` are dict-merged into the stored value
+        instead of replacing it, so a partial update (e.g. quota headers the
+        upstream did not send this time) keeps the fields it does not carry."""
         alias = alias_value(alias)
         with self.db_lock:
             row = self.db.execute("SELECT metadata_json FROM accounts WHERE alias=?",
@@ -150,6 +154,10 @@ class Store:
             if row is None:
                 raise RelayError("unknown account: " + alias, 404)
             metadata = json.loads(row["metadata_json"])
+            for key in deep:
+                incoming, current = patch.get(key), metadata.get(key)
+                if isinstance(incoming, dict) and isinstance(current, dict):
+                    patch = {**patch, key: {**current, **incoming}}
             metadata.update(patch)
             self.db.execute("UPDATE accounts SET metadata_json=?,updated_at=? WHERE alias=?",
                             (json.dumps(metadata, ensure_ascii=False), utc_now(), alias))

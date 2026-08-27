@@ -53,7 +53,7 @@ async function save(): Promise<void> {
       <span v-if="store.schedule" class="badge">
         {{ resetFirst ? "优先重置窗口" : "均衡分配" }}
       </span>
-      <span v-if="store.schedule && resetFirst" class="badge">
+      <span v-if="store.schedule" class="badge">
         用量上限 {{ (store.schedule.max_utilization * 100).toFixed(0) }}%
       </span>
       <span class="spacer"></span>
@@ -90,13 +90,15 @@ async function save(): Promise<void> {
         </label>
       </div>
 
-      <div v-if="resetFirst" class="row" style="margin-top: 10px">
+      <div class="row" style="margin-top: 10px">
         <div class="grow">
           <label class="ceiling">用量上限：{{ (ceiling * 100).toFixed(0) }}%</label>
           <input v-model.number="ceiling" type="range" min="0.5" max="1.2" step="0.01" />
           <p class="muted">
-            账号用量超过此值后排到所有有余量的账号之后，但仍可用。
-            claude-fable-5 另有独立的 7 天窗口，取两者中更满的一个来判断。
+            两种模式都生效：账号用量超过此值后排到所有有余量的账号之后；
+            窗口用满（约 100%）的账号会被自动分配直接跳过，避免烧超额度，
+            直到所有账号都用满才继续兜底服务。claude-fable-5 另有独立的
+            7 天窗口（7d_fable），取两者中更满的一个来判断。
           </p>
         </div>
       </div>

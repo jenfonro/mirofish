@@ -91,6 +91,61 @@ def test_fable_also_counts_its_own_window(state):
     assert route(state, model="claude-opus-5", session="s2") == "fable-spent"
 
 
+def test_balanced_also_skips_an_exhausted_fable_window(state):
+    """The default mode must not keep funneling fable conversations onto an
+    account whose own fable window is spent just because its 7d has room —
+    that is exactly how a 7d_fable window gets driven to 130%."""
+    with_windows(state, "fable-burnt", resets_in_hours=100,
+                 seven_day=0.70, fable=1.30)
+    with_windows(state, "fable-free", resets_in_hours=100,
+                 seven_day=0.80, fable=0.20)
+    state.set_schedule_settings(SCHEDULE_BALANCED, 0.98)
+    for i in range(4):
+        assert route(state, model="claude-fable-5", session=f"f{i}") == "fable-free"
+    # Non-fable requests may still spend the account's remaining 7d room.
+    assert route(state, model="claude-opus-5", session="o1") == "fable-burnt"
+
+
+def test_balanced_respects_the_utilization_ceiling(state):
+    """A nearly-spent account stops attracting new conversations in balanced
+    mode too; overshoot past the budget cannot be walked back afterwards."""
+    with_windows(state, "nearly-spent", resets_in_hours=100, seven_day=0.985)
+    with_windows(state, "has-room", resets_in_hours=100, seven_day=0.20)
+    state.set_schedule_settings(SCHEDULE_BALANCED, 0.98)
+    assert spread(state, 3) == {"has-room": 3}
+
+
+def test_a_window_that_already_reset_no_longer_counts(state):
+    """A cached probe from before the weekly reset is history, not load;
+    treating it as current would bench a freshly refilled account."""
+    with_windows(state, "reset-since-probe", resets_in_hours=-1,
+                 seven_day=1.02, fable=1.16)
+    assert state._load("reset-since-probe", "claude-fable-5") == 0.0
+    assert state._quota_ok("reset-since-probe", "claude-fable-5")
+
+
+def test_a_stale_header_scalar_past_its_reset_is_ignored(state):
+    add_account(state, "work")
+    state.store.merge_metadata("work", {"quota": {
+        "7d_utilization": "1.02", "7d_reset_epoch": str(time.time() - 60)}})
+    assert state._quota_ok("work")
+
+
+def test_headerless_responses_keep_the_cached_quota(state):
+    """A response without ratelimit headers (e.g. the Codex path) must not
+    wipe the probed utilization — a None there reads as "has room" and puts
+    an exhausted account straight back into rotation."""
+    add_account(state, "work")
+    state.store.merge_metadata("work", {"quota": {
+        "7d_utilization": "1.02", "7d_reset_epoch": str(time.time() + 86400)}})
+    assert not state._quota_ok("work")
+    state.record_usage("work", "claude-opus-5",
+                       {"input_tokens": 5, "output_tokens": 2}, {})
+    quota = json.loads(state.store.row("work")["metadata_json"])["quota"]
+    assert quota["7d_utilization"] == "1.02"
+    assert not state._quota_ok("work")
+
+
 def test_an_unprobed_account_gets_no_head_start(state):
     add_account(state, "never-probed")
     with_windows(state, "expiring", resets_in_hours=2, seven_day=0.10)
@@ -270,9 +325,10 @@ async def test_the_sweep_skips_disabled_accounts(state, monkeypatch):
     assert probed == ["on"]
 
 
-async def test_switching_on_reset_first_sweeps_immediately(state, monkeypatch):
-    """Enabling the mode must not order on days-old windows for up to five
-    minutes; the settings endpoint kicks the sweep instead."""
+async def test_the_sweep_runs_in_every_mode(state, monkeypatch):
+    """Both modes read the cached windows to keep exhausted accounts out of
+    selection, and the fable window has no response header to refresh it, so
+    the sweep can no longer wait for reset-first to be switched on."""
     sweeps = []
 
     async def fake_refresh():
@@ -280,14 +336,18 @@ async def test_switching_on_reset_first_sweeps_immediately(state, monkeypatch):
 
     monkeypatch.setattr(state, "refresh_all_limits", fake_refresh)
     state.start_limits_refresh()  # app startup, still in balanced mode
-    await asyncio.sleep(0.05)
-    assert not sweeps  # balanced has nothing to keep warm
-
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
-    state.kick_limits_refresh()
     for _ in range(200):
         if sweeps:
             break
         await asyncio.sleep(0.01)
-    assert sweeps, "the kick did not trigger a sweep"
+    assert sweeps, "the startup sweep did not run in balanced mode"
+
+    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.kick_limits_refresh()
+    before = len(sweeps)
+    for _ in range(200):
+        if len(sweeps) > before:
+            break
+        await asyncio.sleep(0.01)
+    assert len(sweeps) > before, "the kick did not trigger a fresh sweep"
     await state.stop_limits_refresh()

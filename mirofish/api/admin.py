@@ -161,7 +161,7 @@ async def set_schedule(request: Request) -> dict[str, Any]:
         raise RelayError("max_utilization must be a number", 400) from exc
     settings = state.set_schedule_settings(
         str(payload.get("mode", current["mode"])), ceiling)
-    # Reset-first reads the cached windows: make sure the sweep is running and
+    # Both modes read the cached windows: make sure the sweep is running and
     # probe now rather than ordering on days-old numbers until the next tick.
     state.start_limits_refresh()
     state.kick_limits_refresh()
