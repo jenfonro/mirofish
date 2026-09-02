@@ -12,7 +12,8 @@ import time
 import pytest
 
 from mirofish.api.state import (DEFAULT_SCHEDULE_MAX_UTILIZATION,
-                                SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST,
+                                SCHEDULE_BALANCED, SCHEDULE_FABLE_FIRST,
+                                SCHEDULE_RESET_FIRST,
                                 SHARED_QUOTA_COOLDOWN, TRANSIENT_429_COOLDOWN)
 from mirofish.errors import RelayError
 
@@ -77,6 +78,70 @@ def test_the_ceiling_is_configurable(state):
     # Raise it above the account's load and it becomes preferred again.
     state.set_schedule_settings(SCHEDULE_RESET_FIRST, 1.5)
     assert route(state) == "expires-soon"
+
+
+def test_fable_first_prefers_the_fullest_fable_window(state):
+    """Non-fable traffic goes to the urgent account with no fable credit left.
+
+    Both windows reset at the same time and carry the same 7-day spend, so
+    reset-first alone cannot separate them; only the fable window can.
+    """
+    with_windows(state, "fable-spent", resets_in_hours=20,
+                 seven_day=0.50, fable=1.02)
+    with_windows(state, "fable-free", resets_in_hours=20,
+                 seven_day=0.50, fable=0.05)
+    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+
+    assert route(state, model="claude-opus-5") == "fable-spent"
+    # Reset-first cannot tell them apart, so it falls back to alias order --
+    # this is exactly what the new mode adds.
+    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    assert route(state, model="claude-opus-5", session="s2") == "fable-free"
+
+
+def test_fable_first_leaves_fable_traffic_on_reset_first_ordering(state):
+    """A fable request must not be steered at the spent fable window.
+
+    For fable traffic the fable window is the constraint, not the criterion:
+    sending it to the account whose fable credit is gone would just earn a
+    refusal.
+    """
+    with_windows(state, "fable-spent", resets_in_hours=20,
+                 seven_day=0.50, fable=1.02)
+    with_windows(state, "fable-free", resets_in_hours=20,
+                 seven_day=0.50, fable=0.05)
+    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+
+    # The spent fable window is exhausted for this model, so automatic
+    # selection skips it and the account with headroom serves the request.
+    assert route(state, model="claude-fable-5-1") == "fable-free"
+
+
+def test_fable_first_still_honours_the_reset_horizon(state):
+    """A full fable window outside the horizon earns no head start.
+
+    Otherwise the mode would drain accounts whose weekly credit is not
+    expiring, purely because their fable window happens to be spent.
+    """
+    with_windows(state, "far-fable-spent", resets_in_hours=140,
+                 seven_day=0.50, fable=1.02)
+    with_windows(state, "near-fable-free", resets_in_hours=6,
+                 seven_day=0.50, fable=0.60)
+    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+
+    assert route(state, model="claude-opus-5") == "near-fable-free"
+
+
+def test_fable_first_still_spreads_the_concurrency(state):
+    """The fable tilt is capped like the reset tilt, so it cannot funnel."""
+    for index in range(4):
+        with_windows(state, f"acct-{index}", resets_in_hours=20,
+                     seven_day=0.30, fable=1.0)
+    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+
+    picks = spread(state, 12, model="claude-opus-5")
+    assert len(picks) > 1, f"every conversation landed on one account: {picks}"
+    assert max(picks.values()) <= 6, picks
 
 
 def test_fable_also_counts_its_own_window(state):

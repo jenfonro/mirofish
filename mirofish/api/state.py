@@ -44,9 +44,15 @@ TRANSIENT_429_COOLDOWN = 60.0
 # carrying the fewest live sessions. "reset_first" instead prefers the account
 # whose 7-day window resets soonest, so credit that is about to expire unused
 # is spent before it is thrown away; the balanced key stays as the tie-break.
+# "fable_first" is for non-fable traffic: among the accounts whose window is
+# about to reset it prefers the one whose fable window is fullest, so the
+# general 7-day credit is spent on the accounts whose fable credit is already
+# gone (a fable request there would be refused anyway) and the accounts with
+# fable headroom stay free for fable traffic.
 SCHEDULE_BALANCED = "balanced"
 SCHEDULE_RESET_FIRST = "reset_first"
-SCHEDULE_MODES = (SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST)
+SCHEDULE_FABLE_FIRST = "fable_first"
+SCHEDULE_MODES = (SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST, SCHEDULE_FABLE_FIRST)
 SETTING_SCHEDULE_MODE = "schedule_mode"
 SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
 # Above this utilization an account sorts behind every account with room, in
@@ -307,6 +313,19 @@ class AppState:
             return URGENCY_MAX_BONUS
         return URGENCY_MAX_BONUS * (1.0 - hours / URGENCY_HORIZON_HOURS)
 
+    def _fable_spent(self, alias: str) -> float:
+        """How full this account's own fable window is (0.0 when unknown).
+
+        Used by fable-first to rank the accounts that are already inside the
+        reset horizon: the fullest fable window first.
+        """
+        value = self._window_utilization(self._windows(alias).get(FABLE_WINDOW))
+        return value if value is not None else 0.0
+
+    @staticmethod
+    def _is_fable_model(model: Optional[str]) -> bool:
+        return bool(model) and "fable" in model.lower()
+
     def _load(self, alias: str, model: Optional[str]) -> float:
         """How full this account is for the requested model.
 
@@ -315,7 +334,7 @@ class AppState:
         """
         windows = self._windows(alias)
         names = ["7d"]
-        if model and "fable" in model.lower():
+        if self._is_fable_model(model):
             names.append(FABLE_WINDOW)
         loads = [value for value in
                  (self._window_utilization(windows.get(name)) for name in names)
@@ -531,6 +550,15 @@ class AppState:
         than it really does, so it picks up the next conversation earlier and
         its about-to-expire credit gets spent. Ordering by the reset time
         itself would not spread at all, because the timestamps never tie.
+
+        Fable-first refines reset-first for non-fable traffic: among the
+        accounts already inside the reset horizon it prefers the one whose own
+        fable window is fullest. That account's fable credit is spent, so a
+        fable request would be refused there anyway, while its general 7-day
+        credit is about to expire — spend that one, and leave the accounts
+        with fable headroom free for fable traffic. A fable request itself
+        gets plain reset-first ordering: there the fable window is the
+        constraint (``_load`` already weighs it), not the selection criterion.
         """
         live = counts.get(alias, 0)
         recency = self._last_assigned.get(alias, 0.0)
@@ -538,9 +566,19 @@ class AppState:
             # Nearly spent: keep it in service, but let every account with room
             # take a turn first.
             return (float(live) + URGENCY_MAX_BONUS + 1.0, recency)
-        if schedule["mode"] != SCHEDULE_RESET_FIRST:
+        if schedule["mode"] == SCHEDULE_BALANCED:
             return (float(live), recency)
-        return (float(live) - self._urgency_bonus(alias), recency)
+        bonus = self._urgency_bonus(alias)
+        if schedule["mode"] == SCHEDULE_FABLE_FIRST and not self._is_fable_model(model):
+            # Scale the head start by how spent the fable window is, instead of
+            # adding a tie-break after it: the tilted count is a float that
+            # rarely ties, so a separate key would be dead code. An urgent
+            # account with no fable credit left keeps the full bonus and goes
+            # first; one with fable headroom keeps almost none and is left for
+            # fable traffic. The bonus stays capped at URGENCY_MAX_BONUS, so
+            # the ordering still spreads by session count.
+            bonus *= min(1.0, self._fable_spent(alias))
+        return (float(live) - bonus, recency)
 
     def _sticky_account(self, key: str, aliases: list[str],
                         model: Optional[str] = None) -> str:
