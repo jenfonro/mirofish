@@ -1106,8 +1106,41 @@ async def test_model_catalog_exposes_configured_default(client, state, auth_head
     response = await client.get("/v1/models", headers=auth_headers)
 
     assert response.status_code == 200
-    assert response.json()["models"] == ["claude-fable-5", "gpt-5.6-luna"]
+    assert response.json()["mirofish_model_ids"] == ["claude-fable-5", "gpt-5.6-luna"]
     assert response.json()["default_model"] == "gpt-5.6-luna"
+
+
+@respx.mock
+async def test_model_catalog_keeps_every_top_level_list_typed_as_model_objects(
+        client, state, auth_headers):
+    """No top-level list may hold bare strings.
+
+    A strict client (sub2api) decodes every top-level list in this response
+    into model-object structs, so a convenience key holding plain strings
+    fails the whole decode and its model sync breaks. Keep the OpenAI shape
+    clean and namespace the extras.
+    """
+    add_account(state, "work")
+    mock_device_session()
+    respx.get(RELAY_BASE + "/v1/models").mock(return_value=httpx.Response(200, json={
+        "data": [{"id": "claude-fable-5-1"}],
+    }))
+
+    body = (await client.get("/v1/models", headers=auth_headers)).json()
+
+    unnamespaced_string_lists = [
+        key for key, value in body.items()
+        if not key.startswith("mirofish_")
+        and isinstance(value, list)
+        and any(not isinstance(item, dict) for item in value)
+    ]
+    assert unnamespaced_string_lists == [], unnamespaced_string_lists
+    assert body["data"] == [{
+        "id": "claude-fable-5-1", "object": "model", "type": "model",
+        "display_name": "claude-fable-5-1",
+        "created_at": "2024-01-01T00:00:00Z", "created": 0,
+        "owned_by": "mirofish",
+    }]
 
 
 @respx.mock
@@ -1159,7 +1192,7 @@ async def test_model_catalog_still_answers_when_every_account_is_parked(
     response = await client.get("/v1/models", headers=auth_headers)
 
     assert response.status_code == 200
-    assert response.json()["models"] == ["claude-fable-5-1"]
+    assert response.json()["mirofish_model_ids"] == ["claude-fable-5-1"]
     # Model traffic is still refused: only the catalog is exempt.
     with pytest.raises(RelayError) as excinfo:
         state.route_account("", "", _conv("a window"))

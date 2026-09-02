@@ -19,11 +19,13 @@ async function loadModels() {
   try {
     const extra: Record<string, string> = {};
     if (account.value) extra["X-Mirofish-Account"] = account.value;
-    const data = await api<{ models?: string[]; default_model?: string }>(
-      "/v1/models",
-      { headers: extra },
-    );
-    models.value = data.models || [];
+    const data = await api<{
+      mirofish_model_ids?: string[];
+      data?: { id?: string }[];
+      default_model?: string;
+    }>("/v1/models", { headers: extra });
+    models.value = data.mirofish_model_ids
+      ?? (data.data ?? []).map((entry) => entry.id ?? "").filter(Boolean);
     if (!model.value || !models.value.includes(model.value)) {
       const preferred = data.default_model;
       model.value = preferred && models.value.includes(preferred)

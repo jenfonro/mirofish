@@ -61,6 +61,12 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - Missing OpenAI-compatible model ids use `MIROFISH_DEFAULT_MODEL` (currently
   `gpt-5.6-luna`). The legacy `claude-haiku-4-5-20251001` id is normalized to
   `claude-haiku-4-5`; model catalog presence does not guarantee live upstream capacity.
+- `GET /v1/models` keeps `data` a pure OpenAI model-object list; every convenience field is
+  namespaced (`mirofish_model_ids`, plus `ok`/`status`/`count`/`note`/`default_model` scalars).
+  A bare top-level list of strings must never be added back: strict clients decode every
+  top-level list into model-object structs, so one string list fails their whole decode (this
+  is what broke sub2api's "sync upstream models"). `test_model_catalog_keeps_every_top_level_
+  list_typed_as_model_objects` enforces it.
 - Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts with an exhausted window — for fable requests the tighter of `7d` and `7d_fable`). Accounts disabled via
   the WebUI switch (`POST /api/accounts/{alias}/enabled`, `disabled` in metadata) are excluded
   from automatic selection and return 403 when requested explicitly. Any account-scoped 429 —

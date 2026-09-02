@@ -131,7 +131,8 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
     GET    /accounts/<alias>/limits    # 单账号用量额度窗口（上游 /v1/limits，不计费）
     GET    /api/limits                 # 全部账号并发拉取用量额度（不计费）
     GET    /proxies
-    GET    /v1/models                # 按账号缓存 5 分钟
+    GET    /v1/models                # 按账号缓存 5 分钟；data 为标准 OpenAI 模型对象列表，
+                                     # 便利字段以 mirofish_ 前缀命名（mirofish_model_ids）
     POST   /v1/messages              # Anthropic Messages；"stream":true 为真 SSE 透传
     POST   /v1/messages/count_tokens # Anthropic token 计数（转发上游，不计费；失败则本地估算）
     POST   /v1/chat/completions      # OpenAI 兼容；支持 tools/图片/流式

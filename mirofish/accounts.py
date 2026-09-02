@@ -297,8 +297,13 @@ class AccountService:
         rows = [{"id": mid, "object": "model", "type": "model",
                  "display_name": mid, "created_at": "2024-01-01T00:00:00Z",
                  "created": 0, "owned_by": "mirofish"} for mid in ids]
+        # `data` must stay a pure OpenAI/Anthropic model list. The convenience
+        # fields are namespaced because a bare `models` key holding plain
+        # strings breaks clients that type every top-level list as model
+        # objects (sub2api decodes both `data` and `models` into structs, and
+        # a string there fails the whole response).
         return {"object": "list", "data": rows, "ok": True, "status": status,
-                "models": ids, "count": len(ids),
+                "mirofish_model_ids": ids, "count": len(ids),
                 "note": "来自上游 /v1/models；若为空说明该接口未输出模型或账号被隐藏。"}
 
     async def scan_models(self, alias: str, max_models: int = 0,
