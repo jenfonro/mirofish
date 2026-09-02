@@ -128,6 +128,11 @@ LIMIT_WINDOW_LABEL = {"5h": "5 小时窗口", "7d": "7 天窗口",
                       "7d_fable": "7 天 Fable 窗口", "30d": "30 天窗口"}
 LIMIT_WINDOW_LEN = {"5h": 18000, "7d": 604800, "7d_fable": 604800,
                     "30d": 2592000}
+# The upstream meters every fable model against one shared 7d_fable window and
+# reports a single number. These are the ids whose spend lands in it, split out
+# locally from the usage log so the panel can show which one consumed it.
+FABLE_WINDOW = "7d_fable"
+FABLE_MODELS = ["claude-fable-5", "claude-fable-5-1"]
 
 
 def normalize_limits(data: Any, fetched_epoch: float) -> dict[str, Any]:
@@ -400,6 +405,7 @@ class AccountService:
         if status < 200 or status >= 300:
             raise RelayError("could not read usage limits", status, data)
         limits = normalize_limits(data, time.time())
+        self._attach_fable_split(alias, limits)
         row = self.store.row(alias)
         metadata = json.loads(row["metadata_json"])
         metadata["limits"] = limits
@@ -414,6 +420,43 @@ class AccountService:
             metadata["quota"] = quota
         self.store.update_metadata(alias, metadata)
         return limits
+
+    def _attach_fable_split(self, alias: str, limits: dict[str, Any]) -> None:
+        """Break the shared fable window down per model, in place.
+
+        The upstream reports one number for every fable model together. The
+        breakdown counts only the usage logged since this window started, so
+        it resets exactly when the window does: ``reset_at - length`` is the
+        current window's start, and older rows fall out of the range on their
+        own. Missing/oversized upstream numbers leave the window untouched
+        rather than showing a total that spans two windows.
+        """
+        window = next((entry for entry in limits.get("windows", [])
+                       if entry.get("name") == FABLE_WINDOW), None)
+        if window is None:
+            return
+        reset_at, length = window.get("reset_at"), window.get("length")
+        if not isinstance(reset_at, (int, float)) or not length:
+            return
+        try:
+            per_model = self.store.usage_by_model_since(
+                alias, float(reset_at) - float(length), FABLE_MODELS)
+        except RelayError:
+            return
+        window["models"] = [{
+            "model": model,
+            "requests": stats["requests"],
+            "input_tokens": stats["input_tokens"],
+            "output_tokens": stats["output_tokens"],
+            "cache_read_tokens": stats["cache_read_tokens"],
+            "cache_write_tokens": stats["cache_write_tokens"],
+            "total_tokens": (stats["input_tokens"] + stats["output_tokens"]
+                             + stats["cache_read_tokens"] + stats["cache_write_tokens"]),
+        } for model, stats in (
+            (model, per_model.get(model) or {
+                "requests": 0, "input_tokens": 0, "output_tokens": 0,
+                "cache_read_tokens": 0, "cache_write_tokens": 0})
+            for model in FABLE_MODELS)]
 
     # --- model catalog -------------------------------------------------------
 

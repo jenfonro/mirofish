@@ -10,7 +10,7 @@ import secrets
 import sqlite3
 import stat
 import threading
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from .errors import RelayError
 from .validate import alias_value, proxy_subscription_value
@@ -338,6 +338,41 @@ class Store:
             """, (alias_value(alias), model, _int("input_tokens"), _int("output_tokens"),
                   _int("cache_read_input_tokens"), _int("cache_creation_input_tokens"), utc_now()))
             self.db.commit()
+
+    def usage_by_model_since(self, alias: str, since_epoch: float,
+                             models: Sequence[str]) -> dict[str, dict[str, int]]:
+        """Per-model token totals logged since ``since_epoch``.
+
+        Used to split a shared upstream window (7d_fable covers every fable
+        model at once) into per-model figures. Passing the window's own
+        ``reset_at``-derived start is what makes the split reset with the
+        window: rows older than the current window are simply not counted,
+        so nothing has to be deleted or zeroed on a reset.
+        """
+        if not models:
+            return {}
+        since = datetime.datetime.fromtimestamp(
+            since_epoch, datetime.timezone.utc).isoformat()
+        placeholders = ",".join("?" for _ in models)
+        with self.db_lock:
+            rows = self.db.execute(f"""
+                SELECT model,
+                       COUNT(*) AS requests,
+                       COALESCE(SUM(input_tokens),0) AS input_tokens,
+                       COALESCE(SUM(output_tokens),0) AS output_tokens,
+                       COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
+                       COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens
+                FROM usage_log
+                WHERE alias=? AND created_at >= ? AND model IN ({placeholders})
+                GROUP BY model
+            """, (alias_value(alias), since, *models)).fetchall()
+        return {str(row["model"]): {
+            "requests": int(row["requests"]),
+            "input_tokens": int(row["input_tokens"]),
+            "output_tokens": int(row["output_tokens"]),
+            "cache_read_tokens": int(row["cache_read_tokens"]),
+            "cache_write_tokens": int(row["cache_write_tokens"]),
+        } for row in rows}
 
     def usage_summary(self, hours: int = 24) -> dict[str, Any]:
         hours = max(1, min(24 * 30, hours))
