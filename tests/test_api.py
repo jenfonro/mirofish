@@ -1087,7 +1087,7 @@ async def test_model_catalog_exposes_configured_default(client, state, auth_head
     response = await client.get("/v1/models", headers=auth_headers)
 
     assert response.status_code == 200
-    assert response.json()["models"] == ["claude-fable-5", "gpt-5.6-luna"]
+    assert response.json()["mirofish_model_ids"] == ["claude-fable-5", "gpt-5.6-luna"]
     assert response.json()["default_model"] == "gpt-5.6-luna"
 
 

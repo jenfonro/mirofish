@@ -19,11 +19,15 @@ async function loadModels() {
   try {
     const extra: Record<string, string> = {};
     if (account.value) extra["X-Mirofish-Account"] = account.value;
-    const data = await api<{ models?: string[]; default_model?: string }>(
-      "/v1/models",
-      { headers: extra },
-    );
-    models.value = data.models || [];
+    const data = await api<{
+      mirofish_model_ids?: string[];
+      data?: { id?: string }[];
+      default_model?: string;
+    }>("/v1/models", { headers: extra });
+    // Prefer the namespaced id list; fall back to the standard OpenAI shape so
+    // this does not depend on a mirofish-specific field existing.
+    models.value = data.mirofish_model_ids
+      ?? (data.data ?? []).map((entry) => entry.id ?? "").filter(Boolean);
     if (!model.value || !models.value.includes(model.value)) {
       const preferred = data.default_model;
       model.value = preferred && models.value.includes(preferred)
@@ -64,7 +68,6 @@ async function send() {
       },
       controller.signal,
     );
-    loadAccounts().catch(() => undefined);
     loadUsage().catch(() => undefined);
   } catch (error: any) {
     if (error?.name === "AbortError") {
@@ -73,6 +76,9 @@ async function send() {
       output.value += (output.value ? "\n" : "") + `错误：${error.message}`;
     }
   } finally {
+    // Either outcome changes the account's status: a success clears a recorded
+    // 401/503, a failure records one. Refresh on both, not only on success.
+    loadAccounts().catch(() => undefined);
     running.value = false;
     controller = null;
   }
@@ -81,10 +87,10 @@ async function send() {
 
 <template>
   <section class="card">
-    <h2>测试台<span class="muted" style="font-weight: 400">（流式输出；会产生真实模型调用）</span></h2>
+    <h2>测试台<span class="muted" style="font-weight: 400">（流式输出；会产生真实模型调用。指定被标记异常的账号发送一次即可让它恢复调度）</span></h2>
     <div class="row">
       <div class="grow">
-        <label>账号（留空按默认/轮询选择）</label>
+        <label>账号（留空按默认/轮询选择；异常账号只能在此显式指定）</label>
         <select v-model="account">
           <option value="">自动选择</option>
           <option v-for="alias in accountOptions" :key="alias" :value="alias">{{ alias }}</option>

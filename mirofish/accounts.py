@@ -115,6 +115,7 @@ def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
             "limits": metadata.get("limits"),
             "profile_pending": bool(metadata.get("profile_pending")),
             "disabled": bool(metadata.get("disabled")),
+            "health": metadata.get("health") or {},
             "checked_at": metadata.get("checked_at"),
             "proxy": proxy}
 
@@ -489,8 +490,13 @@ class AccountService:
         rows = [{"id": mid, "object": "model", "type": "model",
                  "display_name": mid, "created_at": "2024-01-01T00:00:00Z",
                  "created": 0, "owned_by": "mirofish"} for mid in ids]
+        # `data` must stay a pure OpenAI/Anthropic model list, and no other
+        # top-level list may hold bare strings: a strict client decodes every
+        # top-level list into model-object structs, so one string list fails
+        # its whole decode (this is what broke sub2api's "sync upstream
+        # models"). Namespace the convenience fields instead.
         return {"object": "list", "data": rows, "ok": True, "status": status,
-                "models": ids, "count": len(ids),
+                "mirofish_model_ids": ids, "count": len(ids),
                 "note": "来自上游 /v1/models；若为空说明该接口未输出模型或账号被隐藏。"}
 
     async def scan_models(self, alias: str, max_models: int = 0,

@@ -17,6 +17,9 @@ from .validate import alias_value, proxy_subscription_value
 from .vault import CredentialStore
 
 PROXY_POOL_ALIAS = "proxy_pool"
+# Health states surfaced in the panel's status column.
+HEALTH_OK = "ok"
+HEALTH_ERROR = "error"
 
 
 def utc_now() -> str:
@@ -241,6 +244,44 @@ class Store:
                 params)
             self.db.commit()
         return metadata
+
+    # --- account health ----------------------------------------------------
+
+    def mark_account_error(self, alias: str, status: int, message: str,
+                           kind: str,
+                           retry_after: Optional[float] = None) -> dict[str, Any]:
+        """Record an upstream refusal that makes this account unusable.
+
+        Stored in metadata rather than a new column so it travels with the
+        existing atomic merge and needs no schema migration.
+
+        ``retry_after`` is the epoch after which automatic selection may try
+        the account again; ``None`` means never (the refusal does not heal by
+        itself, so only an operator can clear it).
+        """
+        return self.merge_metadata(alias, {"health": {
+            "state": HEALTH_ERROR,
+            "status": int(status),
+            "kind": kind,
+            "message": message[:300],
+            "at": utc_now(),
+            "retry_at": float(retry_after) if retry_after is not None else None,
+        }})
+
+    def clear_account_error(self, alias: str) -> None:
+        """Drop the error record after the account serves a request again."""
+        alias = alias_value(alias)
+        with self.db_lock:
+            row = self.db.execute("SELECT metadata_json FROM accounts WHERE alias=?",
+                                  (alias,)).fetchone()
+            if row is None:
+                return
+            metadata = json.loads(row["metadata_json"])
+            if not metadata.pop("health", None):
+                return
+            self.db.execute("UPDATE accounts SET metadata_json=?,updated_at=? WHERE alias=?",
+                            (json.dumps(metadata, ensure_ascii=False), utc_now(), alias))
+            self.db.commit()
 
     def remove(self, alias: str) -> None:
         alias = alias_value(alias)

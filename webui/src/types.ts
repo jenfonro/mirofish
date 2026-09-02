@@ -60,6 +60,17 @@ export interface ReferralInfo {
   next_plan?: string | null;
 }
 
+/** Recorded upstream refusal that parks an account (401/503). */
+export interface AccountHealth {
+  state?: string;
+  status?: number;
+  kind?: string;
+  message?: string;
+  at?: string;
+  /** Epoch after which automatic selection retries it; null = never. */
+  retry_at?: number | null;
+}
+
 export interface Account {
   alias: string;
   email: string;
@@ -75,6 +86,9 @@ export interface Account {
   profile_pending?: boolean;
   disabled?: boolean;
   shared_quota_cooldown?: number;
+  healthy?: boolean;
+  health?: AccountHealth;
+  health_retry_in?: number | null;
   active_sessions?: number;
   checked_at?: string | null;
   proxy?: ProxyInfo | null;

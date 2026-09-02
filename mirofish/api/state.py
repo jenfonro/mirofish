@@ -19,7 +19,7 @@ from ..accounts import AccountService
 from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool
-from ..store import Store
+from ..store import HEALTH_ERROR, Store
 from ..upstream import (CREDIT_EXHAUSTED_TYPE, RESPONSES_PATH, Upstream,
                         account_scoped_429, quota_headers)
 from ..validate import alias_value
@@ -39,6 +39,21 @@ SHARED_QUOTA_COOLDOWN = 600.0
 # long enough for its dropped sessions to land elsewhere; the full cooldown
 # would bench a single-account deployment for 10 minutes over one hiccup.
 TRANSIENT_429_COOLDOWN = 60.0
+
+# Upstream statuses that mean "this account cannot serve model traffic at all",
+# mapped to how long automatic selection avoids it afterwards.
+#
+# 401: its credentials or signed session are rejected. That does not heal on
+# its own — the account has to be logged in again — so it is parked with no
+# retry deadline at all.
+#
+# 503: the upstream has no capacity for THIS account ("overloaded_error", the
+# message points at a Discord status channel). It does recover eventually, but
+# on the order of hours, not minutes: re-probing sooner just burns a request
+# and re-parks the account. A day is long enough to be nearly free while still
+# guaranteeing the account comes back without anyone watching it.
+HEALTH_ERROR_STATUSES = (401, 503)
+HEALTH_RETRY_AFTER = {503: 86400.0}
 
 # Account scheduling. "balanced" spreads new conversations over the accounts
 # carrying the fewest live sessions. "reset_first" instead prefers the account
@@ -379,14 +394,94 @@ class AppState:
         except (RelayError, json.JSONDecodeError):
             return False
 
+    def account_health(self, alias: str) -> dict[str, Any]:
+        """Persisted health record, or an empty dict when the account is fine."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except (RelayError, json.JSONDecodeError):
+            return {}
+        health = metadata.get("health")
+        return health if isinstance(health, dict) else {}
+
+    def account_unhealthy(self, alias: str) -> bool:
+        """True while a recorded refusal still keeps the account out of
+        automatic selection.
+
+        A record with no ``retry_at`` never expires on its own (401: the
+        credentials have to be replaced). One with a deadline stops parking the
+        account once that passes, so a capacity outage heals without anyone
+        watching. Either way an explicit request that succeeds clears it
+        immediately — that is the panel's playground path.
+        """
+        health = self.account_health(alias)
+        if health.get("state") != HEALTH_ERROR:
+            return False
+        retry_at = health.get("retry_at")
+        if retry_at is None:
+            # A record written before retry deadlines existed. Treat it by the
+            # rule for its status rather than as "never": a 503 written then is
+            # the same capacity outage that now expires on its own, and leaving
+            # those parked forever is exactly the bug the deadline fixes.
+            return not self._retry_deadline_elapsed(health)
+        try:
+            return time.time() < float(retry_at)
+        except (TypeError, ValueError):
+            # An unreadable deadline must not strand the account forever.
+            return False
+
+    @staticmethod
+    def _retry_deadline_elapsed(health: dict[str, Any]) -> bool:
+        """Whether a legacy record (no ``retry_at``) is already due a retry.
+
+        Derived from when it was recorded plus the status's window, so an old
+        503 is retried a day after it was parked, not a day after the upgrade.
+        """
+        window = HEALTH_RETRY_AFTER.get(health.get("status"))
+        if not window:
+            return False
+        try:
+            marked = datetime.datetime.fromisoformat(str(health.get("at", "")))
+        except (ValueError, TypeError):
+            return True  # undatable: retry now rather than park forever
+        if marked.tzinfo is None:
+            marked = marked.replace(tzinfo=datetime.timezone.utc)
+        return time.time() >= marked.timestamp() + window
+
+    def health_retry_in(self, alias: str) -> Optional[float]:
+        """Seconds until a parked account is retried, or None when never."""
+        health = self.account_health(alias)
+        if health.get("state") != HEALTH_ERROR:
+            return None
+        retry_at = health.get("retry_at")
+        if retry_at is None:
+            window = HEALTH_RETRY_AFTER.get(health.get("status"))
+            if not window:
+                return None
+            # Legacy record: report the remaining part of its own window.
+            return 0.0 if self._retry_deadline_elapsed(health) else window
+        try:
+            return max(0.0, float(retry_at) - time.time())
+        except (TypeError, ValueError):
+            return None
+
     def exhausted_cooldown(self, alias: str) -> float:
         """Seconds left in this account's shared-quota cooldown (0 = serviceable)."""
         return max(0.0, self._exhausted_until.get(alias, 0.0) - time.time())
 
     def _selectable(self, alias: str) -> bool:
         """Eligible for automatic selection: not switched off in the panel and
-        not cooling down after an upstream shared-quota refusal. Quota load is
-        a soft preference handled separately; these two are hard exclusions."""
+        neither cooling down after an upstream shared-quota refusal nor parked
+        by a 401/503. Quota load is a soft preference handled separately; these
+        are hard exclusions."""
+        return self._serviceable(alias) and not self.account_unhealthy(alias)
+
+    def _serviceable(self, alias: str) -> bool:
+        """Usable for a zero-cost control-plane read.
+
+        Same as ``_selectable`` minus the health verdict: a 401/503 refusal
+        stops model traffic, but the account can still answer the model
+        catalog, and a parked account must not take the panel down with it.
+        """
         return not self.account_disabled(alias) and self.exhausted_cooldown(alias) <= 0.0
 
     def _explicit_account(self, requested: str) -> str:
@@ -401,17 +496,25 @@ class AppState:
         return RelayError("all accounts are disabled or cooling down after a "
                           "shared-quota refusal; enable one in the panel or retry later", 503)
 
-    def pick_account(self, requested: str, model: Optional[str] = None) -> str:
-        """Explicit header > default account > quota-aware round-robin."""
+    def pick_account(self, requested: str, model: Optional[str] = None, *,
+                     allow_unhealthy: bool = False) -> str:
+        """Explicit header > default account > quota-aware round-robin.
+
+        ``allow_unhealthy`` keeps accounts parked by a 401/503 in the running
+        for zero-cost catalog reads: those refusals are about serving model
+        traffic, and refusing `/v1/models` because every account is parked
+        would take the panel down exactly when it is needed to recover one.
+        """
         requested = requested.strip()
         if requested:
             return self._explicit_account(requested)
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
-        if self.default_account in aliases and self._selectable(self.default_account):
+        eligible = self._serviceable if allow_unhealthy else self._selectable
+        if self.default_account in aliases and eligible(self.default_account):
             return self.default_account
-        selectable = [alias for alias in aliases if self._selectable(alias)]
+        selectable = [alias for alias in aliases if eligible(alias)]
         if not selectable:
             raise self._no_selectable_error()
         schedule = self.schedule_settings()
@@ -691,6 +794,9 @@ class AppState:
             self._last_assigned.pop(alias, None)
         self.model_cache.pop(alias, None)
         self._exhausted_until.pop(alias, None)
+        # New credentials invalidate a recorded 401; a 503 was never about them,
+        # but re-probing once after a login is cheaper than staying parked.
+        self.note_account_healthy(alias)
         # A successful login may represent a different upstream identity under
         # the same local alias. Region refusals belong to the old identity, but
         # the alias's slot remains valid (and may still carry an in-flight
@@ -738,7 +844,7 @@ class AppState:
         elif self._is_region_refused_everywhere(exc):
             cooldown, reason = SHARED_QUOTA_COOLDOWN, "region refusal from every exit"
         else:
-            return False
+            return self.note_account_error(alias, exc)
         self._exhausted_until[alias] = time.time() + cooldown
         self.drop_account_sessions(alias)
         logger.warning(
@@ -746,12 +852,66 @@ class AppState:
             int(cooldown), reason, alias)
         return True
 
+    @staticmethod
+    def _refusal_message(exc: RelayError) -> str:
+        """Human-readable upstream reason for the panel's status column."""
+        data = exc.data if isinstance(exc.data, dict) else {}
+        error = data.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            kind = error.get("type") or error.get("code")
+            if isinstance(message, str) and message.strip():
+                return (f"{kind}: {message}" if isinstance(kind, str) and kind
+                        else message).strip()
+        return str(exc)
+
+    def note_account_error(self, alias: str, exc: RelayError) -> bool:
+        """Park an account the upstream refused with 401 or 503.
+
+        Returns True when the error was one of those, letting the caller fail
+        over to another account. How long it stays parked depends on whether
+        the refusal heals by itself (see ``HEALTH_RETRY_AFTER``); a successful
+        explicitly-pinned request clears it at any point.
+        """
+        if exc.status not in HEALTH_ERROR_STATUSES:
+            return False
+        message = self._refusal_message(exc)
+        retry_after = HEALTH_RETRY_AFTER.get(exc.status)
+        retry_at = time.time() + retry_after if retry_after else None
+        self.drop_account_sessions(alias)
+        try:
+            self.store.mark_account_error(alias, exc.status, message,
+                                          "upstream_%d" % exc.status,
+                                          retry_after=retry_at)
+        except RelayError:
+            # The account was deleted mid-request; nothing left to park.
+            return True
+        window = ("until it is logged in again" if retry_at is None
+                  else "for %dh" % round(retry_after / 3600.0))
+        logger.warning(
+            "account parked %s after upstream %s; a successful request from "
+            "the playground clears it: account=%s %s",
+            window, exc.status, alias, message)
+        return True
+
+    def note_account_healthy(self, alias: str) -> None:
+        """Clear a recorded error once the account serves a request again."""
+        if not self.account_health(alias):
+            return
+        try:
+            self.store.clear_account_error(alias)
+        except RelayError:
+            return
+        logger.info("account back to normal after a successful request: "
+                    "account=%s", alias)
+
     async def with_account_failover(
             self, requested: str, session_hint: str, payload: Any,
             run: Callable[[str], Awaitable[Any]]) -> tuple[str, Any]:
         """Route an account and run the request, failing over to another account
-        when the upstream refuses the chosen one with credit_exhausted_shared.
-        An explicitly requested account is never substituted."""
+        when the upstream refuses the chosen one with credit_exhausted_shared or
+        parks it with a 401/503. An explicitly requested account is never
+        substituted."""
         requested = (requested or "").strip()
         tried: set[str] = set()
         last: Optional[RelayError] = None
@@ -765,12 +925,15 @@ class AppState:
                 raise last if last is not None else RelayError(
                     "account selection returned an already-failed account", 500)
             try:
-                return account, await run(account)
+                result = account, await run(account)
             except RelayError as exc:
                 if not self.note_account_unserviceable(account, exc) or requested:
                     raise
                 tried.add(account)
                 last = exc
+                continue
+            self.note_account_healthy(account)
+            return result
 
     @classmethod
     def relay_session_id(cls, claude_session: str, session_hint: str,
