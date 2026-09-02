@@ -36,7 +36,9 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   `/v1/device/session` tickets, and `mrs-sig-v2` signatures over a canonical record (method,
   pathname, timestamp, nonce, device id, client version, and SHA-256 digests of the bearer
   credential, the canonicalized relay metadata, and the exact request body — secrets never enter
-  the signed message). The private key lives in the encrypted vault and `x-mirasim-device` is
+  the signed message; the metadata digest line is *empty* when a request carries no metadata,
+  which is the device-session mint — `device.signing_record` is pinned byte-for-byte against the
+  desktop's WASM `cc_canonical`/`cc_sign` output in `tests/test_seal.py`). The private key lives in the encrypted vault and `x-mirasim-device` is
   derived from it on both the signed and the unsigned path. With the 0.0.272 profile a model
   request without a device ticket fails closed (503 `device_session_required`) instead of falling
   back to the plain account token; that legacy fallback exists only when

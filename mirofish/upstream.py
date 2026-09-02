@@ -1310,7 +1310,8 @@ class Upstream:
             self._note_ticket_failure(key, transient=exc.status >= 500)
             logger.warning(
                 "device session unavailable; temporarily using account token: "
-                "account=%s status=%s", alias, exc.status)
+                "account=%s status=%s %s", alias, exc.status,
+                _rejection_detail(exc.data))
         if cached is not None and time.monotonic() < cached.expires_at:
             return cached.value
         return None

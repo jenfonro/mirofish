@@ -17,8 +17,10 @@ from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import serialization
 
 from mirofish.config import Settings
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
 from mirofish.device import (LEGACY_SIG_VERSION, SIG_VERSION, DeviceSigner,
-                             canonical_metadata, uses_v2)
+                             canonical_metadata, signing_record, uses_v2)
 from mirofish.seal import (DEFAULT_SEAL_PUBLIC_KEY, SEAL_HEADER,
                            decode_seal_public_key, seal_header_pairs,
                            seal_metadata, sealed_size)
@@ -142,6 +144,75 @@ def test_seal_header_pairs_keeps_client_clear_and_drops_stale_envelopes():
 ])
 def test_uses_v2_switches_at_the_272_build(version, expected):
     assert uses_v2(version) is expected
+
+
+#: Reference values produced by the official desktop's WASM crypto core
+#: (``cc_canonical`` / ``cc_sign`` / ``cc_ed25519_pub`` in the 0.0.272
+#: ``server.cjs``), run in Node with a fixed 32-byte seed of 0x07.
+WASM_SEED = bytes([7]) * 32
+WASM_PUBLIC_HEX = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
+WASM_CONTEXT = dict(method="POST", path="/v1/device/session",
+                    timestamp="1788345516613", nonce="bm9uY2Vub25jZW5vbg",
+                    device_id="DEVICEID22charsxxxxxxx", client_version="0.0.272",
+                    credential="access-token-secret")
+WASM_BODY = b'{"publicKey":"PK","deviceId":"DEVICEID22charsxxxxxxx"}'
+WASM_METADATA = {"x-mirasim-session": "sess-1", "x-mirasim-agent": "claude"}
+WASM_RECORD_WITH_METADATA = (
+    "mrs-sig-v2\nPOST\n/v1/device/session\n1788345516613\nbm9uY2Vub25jZW5vbg\n"
+    "DEVICEID22charsxxxxxxx\n0.0.272\n"
+    "a67f40cb8bc414aeb64130f986090c004091aacc517af6799d5125261c14037a\n"
+    "31198bd9dc30b19eb8367058f96df25046b19d7df8e7989d8d9725c356152c81\n"
+    "9a417759e7128a0fb7aa8f6eafb8e1ef8ac8d5d00dc23c71a91d628e1caaebcf")
+WASM_SIGNATURE_WITH_METADATA = (
+    "341I2DmRtggNv4WMUgyxykv6AoVlo-YKYeSACpHPHd48sjmS0iykoxmA8_r45TY4YD2zVXRWg7kmvncoy_5fAg")
+WASM_SIGNATURE_WITHOUT_METADATA = (
+    "yhdKVLk_iJG8nYO6mPuin4t5yYzFV7CmrkL_OBYWVPtv5Na7FbYa2dpw7l7eMn-GfAKtTuPsY5mnNtesVHwgBg")
+#: ``cc_canonical``'s metadata digest for NUL-joined pairs as the desktop
+#: wrapper hands them over: sorted by lower-cased name, ``name:value`` per line.
+WASM_METADATA_DIGESTS = [
+    ([("x-mirasim-session", "s")],
+     "bd150ca0121dbf09f6db04057542f936bfd50171eae7994a9c696470b77b6619"),
+    ([("x-mirasim-session", "s"), ("x-mirasim-agent", "a")],
+     "c68ad31c8343097747cba12104296cb4a26878370814d90563ffd194420d8742"),
+    ([("X-Mirasim-Agent", "a")],
+     "85ea732053bc13ffe4c72dca2c60640f707d1b5ba0c76d48d745a04cc34f9c42"),
+    ([("x-mirasim-agent", "a:b")],
+     "0dc9446e6dd86ddbecc939a94306b26af9022b46c677eca59a5a224e6000ec98"),
+    ([("x-mirasim-agent", "a"), ("x-mirasim-agent", "b")],
+     "eea0da905ae5fb197e5038209ad167293b4a65c2547a0b1a8f59b54189439d30"),
+]
+
+
+def _b64url(value: bytes) -> str:
+    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def test_signing_record_matches_the_official_wasm_core():
+    """Byte-for-byte agreement with ``cc_canonical`` / ``cc_sign``.
+
+    The empty-metadata case is the device-session mint: the core leaves the
+    metadata digest line empty, and hashing the empty string instead makes
+    the upstream reject every ticket with 401.
+    """
+    key = Ed25519PrivateKey.from_private_bytes(WASM_SEED)
+    assert key.public_key().public_bytes_raw().hex() == WASM_PUBLIC_HEX
+
+    record = signing_record(
+        **WASM_CONTEXT, metadata_text=canonical_metadata(WASM_METADATA),
+        body=WASM_BODY)
+    assert record.decode() == WASM_RECORD_WITH_METADATA
+    assert _b64url(key.sign(record)) == WASM_SIGNATURE_WITH_METADATA
+
+    empty = signing_record(**WASM_CONTEXT, metadata_text="", body=WASM_BODY)
+    lines = empty.decode().split("\n")
+    assert len(lines) == 10 and lines[8] == ""
+    assert _b64url(key.sign(empty)) == WASM_SIGNATURE_WITHOUT_METADATA
+    assert canonical_metadata({}) == ""
+
+
+@pytest.mark.parametrize(("pairs", "digest"), WASM_METADATA_DIGESTS)
+def test_canonical_metadata_digest_matches_the_official_wasm_core(pairs, digest):
+    assert hashlib.sha256(canonical_metadata(pairs).encode()).hexdigest() == digest
 
 
 def test_v2_signature_covers_credential_metadata_and_body(state):

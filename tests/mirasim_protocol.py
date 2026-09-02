@@ -23,7 +23,7 @@ from cryptography.hazmat.primitives.asymmetric.x25519 import (
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-from mirofish.device import SIG_VERSION, canonical_metadata
+from mirofish.device import canonical_metadata, signing_record
 from mirofish.seal import SEAL_HEADER, SEAL_VERSION
 
 # One receiving key for the whole test process.  Only its public half enters
@@ -80,18 +80,10 @@ def signing_payload(request: httpx.Request, path: str, credential: str,
     fields = relay_metadata(request, path) if fields is None else fields
     metadata = {name: value for name, value in fields.items()
                 if name not in _IDENTITY_FIELDS}
-    return "\n".join((
-        SIG_VERSION,
-        request.method.upper(),
-        path,
-        fields["x-mirasim-ts"],
-        fields["x-mirasim-nonce"],
-        fields["x-mirasim-device"],
-        fields.get("x-mirasim-client", ""),
-        hashlib.sha256(credential.encode("utf-8")).hexdigest(),
-        hashlib.sha256(canonical_metadata(metadata).encode("utf-8")).hexdigest(),
-        hashlib.sha256(request.content).hexdigest(),
-    )).encode("utf-8")
+    return signing_record(
+        request.method, path, fields["x-mirasim-ts"], fields["x-mirasim-nonce"],
+        fields["x-mirasim-device"], fields.get("x-mirasim-client", ""),
+        credential, canonical_metadata(metadata), request.content)
 
 
 def verify_signature(state, request: httpx.Request, path: str,

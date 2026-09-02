@@ -108,6 +108,36 @@ def canonical_metadata(
     return "\n".join(f"{name}:{value}" for name, value in normalized)
 
 
+def signing_record(
+        method: str, path: str, timestamp: str, nonce: str, device_id: str,
+        client_version: str, credential: str, metadata_text: str,
+        body: bytes) -> bytes:
+    """Build the exact ``mrs-sig-v2`` record the official crypto core signs.
+
+    Pinned against the desktop's WASM ``cc_canonical`` export
+    (``tests/test_seal.py``): newline-delimited, method upper-cased, the
+    credential and body carried as SHA-256 hex digests, and the metadata
+    digest line left *empty* when there is no metadata at all rather than
+    holding the digest of the empty string.  The device-session mint is the
+    one request without metadata, so getting that line wrong rejects every
+    ticket while leaving model requests (which always carry metadata) intact.
+    """
+    metadata_digest = (hashlib.sha256(metadata_text.encode("utf-8")).hexdigest()
+                       if metadata_text else "")
+    return "\n".join((
+        SIG_VERSION,
+        method.upper(),
+        path,
+        timestamp,
+        nonce,
+        device_id,
+        client_version,
+        hashlib.sha256(credential.encode("utf-8")).hexdigest(),
+        metadata_digest,
+        hashlib.sha256(body).hexdigest(),
+    )).encode("utf-8")
+
+
 class DeviceSigner:
     """Load or create the installation's persistent Ed25519 identity."""
 
@@ -278,18 +308,9 @@ class DeviceSigner:
                 # same explicit invariant as the native wrapper if these hooks
                 # are ever made injectable for tests.
                 raise ValueError("Mirasim signature context contains NUL")
-            signing_payload = "\n".join((
-                SIG_VERSION,
-                method_text.upper(),
-                path_text,
-                timestamp,
-                nonce,
-                self.device_id,
-                client_text,
-                hashlib.sha256(credential_text.encode("utf-8")).hexdigest(),
-                hashlib.sha256(metadata_text.encode("utf-8")).hexdigest(),
-                hashlib.sha256(body).hexdigest(),
-            ))
+            signing_payload = signing_record(
+                method_text, path_text, timestamp, nonce, self.device_id,
+                client_text, credential_text, metadata_text, body).decode("utf-8")
         else:
             raise ValueError(f"unsupported Mirasim signature version: {version}")
         signature = _base64url(
