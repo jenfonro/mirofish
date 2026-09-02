@@ -16,6 +16,7 @@ import pytest
 import respx
 from cryptography.hazmat.primitives import serialization
 
+from mirofish.device import metadata_digest
 from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, LIMITS_PATH
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 from tests.test_request_profile import _body as captured_messages_body
@@ -62,18 +63,34 @@ def _mock_device_session(ticket: str = "device-ticket"):
 
 
 def _verify_signature(state, request: httpx.Request, path: str) -> None:
+    """Recompute mrs-sig-v2 from what the request actually carries.
+
+    Rebuilding the metadata digest from the emitted x-mirasim-* headers keeps
+    the signed set and the sent set locked together.
+    """
+    signer = state.upstream._signer("work")
+    meta = {name.lower(): value for name, value in request.headers.items()
+            if name.lower().startswith("x-mirasim-")
+            and name.lower() not in (
+                "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce",
+                "x-mirasim-sig", "x-mirasim-client")}
+    credential = request.headers.get("authorization", "").removeprefix("Bearer ")
     signed = "\n".join((
-        "mrs-sig-v1",
+        "mrs-sig-v2",
         request.method,
         path,
         request.headers["x-mirasim-ts"],
         request.headers["x-mirasim-nonce"],
+        signer.device_id,
+        signer.client_version,
+        hashlib.sha256(credential.encode("utf-8")).hexdigest(),
+        metadata_digest(meta),
         hashlib.sha256(request.content).hexdigest(),
     )).encode("utf-8")
     encoded = request.headers["x-mirasim-sig"]
     signature = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
     public = serialization.load_der_public_key(
-        base64.b64decode(state.upstream._signer("work").public_key))
+        base64.b64decode(signer.public_key))
     public.verify(signature, signed)
 
 

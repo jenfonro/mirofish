@@ -242,11 +242,30 @@ def test_region_refusal_stays_with_the_proxy_pool(state):
     assert state.exhausted_cooldown("work") == 0
 
 
-def test_non_429_errors_are_left_alone(state):
+def test_transport_and_client_errors_are_left_alone(state):
+    """A bad request or a transport-level failure is not an account verdict.
+
+    401/503 are (see below): those say the upstream will not serve this
+    account at all.
+    """
     add_account(state, "work")
-    for status in (400, 401, 500, 502):
+    for status in (400, 500, 502):
         assert not state.note_account_unserviceable("work", refusal(status))
     assert state.exhausted_cooldown("work") == 0
+    assert not state.account_unhealthy("work")
+
+
+def test_401_and_503_park_the_account(state):
+    """These mean the account itself cannot serve traffic, so it stops being
+    scheduled and the panel records why. Recovery is manual."""
+    add_account(state, "work")
+    for status in (401, 503):
+        state.store.clear_account_error("work")
+        assert state.note_account_unserviceable("work", refusal(status))
+        assert state.account_unhealthy("work")
+        assert state.account_health("work")["status"] == status
+        # This is a health verdict, not a quota one.
+        assert state.exhausted_cooldown("work") == 0
 
 
 def spread(state, count, model="claude-opus-5"):

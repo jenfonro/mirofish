@@ -27,6 +27,14 @@ export interface AccountLimits {
   fetched_epoch: number;
 }
 
+export interface AccountHealth {
+  state?: string;
+  status?: number;
+  kind?: string;
+  message?: string;
+  at?: string;
+}
+
 export interface Account {
   alias: string;
   email: string;
@@ -40,6 +48,8 @@ export interface Account {
   profile_pending?: boolean;
   disabled?: boolean;
   shared_quota_cooldown?: number;
+  healthy?: boolean;
+  health?: AccountHealth;
   active_sessions?: number;
   checked_at?: string | null;
   proxy?: ProxyInfo | null;

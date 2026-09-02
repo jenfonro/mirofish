@@ -312,6 +312,23 @@ def _set_ordered_header(
     headers.append((name, value))
 
 
+_SIGNATURE_HEADERS = ("x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce",
+                      "x-mirasim-sig", "x-mirasim-client")
+
+
+def _signable_metadata(headers: Sequence[tuple[str, str]]) -> dict[str, str]:
+    """The ``x-mirasim-*`` metadata that ``mrs-sig-v2`` covers.
+
+    Mirrors the client: every ``x-mirasim-*`` header except the signature
+    fields themselves and the client version, which the signed payload carries
+    as its own field.  Derived from the header list that will actually be sent,
+    so a new metadata header cannot end up signed but unsent (or the reverse).
+    """
+    return {name.lower(): value for name, value in headers
+            if name.lower().startswith("x-mirasim-")
+            and name.lower() not in _SIGNATURE_HEADERS}
+
+
 def _authority(url: str) -> str:
     """HTTP Host value, including a non-default port when present."""
     return httpx.URL(url).netloc.decode("ascii")
@@ -1092,7 +1109,10 @@ class Upstream:
         signer = self._signer(alias)
         body = _json_bytes({"publicKey": signer.public_key,
                             "deviceId": signer.device_id})
-        signature = signer.headers("POST", DEVICE_SESSION_PATH, body)
+        # The device-session call carries no relay metadata; its credential is
+        # the account access token this request authenticates with.
+        signature = signer.headers("POST", DEVICE_SESSION_PATH, body,
+                                   credential=access)
         url = self.settings.relay_base + DEVICE_SESSION_PATH
         headers = [
             ("content-type", "application/json"),
@@ -1231,10 +1251,10 @@ class Upstream:
         # Credentials and signature metadata always win over caller-derived
         # headers. The signature covers the canonical pathname only; the
         # product preserves ?beta=true on the URL but excludes it here.
-        signature = (self._signer(alias).headers(method, path, body)
-                     if credential.signed else None)
+        # mrs-sig-v2 also covers the relay metadata headers, so signing happens
+        # once the envelope below is assembled rather than ahead of it.
         url = self.settings.relay_base + (url_path or path)
-        if signature is not None and httpx.URL(url).path != path:
+        if credential.signed and httpx.URL(url).path != path:
             # A relay base carrying its own path prefix would make the signed
             # pathname disagree with the one upstream actually receives, and
             # every request would fail verification for a non-obvious reason.
@@ -1262,9 +1282,12 @@ class Upstream:
                     self.settings.mirasim_client_version,
                     self.settings.mirasim_locale, probe):
                 _set_ordered_header(headers, name, value)
-            if signature is not None:
+            if credential.signed:
                 # Signing overwrites device/client in place, preserving each
                 # metadata field's official header position.
+                signature = self._signer(alias).headers(
+                    method, path, body, credential=credential.value,
+                    meta=_signable_metadata(headers))
                 for name in ("x-mirasim-device", "x-mirasim-client",
                              "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig"):
                     _set_ordered_header(headers, name, signature[name])
@@ -1278,7 +1301,12 @@ class Upstream:
             headers.extend((
                 ("Authorization", "Bearer " + credential.value),
             ))
-            if signature is not None:
+            if credential.signed:
+                # The client version below is part of the signed payload, so it
+                # is not included in the covered metadata.
+                signature = self._signer(alias).headers(
+                    method, path, body, credential=credential.value,
+                    meta=_signable_metadata(headers))
                 headers.extend((
                     ("x-mirasim-device", signature["x-mirasim-device"]),
                     ("x-mirasim-ts", signature["x-mirasim-ts"]),

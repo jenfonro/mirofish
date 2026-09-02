@@ -15,8 +15,9 @@ from cryptography.hazmat.primitives import serialization
 from mirofish.api.relay import (_MAX_USAGE_LINE_BYTES,
                                 _ManagedStreamingResponse, _UsageWatcher,
                                 _finalize_upstream_stream)
+from mirofish.api.state import AppState
 from mirofish.errors import RelayError
-from mirofish.device import DEVICE_KEY_KIND
+from mirofish.device import DEVICE_KEY_KIND, metadata_digest
 from mirofish.translate import MAX_SSE_EVENT_BYTES
 from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, _DeviceTicket
 
@@ -53,16 +54,32 @@ def mock_device_session(ticket: str = "device-ticket"):
 
 
 def verify_relay_signature(state, request: httpx.Request, path: str) -> bytes:
+    """Recompute the mrs-sig-v2 signature the relay must have produced.
+
+    The metadata digest is rebuilt from the x-mirasim-* headers actually sent,
+    so a header the signer forgot to cover (or covered but did not send) makes
+    the verification fail rather than silently pass.
+    """
     headers = request.headers
     body = request.content
+    signer = state.upstream._signer("work")
+    meta = {name.lower(): value for name, value in request.headers.items()
+            if name.lower().startswith("x-mirasim-")
+            and name.lower() not in (
+                "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce",
+                "x-mirasim-sig", "x-mirasim-client")}
+    credential = headers.get("authorization", "").removeprefix("Bearer ")
     signed = "\n".join((
-        "mrs-sig-v1", request.method, path, headers["x-mirasim-ts"],
-        headers["x-mirasim-nonce"], hashlib.sha256(body).hexdigest(),
+        "mrs-sig-v2", request.method, path, headers["x-mirasim-ts"],
+        headers["x-mirasim-nonce"], signer.device_id, signer.client_version,
+        hashlib.sha256(credential.encode()).hexdigest(),
+        metadata_digest(meta),
+        hashlib.sha256(body).hexdigest(),
     )).encode()
     signature = base64.urlsafe_b64decode(
         headers["x-mirasim-sig"] + "=" * (-len(headers["x-mirasim-sig"]) % 4))
     public = serialization.load_der_public_key(
-        base64.b64decode(state.upstream._signer("work").public_key))
+        base64.b64decode(signer.public_key))
     public.verify(signature, signed)
     return signature
 
@@ -349,8 +366,16 @@ async def test_messages_preserves_beta_query_and_claude_fingerprint(
 
     signature = verify_relay_signature(state, sent, "/v1/messages")
     query_payload = "\n".join((
-        "mrs-sig-v1", "POST", "/v1/messages?beta=true",
+        "mrs-sig-v2", "POST", "/v1/messages?beta=true",
         sent.headers["x-mirasim-ts"], sent.headers["x-mirasim-nonce"],
+        sent.headers["x-mirasim-device"], sent.headers["x-mirasim-client"],
+        hashlib.sha256(b"device-ticket").hexdigest(),
+        metadata_digest({
+            name.lower(): value for name, value in sent.headers.items()
+            if name.lower().startswith("x-mirasim-")
+            and name.lower() not in (
+                "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce",
+                "x-mirasim-sig", "x-mirasim-client")}),
         hashlib.sha256(sent.content).hexdigest(),
     )).encode()
     public = serialization.load_der_public_key(
@@ -1211,6 +1236,11 @@ async def test_login_start_fails_over_dead_node(client, state, auth_headers):
 
 EXHAUSTED_BODY = {"type": "error", "error": {
     "type": "credit_exhausted_shared", "message": "shared quota used up"}}
+SIGNED_SESSION_BODY = {"type": "error", "error": {
+    "type": "authentication_error",
+    "message": "this client version must upgrade to a signed session"}}
+NO_CAPACITY_BODY = {"type": "error", "error": {
+    "type": "api_error", "message": "no upstream available"}}
 
 
 async def test_account_toggle_excludes_from_selection(client, state, auth_headers):
@@ -1341,3 +1371,122 @@ async def test_failover_covers_region_refused_everywhere(state):
     assert (account, result) == ("beta", "ok")
     assert served == ["alpha", "beta"]
     assert state.exhausted_cooldown("alpha") > 0
+
+
+@respx.mock
+async def test_messages_park_account_on_signed_session_401(client, state, auth_headers):
+    """A 401 that survives the ticket retry marks the account abnormal.
+
+    The relay already re-mints the device ticket once on 401, so only the
+    second refusal is treated as an account problem; the request then fails
+    over to another account.
+    """
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(side_effect=[
+        httpx.Response(401, json=SIGNED_SESSION_BODY),
+        httpx.Response(401, json=SIGNED_SESSION_BODY),
+        httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS),
+    ])
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert response.headers["X-Mirofish-Account"] == "beta"
+    assert route.call_count == 3
+
+    # The refused account is abnormal, excluded from routing, and the panel
+    # shows the upstream reason.
+    assert state.account_unhealthy("alpha") is True
+    assert state.account_unhealthy("beta") is False
+    assert state.route_account("", "", _conv("a brand new window")) == "beta"
+    accounts = {a["alias"]: a for a in
+                (await client.get("/accounts", headers=auth_headers)).json()["accounts"]}
+    assert accounts["alpha"]["healthy"] is False
+    assert accounts["alpha"]["health"]["status"] == 401
+    assert "signed session" in accounts["alpha"]["health"]["message"]
+    assert accounts["beta"]["healthy"] is True and accounts["beta"]["health"] == {}
+
+
+@respx.mock
+async def test_messages_park_account_on_503(client, state, auth_headers):
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    respx.post(RELAY_BASE + "/v1/messages").mock(side_effect=[
+        httpx.Response(503, json=NO_CAPACITY_BODY),
+        httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS),
+    ])
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert response.status_code == 200
+    assert state.account_unhealthy("alpha") is True
+    assert state.store.row("alpha")["metadata_json"].find("no upstream available") > 0
+
+
+@respx.mock
+async def test_success_clears_a_recorded_account_error(client, state, auth_headers):
+    """Only a request that actually succeeds brings the account back."""
+    add_account(state, "alpha")
+    mock_device_session()
+    state.store.mark_account_error("alpha", 503, "no upstream available",
+                                   "upstream_503")
+    # Parked: automatic selection will not touch it, so nothing can recover it
+    # on its own.
+    assert state.account_unhealthy("alpha") is True
+    with pytest.raises(RelayError) as excinfo:
+        state.route_account("", "", _conv("some window"))
+    assert excinfo.value.status == 503
+
+    respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE, headers=QUOTA_HEADERS))
+    # The operator retries it explicitly from the playground, which is the only
+    # way a parked account is reached.
+    response = await client.post(
+        "/v1/messages", headers={**auth_headers, "X-Mirofish-Account": "alpha"},
+        json={"model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 200
+    assert state.account_health("alpha") == {}
+    accounts = (await client.get("/accounts", headers=auth_headers)).json()["accounts"]
+    assert accounts[0]["healthy"] is True
+    # Back in automatic rotation now.
+    assert state.route_account("", "", _conv("some window")) == "alpha"
+
+
+@respx.mock
+async def test_explicit_account_is_not_parked_silently(client, state, auth_headers):
+    """An explicitly pinned account still surfaces its 401 to the caller."""
+    add_account(state, "alpha")
+    add_account(state, "beta")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(401, json=SIGNED_SESSION_BODY))
+    response = await client.post(
+        "/v1/messages", headers={**auth_headers, "X-Mirofish-Account": "alpha"},
+        json={"model": "claude-haiku-4-5-20251001", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 401
+    # One ticket retry, then the refusal surfaces instead of silently moving on.
+    assert route.call_count == 2
+
+
+async def test_recorded_error_never_expires_on_its_own(state, settings):
+    """A parked account is only recovered by an explicit retry.
+
+    No timer and no restart puts it back: the record lives in metadata and is
+    cleared only by a request that succeeds.
+    """
+    add_account(state, "alpha")
+    state.store.mark_account_error("alpha", 401, "signed session required",
+                                   "upstream_401")
+    assert state.account_unhealthy("alpha") is True
+    revived = AppState(settings)
+    try:
+        assert revived.account_unhealthy("alpha") is True
+    finally:
+        await revived.aclose()

@@ -35,6 +35,10 @@ async def list_accounts(request: Request) -> dict[str, Any]:
                                proxy=state.pool.account_public(alias))
         status["active_sessions"] = sessions.get(alias, 0)
         status["shared_quota_cooldown"] = round(state.exhausted_cooldown(alias))
+        # One flag the panel can render directly: abnormal accounts are the
+        # ones an upstream 401/503 parked and that scheduling now skips. They
+        # stay parked until an operator retries them from the playground.
+        status["healthy"] = not state.account_unhealthy(alias)
         accounts.append(status)
     return {"accounts": accounts}
 

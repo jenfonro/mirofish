@@ -47,6 +47,7 @@ def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
             "limits": metadata.get("limits"),
             "profile_pending": bool(metadata.get("profile_pending")),
             "disabled": bool(metadata.get("disabled")),
+            "health": metadata.get("health") or {},
             "checked_at": metadata.get("checked_at"),
             "proxy": proxy}
 

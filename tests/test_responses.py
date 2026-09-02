@@ -9,6 +9,7 @@ import httpx
 import respx
 from cryptography.hazmat.primitives import serialization
 
+from mirofish.device import metadata_digest
 from mirofish.upstream import RESPONSES_PATH
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 
@@ -21,19 +22,30 @@ def _device_session(result: httpx.Response | None = None):
 
 def _verify_signature(state, request: httpx.Request,
                       path: str = RESPONSES_PATH) -> None:
+    """Recompute mrs-sig-v2 from the headers the request actually carries."""
+    signer = state.upstream._signer("work")
+    meta = {name.lower(): value for name, value in request.headers.items()
+            if name.lower().startswith("x-mirasim-")
+            and name.lower() not in (
+                "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce",
+                "x-mirasim-sig", "x-mirasim-client")}
+    credential = request.headers.get("authorization", "").removeprefix("Bearer ")
     canonical = "\n".join((
-        "mrs-sig-v1",
+        "mrs-sig-v2",
         "POST",
         path,
         request.headers["x-mirasim-ts"],
         request.headers["x-mirasim-nonce"],
+        signer.device_id,
+        signer.client_version,
+        hashlib.sha256(credential.encode("utf-8")).hexdigest(),
+        metadata_digest(meta),
         hashlib.sha256(request.content).hexdigest(),
     )).encode("utf-8")
     signature_text = request.headers["x-mirasim-sig"]
     signature = base64.urlsafe_b64decode(
         signature_text + "=" * (-len(signature_text) % 4))
-    public = serialization.load_der_public_key(base64.b64decode(
-        state.upstream._signer("work").public_key))
+    public = serialization.load_der_public_key(base64.b64decode(signer.public_key))
     public.verify(signature, canonical)
 
 

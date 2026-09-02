@@ -6,6 +6,11 @@ signature over the exact request body.  The official desktop keeps one device
 key per installation, not one per signed-in account.  This module mirrors that
 boundary and migrates one legacy per-account key when upgrading an existing
 relay installation.
+
+Since client 0.0.264 the relay requires ``mrs-sig-v2``: the signed string binds
+the client version, the credential in use and the relay metadata headers in
+addition to the body.  The upstream answers 401 ``client_outdated: this client
+version must upgrade to a signed session`` to a ``mrs-sig-v1`` signature.
 """
 
 from __future__ import annotations
@@ -16,6 +21,7 @@ import secrets
 import threading
 import time
 from collections.abc import Sequence
+from typing import Mapping, Optional
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -27,11 +33,27 @@ from .store import Store
 
 DEVICE_KEY_KIND = "device_private_key"
 DEVICE_KEY_ALIAS = "mirasim-installation"
-SIG_VERSION = "mrs-sig-v1"
+SIG_VERSION = "mrs-sig-v2"
 
 
 def _base64url(value: bytes) -> str:
     return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+
+
+def _sha256_hex(value: bytes) -> str:
+    return hashlib.sha256(value).hexdigest()
+
+
+def metadata_digest(meta: Mapping[str, str]) -> str:
+    """Hash the relay metadata headers exactly as the client's crypto-core does.
+
+    Keys are sorted, joined as ``name:value`` with newlines, and hashed; an
+    empty mapping contributes an empty field rather than the hash of "".
+    """
+    if not meta:
+        return ""
+    joined = "\n".join(f"{key}:{meta[key]}" for key in sorted(meta))
+    return _sha256_hex(joined.encode("utf-8"))
 
 
 class DeviceSigner:
@@ -132,19 +154,30 @@ class DeviceSigner:
         self._device_id = _base64url(
             hashlib.sha256(public_b64.encode("ascii")).digest())[:22]
 
-    def headers(self, method: str, path: str, body: bytes) -> dict[str, str]:
-        """Create the ``mrs-sig-v1`` headers for an exact request body."""
+    def headers(self, method: str, path: str, body: bytes, *,
+                credential: str = "",
+                meta: Optional[Mapping[str, str]] = None) -> dict[str, str]:
+        """Create the ``mrs-sig-v2`` headers for an exact request body.
+
+        ``credential`` is the bearer value this request will carry (the account
+        access token for the device-session call, the device ticket afterwards)
+        and ``meta`` the ``x-mirasim-*`` metadata headers sent alongside; both
+        are covered by the signature, so they must match the request exactly.
+        """
         self._ensure_identity()
         timestamp = str(int(time.time() * 1000))
         nonce = _base64url(secrets.token_bytes(12))
-        body_hash = hashlib.sha256(body).hexdigest()
         signing_payload = "\n".join((
             SIG_VERSION,
             method.upper(),
             path,
             timestamp,
             nonce,
-            body_hash,
+            self.device_id,
+            self.client_version,
+            _sha256_hex(credential.encode("utf-8")),
+            metadata_digest(meta or {}),
+            _sha256_hex(body),
         ))
         signature = _base64url(
             self._load_or_create().sign(signing_payload.encode("utf-8")))

@@ -6,13 +6,16 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey, Ed25519PublicKey,
 )
 
-from mirofish.device import DEVICE_KEY_ALIAS, DEVICE_KEY_KIND, DeviceSigner
+from mirofish.device import (DEVICE_KEY_ALIAS, DEVICE_KEY_KIND, DeviceSigner,
+                             metadata_digest)
 
 
 def test_device_signer_persists_identity_and_verifiable_signature(state):
     signer = DeviceSigner(state.store, "0.0.228", ("work",))
     body = b'{"hello":"world"}'
-    headers = signer.headers("POST", "/v1/messages", body)
+    meta = {"x-mirasim-agent": "claude", "x-mirasim-session": "s-1"}
+    headers = signer.headers("POST", "/v1/messages", body,
+                             credential="ticket-value", meta=meta)
 
     public_der = base64.b64decode(signer.public_key)
     public = serialization.load_der_public_key(public_der)
@@ -22,9 +25,15 @@ def test_device_signer_persists_identity_and_verifiable_signature(state):
     ).rstrip(b"=").decode("ascii")[:22]
     assert signer.device_id == expected_id
 
+    # mrs-sig-v2 binds the device id, client version, credential and relay
+    # metadata in addition to the body.
     payload = "\n".join((
-        "mrs-sig-v1", "POST", "/v1/messages", headers["x-mirasim-ts"],
-        headers["x-mirasim-nonce"], hashlib.sha256(body).hexdigest(),
+        "mrs-sig-v2", "POST", "/v1/messages", headers["x-mirasim-ts"],
+        headers["x-mirasim-nonce"], signer.device_id, "0.0.228",
+        hashlib.sha256(b"ticket-value").hexdigest(),
+        hashlib.sha256(
+            b"x-mirasim-agent:claude\nx-mirasim-session:s-1").hexdigest(),
+        hashlib.sha256(body).hexdigest(),
     )).encode("utf-8")
     signature = base64.urlsafe_b64decode(
         headers["x-mirasim-sig"] + "=" * (-len(headers["x-mirasim-sig"]) % 4))
@@ -70,3 +79,13 @@ def test_device_id_shape_is_identical_signed_and_unsigned(state):
         "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
     assert state.upstream._signer("work").headers(
         "POST", "/v1/responses", b"{}")["x-mirasim-device"] == device_id
+
+
+def test_metadata_digest_is_order_independent_and_empty_for_no_meta():
+    # The client sorts by header name, so header emission order cannot change
+    # the signature.
+    assert metadata_digest({"b": "2", "a": "1"}) == metadata_digest({"a": "1", "b": "2"})
+    assert metadata_digest({"a": "1", "b": "2"}) == hashlib.sha256(
+        b"a:1\nb:2").hexdigest()
+    # No metadata contributes an empty field, not the hash of an empty string.
+    assert metadata_digest({}) == ""

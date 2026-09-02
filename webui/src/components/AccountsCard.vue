@@ -53,6 +53,23 @@ function cooldownLabel(seconds: number): string {
   return seconds >= 90 ? `${Math.ceil(seconds / 60)} 分钟` : `${seconds} 秒`;
 }
 
+// 状态列：上游 401/503 会把账号标记为异常并暂停调度。
+function healthState(account: Account): "disabled" | "error" | "ok" {
+  if (account.disabled) return "disabled";
+  return account.healthy === false ? "error" : "ok";
+}
+
+function healthTitle(account: Account): string {
+  if (account.disabled) return "已停用：不参与自动分配，点击开关可启用";
+  if (account.healthy === false) {
+    const reason = account.health?.message || "上游拒绝了这个账号";
+    const code = account.health?.status ? `上游 ${account.health.status}：` : "";
+    const at = account.health?.at ? `（${account.health.at.slice(0, 19).replace("T", " ")} UTC）` : "";
+    return `${code}${reason}${at}；已暂停调度，在测试台指定该账号发送一次请求即可恢复`;
+  }
+  return "正常：参与自动分配";
+}
+
 async function removeAccount(alias: string) {
   if (!confirm(`删除账号 ${alias} 的本地凭证？（不会注销远端账号）`)) return;
   try {
@@ -81,13 +98,13 @@ async function removeAccount(alias: string) {
       <table>
         <thead>
           <tr>
-            <th>启用</th><th>别名</th><th>邮箱</th><th>套餐</th><th>代理节点</th>
+            <th>启用</th><th>状态</th><th>别名</th><th>邮箱</th><th>套餐</th><th>代理节点</th>
             <th>7 天配额</th><th class="num">活跃会话</th><th class="num">最近用量</th><th></th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="account in store.accounts" :key="account.alias"
-              :class="{ off: account.disabled }">
+              :class="{ off: account.disabled, unhealthy: healthState(account) === 'error' }">
             <td>
               <button class="switch" :class="{ on: !account.disabled }"
                       :disabled="busy === account.alias"
@@ -97,6 +114,17 @@ async function removeAccount(alias: string) {
                       @click="toggleEnabled(account)">
                 <span class="knob"></span>
               </button>
+            </td>
+            <td>
+              <span class="badge" :title="healthTitle(account)">
+                <span class="dot" :class="healthState(account) === 'ok' ? 'ok' : 'bad'"></span>
+                {{ healthState(account) === "disabled" ? "已停用"
+                   : healthState(account) === "error" ? "异常" : "正常" }}
+              </span>
+              <div v-if="healthState(account) === 'error' && account.health?.message"
+                   class="muted health-reason" :title="healthTitle(account)">
+                {{ account.health.message }}
+              </div>
             </td>
             <td class="mono">{{ account.alias }}</td>
             <td>{{ account.email }}</td>
@@ -110,6 +138,8 @@ async function removeAccount(alias: string) {
                       + cooldownLabel(account.shared_quota_cooldown) + '后自动重试'">
                 额度冷却 {{ cooldownLabel(account.shared_quota_cooldown) }}
               </span>
+              <span v-else-if="account.healthy === false" class="badge"
+                    :title="healthTitle(account)">已停调</span>
             </td>
             <td>
               <template v-if="account.proxy">
@@ -160,6 +190,8 @@ async function removeAccount(alias: string) {
 <style scoped>
 .scroll-x { overflow-x: auto; }
 tr.off td:not(:first-child) { opacity: 0.55; }
+tr.unhealthy td:nth-child(2) { color: var(--critical); }
+.health-reason { max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .switch {
   width: 34px; height: 18px; border-radius: 9px; padding: 0; position: relative;
   border: 1px solid var(--border, rgba(128, 128, 128, 0.5));

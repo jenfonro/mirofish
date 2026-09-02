@@ -10,7 +10,7 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   - `mirofish/cli.py`: CLI entry point (`python -m mirofish` / `mirofish`).
   - `mirofish/api/`: FastAPI routes (`admin.py`, `relay.py`, `openai_compat.py`, `webui.py`) and `state.py` (account selection, proxy retry, usage accounting).
   - `mirofish/upstream.py`: httpx layer, per-alias single-flight token refresh, per-account/exit device-ticket and connection caches, signed streaming.
-  - `mirofish/device.py`: persistent Ed25519 device identity and `mrs-sig-v1` request headers.
+  - `mirofish/device.py`: persistent Ed25519 device identity and `mrs-sig-v2` request headers.
   - `mirofish/proxy/`: subscription parsing (PyYAML), Mihomo controller client + slot manager, sticky pool.
   - `mirofish/vault/`: credential backends (macOS Keychain; AES-256-GCM file vault with legacy v1 migration).
   - `mirofish/store.py`: SQLite metadata + usage log.
@@ -27,9 +27,17 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
 - Model relay calls use one installation-wide Ed25519 device identity (not one per alias), per-exit
-  `/v1/device/session` tickets, and `mrs-sig-v1` signatures over the exact request body; the private
+  `/v1/device/session` tickets, and `mrs-sig-v2` signatures; the private
   key lives in the encrypted vault and `x-mirasim-device` is derived from it on both the signed and
-  the unsigned fallback path.
+  the unsigned fallback path. The signed string is
+  `mrs-sig-v2\nMETHOD\npath\nts\nnonce\ndeviceId\nclientVersion\nsha256(credential)\n`
+  `metadata_digest\nsha256(body)`, where `credential` is the bearer value the request carries
+  (access token for the device-session call, device ticket afterwards) and `metadata_digest` is
+  `sha256` over the `x-mirasim-*` metadata headers sorted and joined as `name:value` with
+  newlines (empty string when there are none). Adding or renaming a metadata header therefore
+  changes the signature, so `_signable_metadata` derives it from the header list that is about to
+  be sent. The upstream answers 401 `client_outdated: this client version must upgrade to a
+  signed session` to a `mrs-sig-v1` signature; `x-mirasim-client` itself is not version-gated.
 - Impersonation fidelity is header- and body-level. The TLS ClientHello is OpenSSL's, not the
   official client's BoringSSL one, and matching its JA3 would mean replacing the TLS stack rather
   than configuring it; `upstream.tls_context()` documents the two knobs that exist and why ALPN is
@@ -63,6 +71,16 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   node. The documented `credit_exhausted_shared` cools the account for `SHARED_QUOTA_COOLDOWN`
   (600s); any other 429 shape is usually transient rate pressure and cools for
   `TRANSIENT_429_COOLDOWN` (60s). Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned by the schedule mode (WebUI card; `GET`/`POST /api/schedule`; persisted in the SQLite `settings` table): `balanced` (default) picks the least-loaded eligible account so separate windows fan out; `reset_first` keeps that ordering but treats an account whose 7-day window resets within `URGENCY_HORIZON_HOURS` (48h) as carrying up to `URGENCY_MAX_BONUS` (2) fewer live sessions, so expiring credit is spent first without funneling the whole concurrency onto one account. Utilization constraints apply in both modes: fable requests weigh the model's own `7d_fable` window (the tighter of the two counts), accounts above the configurable utilization ceiling (default 0.98) sort behind every account with room, and accounts whose relevant window is exhausted (`QUOTA_EXHAUSTED`, or the ceiling when configured above it) are skipped by automatic selection entirely — the upstream meters lazily enough that keeping them in rotation drives windows far past 100% — falling back to serving them only when every account is exhausted (explicit pinning is unaffected; the upstream 429 stays the final authority). Both modes read cached `/v1/limits` windows kept warm by a background sweep (`LIMITS_REFRESH_SECONDS` = 300s, skipping disabled accounts, kicked immediately when settings change) — never probed on the request path; a cached window whose `reset_at` has passed counts as no data, and response quota headers merge into (never wipe) the cached quota values. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the round-robin used for `/v1/models` (in reset-first mode it applies the same tilted ordering).
+- Account health: an upstream 401 (credentials/signed session refused) or 503 (no capacity for
+  this account) marks the account abnormal — `health` in metadata records status, reason and
+  timestamp, live sessions are dropped, and automatic selection skips it, while the request fails
+  over to another account (never when explicitly pinned, which surfaces the error instead).
+  Recovery is deliberately manual: nothing re-probes a parked account — no timer, no background
+  sweep, and the record survives restarts — so a dead account cannot quietly rejoin the rotation.
+  It comes back only when a request that targets it explicitly succeeds, i.e. selecting it in the
+  WebUI playground (`X-Mirofish-Account`), or on a new login. `GET /accounts` exposes `healthy`
+  and `health`; the WebUI renders them as a 正常/异常 status column and the playground refreshes
+  the list on both outcomes so the verdict is visible immediately.
 - WebUI is built by Vite into `mirofish/static/` and served by the relay; a fallback page with build instructions appears if it is missing.
 
 ## Common commands
