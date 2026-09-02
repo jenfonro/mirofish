@@ -121,10 +121,6 @@ async function removeAccount(alias: string) {
                 {{ healthState(account) === "disabled" ? "已停用"
                    : healthState(account) === "error" ? "异常" : "正常" }}
               </span>
-              <div v-if="healthState(account) === 'error' && account.health?.message"
-                   class="muted health-reason" :title="healthTitle(account)">
-                {{ account.health.message }}
-              </div>
             </td>
             <td class="mono">{{ account.alias }}</td>
             <td>{{ account.email }}</td>
@@ -191,7 +187,6 @@ async function removeAccount(alias: string) {
 .scroll-x { overflow-x: auto; }
 tr.off td:not(:first-child) { opacity: 0.55; }
 tr.unhealthy td:nth-child(2) { color: var(--critical); }
-.health-reason { max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .switch {
   width: 34px; height: 18px; border-radius: 9px; padding: 0; position: relative;
   border: 1px solid var(--border, rgba(128, 128, 128, 0.5));
