@@ -11,7 +11,7 @@
     {"name": "x-mirasim-ts", "value": "<dynamic:unix_ms>"},
     {"name": "x-mirasim-nonce", "value": "<dynamic:base64url_12b>"},
     {"name": "x-mirasim-sig", "value": "<dynamic:ed25519_signature>"},
-    {"name": "x-mirasim-client", "value": "0.0.228"},
+    {"name": "x-mirasim-client", "value": "0.0.272"},
     {"name": "accept-encoding", "value": "identity"},
     {"name": "content-length", "value": "<dynamic:content_length>"},
     {"name": "Host", "value": "relay.mirasim.ai"},

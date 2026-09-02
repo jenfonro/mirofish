@@ -6,7 +6,7 @@
   "http_version": "HTTP/1.1",
   "headers": [
     {"name": "Accept", "value": "application/json"},
-    {"name": "User-Agent", "value": "mirasim-desktop/0.0.228"},
+    {"name": "User-Agent", "value": "mirasim-desktop/0.0.272"},
     {"name": "accept-encoding", "value": "identity"},
     {"name": "Host", "value": "cdn-assets.mirasim.ai"},
     {"name": "Connection", "value": "keep-alive"}

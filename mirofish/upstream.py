@@ -23,9 +23,11 @@ from typing import Any, Mapping, Optional, Sequence
 import httpx
 
 from .config import Settings
-from .device import DeviceSigner
+from .device import DeviceSigner, uses_v2
 from .errors import RelayError
+from .seal import DEFAULT_SEAL_PUBLIC_KEY, seal_header_pairs
 from .store import Store
+from .wire import install_profile_header_order
 
 DEVICE_SESSION_PATH = "/v1/device/session"
 MESSAGES_PATH = "/v1/messages"
@@ -35,6 +37,16 @@ ALPHA_SEARCH_PATH = "/v1/alpha/search"
 LIMITS_PATH = "/v1/limits"
 #: Upstream endpoints the Codex agent reaches through the transparent MITM path.
 CODEX_PATHS = (RESPONSES_PATH, ALPHA_SEARCH_PATH)
+
+
+def _is_model_request_path(path: str) -> bool:
+    """Whether ``path`` carries model work rather than control-plane data.
+
+    The current desktop client requires a prepared device ticket before these
+    routes are sent.  Keeping the predicate centralized prevents a new Codex
+    alias from accidentally taking the account-token fallback path.
+    """
+    return path in (MESSAGES_PATH, COUNT_TOKENS_PATH, *CODEX_PATHS)
 
 TICKET_REFRESH_LEAD_SECONDS = 120.0
 TICKET_MINT_TIMEOUT_SECONDS = 10.0
@@ -133,6 +145,11 @@ _RELAY_OWNED_REQUEST_HEADERS = {"cookie", "cookie2"}
 # Every observed official Codex request reaches the relay with this exact
 # originator, so pin it rather than trusting whatever the local caller sends.
 _CODEX_ORIGINATOR = "mirasim"
+# Fields a stand-alone Codex CLI adds that the desktop's bundled Codex does
+# not put on the wire (0.0.272 capture).  ``accept-encoding`` only affects
+# what comes back, and the relay streams whatever the upstream sends either
+# way; ``openai-beta`` was dropped by newer Codex builds.
+_CODEX_DROPPED_REQUEST_HEADERS = frozenset({"accept-encoding", "openai-beta"})
 _HOP_BY_HOP_RESPONSE_HEADERS = {
     "connection", "content-length", "keep-alive", "proxy-authenticate",
     "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade",
@@ -199,14 +216,39 @@ def _forwarded_message_headers(
     return forwarded
 
 
+def _place_before_authorization(
+        headers: list[tuple[str, str]], name: str, value: str) -> None:
+    """Assign ``name`` in place, or insert it just ahead of the credential.
+
+    The bundled Codex emits ``originator``, ``user-agent`` and its cookie jar
+    immediately before ``authorization``.  A caller that omits one of them
+    would otherwise receive it *after* the credential slot, a header order the
+    official client never produces.
+    """
+    lowered = name.lower()
+    for index, (header_name, _) in enumerate(headers):
+        if header_name.lower() == lowered:
+            headers[index] = (header_name, value)
+            return
+    for index, (header_name, _) in enumerate(headers):
+        if header_name.lower() == "authorization":
+            headers.insert(index, (name, value))
+            return
+    headers.append((name, value))
+
+
 def forwarded_codex_headers(
-        headers: Optional[Mapping[str, str] | Iterable[tuple[Any, Any]]]
+        headers: Optional[Mapping[str, str] | Iterable[tuple[Any, Any]]],
+        user_agent: str = "",
 ) -> list[tuple[str, str]]:
     """Preserve Codex's evolving protocol headers while isolating local secrets.
 
     The desktop MITM uses a blocklist, not a fixed allowlist: Codex frequently
     adds routing and beta headers, and dropping a new one can change the request.
-    Authentication and hop-by-hop fields are always rebuilt locally.
+    Authentication and hop-by-hop fields are always rebuilt locally.  The
+    caller's ``user-agent`` is replaced by ``user_agent`` when given: the
+    desktop's bundled Codex identifies as the product, and a stand-alone
+    ``codex_cli_rs/...`` string would name a client the upstream never sees.
 
     Two namespaces are refused outright even though the desktop forwards them.
     ``x-mirasim-*`` belongs to the relay's own signing envelope: the desktop
@@ -241,7 +283,8 @@ def forwarded_codex_headers(
                 or name in _RELAY_OWNED_REQUEST_HEADERS \
                 or name.startswith("x-forwarded-") \
                 or name == "forwarded" or name.startswith("x-mirofish-") \
-                or name.startswith(_MIRASIM_HEADER_PREFIX):
+                or name.startswith(_MIRASIM_HEADER_PREFIX) \
+                or name in _CODEX_DROPPED_REQUEST_HEADERS:
             continue
         value = raw_value.strip()
         if not value or len(value) > 16384 or any(char in value for char in "\r\n\0"):
@@ -258,8 +301,22 @@ def forwarded_codex_headers(
                          if name.lower() == "content-type"), "")
     if content_type.partition(";")[0].strip().lower() != "application/json":
         _set_ordered_header(forwarded, "content-type", "application/json")
-    _set_ordered_header(forwarded, "originator", _CODEX_ORIGINATOR)
+    _place_before_authorization(forwarded, "originator", _CODEX_ORIGINATOR)
+    if user_agent:
+        _place_before_authorization(forwarded, "user-agent", user_agent)
     return forwarded
+
+
+def _cookie_header(jar: httpx.Cookies, url: str) -> str:
+    """Render the cookies ``jar`` would attach to a request for ``url``.
+
+    ``http.cookiejar`` applies the usual RFC 6265 rules (host match, path,
+    ``Secure``, expiry), so a Cloudflare cookie the upstream relays for another
+    domain is not replayed, just as the bundled Codex's cookie store would not.
+    """
+    probe = httpx.Request("POST", url)
+    jar.set_cookie_header(probe)
+    return probe.headers.get("cookie", "")
 
 
 def forwarded_response_headers(response: httpx.Response) -> list[tuple[str, str]]:
@@ -369,19 +426,28 @@ def _relay_envelope(
     conversation and the product does not attribute one.
     """
     if probe:
-        return [("x-mirasim-probe", "usage"),
-                ("authorization", "Bearer " + token),
-                ("x-mirasim-client", client_version)]
-    envelope = [("authorization", "Bearer " + token),
-                ("x-mirasim-session", session_id),
-                ("x-mirasim-agent", agent),
-                ("x-mirasim-device", device_id)]
+        envelope = [("x-mirasim-probe", "usage"),
+                    ("authorization", "Bearer " + token)]
+        if client_version:
+            envelope.append(("x-mirasim-client", client_version))
+        return envelope
+    envelope = [("authorization", "Bearer " + token)]
+    # The desktop assigns relay metadata only when its value is truthy.  In
+    # normal model calls all three are present, but preserving that rule keeps
+    # private/diagnostic callers from emitting empty signed fields.
+    for name, value in (("x-mirasim-session", session_id),
+                        ("x-mirasim-agent", agent),
+                        ("x-mirasim-device", device_id)):
+        if value:
+            envelope.append((name, value))
     if account_id:
         envelope.append(("x-mirasim-account", account_id))
-    envelope.append(("x-mirasim-client", client_version))
+    if client_version:
+        envelope.append(("x-mirasim-client", client_version))
     if locale:
         envelope.append(("x-mirasim-locale", locale))
-    envelope.append(("x-mirasim-call", call_id))
+    if call_id:
+        envelope.append(("x-mirasim-call", call_id))
     return envelope
 
 
@@ -391,6 +457,64 @@ def _wire_tail(url: str, body: bytes = b"") -> list[tuple[str, str]]:
         tail.append(("content-length", str(len(body))))
     tail.extend((("Host", _authority(url)), ("Connection", "keep-alive")))
     return tail
+
+
+def _seal_model_headers(
+        headers: Sequence[tuple[str, str]], method: str, path: str,
+        settings: Settings) -> list[tuple[str, str]]:
+    """Encrypt the generated relay envelope for a current Mirasim client.
+
+    Sealing is deliberately fail-closed: a malformed/rotated public key must
+    not silently turn the device, account, or signature metadata back into
+    clear headers.  ``seal_header_pairs`` only receives relay-owned fields at
+    this point; caller-provided ``x-mirasim-*`` values were removed by the
+    forwarding filters before the envelope was assigned.
+    """
+    if not getattr(settings, "mirasim_seal_metadata", True):
+        return list(headers)
+    try:
+        return seal_header_pairs(
+            headers, method, path,
+            getattr(settings, "mirasim_seal_public_key", DEFAULT_SEAL_PUBLIC_KEY),
+        )
+    except (TypeError, ValueError) as exc:
+        # Keep the diagnostic useful for operators without echoing the public
+        # key or any metadata values into a response/log payload.
+        raise RelayError(
+            "unable to seal Mirasim relay metadata", 502,
+            {"reason": str(exc)[:200]},
+        ) from exc
+
+
+SIGNED_MODEL_REQUIRED_MESSAGE = "cloud relay requires a signed device session"
+
+
+_SIGNATURE_IDENTITY_HEADERS = frozenset({
+    "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce",
+    "x-mirasim-sig", "x-mirasim-client", "x-mirasim-enc",
+})
+
+
+def _signing_metadata(
+        headers: Sequence[tuple[str, str]],
+) -> dict[str, str]:
+    """Extract the relay metadata covered by an mrs-sig-v2 signature.
+
+    The official client passes ``XZe(headers)`` to its signer: only the
+    ``x-mirasim-*`` namespace is considered, while the device/timestamp/nonce/
+    signature fields and the clear client build marker are carried separately
+    in the signing context.  Header assignment is last-value-wins, matching
+    Node's coalesced request-header object.
+    """
+    result: dict[str, str] = {}
+    for raw_name, raw_value in headers:
+        name = str(raw_name).lower()
+        value = str(raw_value)
+        if (not name.startswith(_MIRASIM_HEADER_PREFIX)
+                or name in _SIGNATURE_IDENTITY_HEADERS or not value):
+            continue
+        result[name] = value
+    return result
 
 
 def _rejection_detail(body: Any) -> str:
@@ -737,6 +861,11 @@ class Upstream:
         # session. New process/route pairs begin with the captured account-token
         # limits profile and switch once model traffic mints a ticket.
         self._device_sessions: set[tuple[str, str]] = set()
+        # The bundled Codex keeps a per-process cookie store and replays the
+        # Cloudflare cookies the relay host sets (``__cflb``, ``_cfuvid``,
+        # ``__cf_bm``).  One jar per (account, exit) mirrors one desktop
+        # install per account; Node's fetch on the Claude path keeps none.
+        self._cookie_jars: dict[tuple[str, str], httpx.Cookies] = {}
         self._device_signer: DeviceSigner | None = None
         # Monotonic per-alias epoch. In-flight ticket/refresh work may finish
         # after a re-login or deletion; only results from the current epoch may
@@ -770,6 +899,7 @@ class Upstream:
         async with self._clients_lock:
             client = self._clients.get(key)
             if client is None:
+                install_profile_header_order()
                 client = httpx.AsyncClient(
                     proxy=transport_url or None, trust_env=False,
                     verify=tls_context(),
@@ -799,11 +929,10 @@ class Upstream:
         using ``build_request`` or ``request`` would merge the client's Accept,
         User-Agent, and Accept-Encoding values before the transport sees them.
 
-        The sequence is the HTTPX request-model order. Its HTTP/1.1 serializer
-        (h11) emits Host first as recommended by RFC 7230, while preserving the
-        relative order of the remaining fields. Golden comparisons therefore
-        validate profile construction, not a claim of byte-identical wire/TLS
-        fingerprinting.
+        The sequence is also the wire order: ``mirofish.wire`` replaces h11's
+        Host-first writer so ``Host`` and ``Connection`` go out last, where the
+        official clients (and every capture-derived golden profile) put them.
+        TLS remains OpenSSL's; see ``tls_context``.
         """
         request = httpx.Request(
             method,
@@ -884,6 +1013,13 @@ class Upstream:
             legacy = (alias,) if alias else ()
             self._device_signer = DeviceSigner(
                 self.store, self.settings.mirasim_client_version, legacy)
+        else:
+            # Settings are mutable in the test harness and in long-lived
+            # deployments that rotate the upstream client profile without
+            # restarting the process.  The signer is installation-wide, but
+            # its version marker is per active protocol profile.
+            self._device_signer.set_client_version(
+                self.settings.mirasim_client_version)
         return self._device_signer
 
     def ensure_device_identity(self, legacy_alias: str = "") -> str:
@@ -897,6 +1033,15 @@ class Upstream:
         if clear_device:
             self._device_sessions = {
                 key for key in self._device_sessions if key[0] != alias}
+            for key in [key for key in self._cookie_jars if key[0] == alias]:
+                del self._cookie_jars[key]
+
+    def _cookie_jar(self, alias: str, proxy_url: Optional[str]) -> httpx.Cookies:
+        key = self._ticket_key(alias, proxy_url)
+        jar = self._cookie_jars.get(key)
+        if jar is None:
+            jar = self._cookie_jars[key] = httpx.Cookies()
+        return jar
 
     def credentials_changed(self, alias: str) -> None:
         """Invalidate account-bound authorization after login credentials change."""
@@ -988,6 +1133,7 @@ class Upstream:
         # may bind a short-lived device session to its source exit.
         stale = {key for mapping in (
             self._ticket_cache, self._ticket_retry_after, self._ticket_failures,
+            self._signing_unsupported_until,
         ) for key in mapping if key[0] == alias}
         for key in stale:
             self._ticket_cache.pop(key, None)
@@ -1008,6 +1154,7 @@ class Upstream:
             self._ticket_cache.pop(key, None)
             self._ticket_retry_after.pop(key, None)
             self._ticket_failures.pop(key, None)
+            self._signing_unsupported_until.pop(key, None)
 
     async def refresh_access(self, alias: str, stale_access: str,
                              proxy_url: Optional[str] = None) -> str:
@@ -1092,7 +1239,10 @@ class Upstream:
         signer = self._signer(alias)
         body = _json_bytes({"publicKey": signer.public_key,
                             "deviceId": signer.device_id})
-        signature = signer.headers("POST", DEVICE_SESSION_PATH, body)
+        # The account access token authenticates the mint request and is part
+        # of the v2 signature context (only its SHA-256 digest is signed).
+        signature = signer.headers(
+            "POST", DEVICE_SESSION_PATH, body, credential=access, metadata={})
         url = self.settings.relay_base + DEVICE_SESSION_PATH
         headers = [
             ("content-type", "application/json"),
@@ -1101,10 +1251,11 @@ class Upstream:
             ("x-mirasim-ts", signature["x-mirasim-ts"]),
             ("x-mirasim-nonce", signature["x-mirasim-nonce"]),
             ("x-mirasim-sig", signature["x-mirasim-sig"]),
-            ("x-mirasim-client", signature["x-mirasim-client"]),
-            ("accept-encoding", "identity"),
-            *_wire_tail(url, body),
         ]
+        if signature.get("x-mirasim-client"):
+            headers.append(("x-mirasim-client", signature["x-mirasim-client"]))
+        headers.append(("accept-encoding", "identity"))
+        headers.extend(_wire_tail(url, body))
         try:
             response = await self.send_explicit(
                 "POST", url, headers, body, proxy_url,
@@ -1208,10 +1359,34 @@ class Upstream:
                 return ticket.value
 
     async def _relay_credential(
-            self, alias: str, proxy_url: Optional[str]) -> _RelayCredential:
+            self, alias: str, proxy_url: Optional[str], *,
+            require_signed: bool = False) -> _RelayCredential:
+        """Resolve the credential for one relay request.
+
+        Control-plane calls may use the account bearer while a device session
+        is being established.  A current-client model call is different: the
+        upstream binds model traffic to a short-lived device ticket and
+        rejects a plain account token.  More importantly, silently sending the
+        account token here would turn a cloud-relay outage into an unexpected
+        charge against the user's own account.  Legacy profiles retain the
+        historical plain-token fallback explicitly by selecting a pre-v2
+        ``mirasim_client_version``.
+        """
         ticket = await self._device_ticket(alias, proxy_url)
         if ticket:
             return _RelayCredential(ticket, "ticket", True)
+        if require_signed and uses_v2(self.settings.mirasim_client_version):
+            key = self._ticket_key(alias, proxy_url)
+            retry_after = max(
+                self._signing_unsupported_until.get(key, 0.0),
+                self._ticket_retry_after.get(key, 0.0),
+            )
+            detail: dict[str, Any] = {"kind": "device_session_required"}
+            if retry_after > time.monotonic():
+                # A relative duration is useful to callers but does not reveal
+                # any credential or upstream response detail.
+                detail["retry_after"] = max(1, int(retry_after - time.monotonic()))
+            raise RelayError(SIGNED_MODEL_REQUIRED_MESSAGE, 503, detail)
         access, _ = self.store.credentials(alias)
         return _RelayCredential(access, "account", False)
 
@@ -1227,21 +1402,22 @@ class Upstream:
                                      agent: str = "claude",
                                      account_id: str = "",
     ) -> httpx.Response:
-        credential = await self._relay_credential(alias, proxy_url)
-        # Credentials and signature metadata always win over caller-derived
-        # headers. The signature covers the canonical pathname only; the
-        # product preserves ?beta=true on the URL but excludes it here.
-        signature = (self._signer(alias).headers(method, path, body)
-                     if credential.signed else None)
+        model_request = _is_model_request_path(path)
+        # Explicit usage probes are intentionally allowed to use the account
+        # token: they are the zero-cost compatibility profile used while a
+        # route is pre-warming its device session.  Real model traffic on the
+        # current protocol is fail-closed when minting is unavailable.
+        require_signed = model_request and not probe
+        credential = await self._relay_credential(
+            alias, proxy_url, require_signed=require_signed)
         url = self.settings.relay_base + (url_path or path)
-        if signature is not None and httpx.URL(url).path != path:
+        if credential.signed and httpx.URL(url).path != path:
             # A relay base carrying its own path prefix would make the signed
             # pathname disagree with the one upstream actually receives, and
             # every request would fail verification for a non-obvious reason.
             raise RelayError(
                 "relay base must not add a URL path prefix", 500,
                 {"signed_path": path})
-        model_request = path in (MESSAGES_PATH, COUNT_TOKENS_PATH, *CODEX_PATHS)
         if model_request:
             # ``extra_headers`` is caller-derived, so every relay-owned field is
             # assigned rather than appended: the desktop mutates an already
@@ -1262,12 +1438,30 @@ class Upstream:
                     self.settings.mirasim_client_version,
                     self.settings.mirasim_locale, probe):
                 _set_ordered_header(headers, name, value)
+            # The v2 signature covers the final relay metadata (before its
+            # device/timestamp/nonce/signature fields are assigned).  Build the
+            # envelope first so x-mirasim-session/agent/account/locale/call are
+            # bound to the signature exactly as on the desktop client.
+            signature = (self._signer(alias).headers(
+                method, path, body, credential=credential.value,
+                metadata=_signing_metadata(headers))
+                         if credential.signed else None)
             if signature is not None:
                 # Signing overwrites device/client in place, preserving each
                 # metadata field's official header position.
                 for name in ("x-mirasim-device", "x-mirasim-client",
                              "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig"):
-                    _set_ordered_header(headers, name, signature[name])
+                    value = signature.get(name)
+                    if value:
+                        _set_ordered_header(headers, name, value)
+            # Starting with the 0.0.272 client, only the build marker remains
+            # visible.  The complete relay envelope (including the signing
+            # fields, when present) is sealed with the route's public key and
+            # bound to this canonical pathname.  Explicit usage probes retain
+            # their deliberately lean clear profile.
+            if (not probe and credential.signed
+                    and uses_v2(self.settings.mirasim_client_version)):
+                headers = _seal_model_headers(headers, method, path, self.settings)
             headers.extend(_wire_tail(url, body))
         else:
             headers: list[tuple[str, str]] = []
@@ -1275,9 +1469,17 @@ class Upstream:
                 headers.append(("content-type", "application/json"))
             if path == LIMITS_PATH:
                 headers.append(("x-mirasim-probe", "usage"))
-            headers.extend((
-                ("Authorization", "Bearer " + credential.value),
-            ))
+            # The desktop's usage probe reuses its Node request object, whose
+            # ``Authorization`` key is capitalized; every other signed control
+            # call in the 0.0.272 capture (``/v1/models``, ``/v1/model-roster``)
+            # spells the field in lower case.
+            headers.append((
+                "Authorization" if path == LIMITS_PATH else "authorization",
+                "Bearer " + credential.value))
+            signature = (self._signer(alias).headers(
+                method, path, body, credential=credential.value,
+                metadata=_signing_metadata(headers))
+                         if credential.signed else None)
             if signature is not None:
                 headers.extend((
                     ("x-mirasim-device", signature["x-mirasim-device"]),
@@ -1474,13 +1676,24 @@ class Upstream:
             raise RelayError("unsupported codex endpoint", 404)
         url_path = path + ("?" + query_string if query_string else "")
         relay_session = session_id or str(uuid.uuid4())
-        extra_headers = forwarded_codex_headers(request_headers)
+        jar = self._cookie_jar(alias, proxy_url)
         for attempt in range(2):
+            extra_headers = forwarded_codex_headers(
+                request_headers, self.settings.codex_user_agent)
+            # Replay this account's Cloudflare cookies exactly where the bundled
+            # Codex's cookie store puts them: after user-agent, before the
+            # credential.  A caller's own cookie never survives (see
+            # forwarded_codex_headers); only what this route was served counts.
+            cookie = _cookie_header(jar, self.settings.relay_base + url_path)
+            if cookie:
+                _place_before_authorization(extra_headers, "cookie", cookie)
             response = await self._signed_relay_response(
                 alias, "POST", path, body, proxy_url,
                 stream=True, url_path=url_path, extra_headers=extra_headers,
                 session_id=relay_session, call_id=str(uuid.uuid4()),
                 agent="codex", account_id=account_id)
+            if getattr(response, "_request", None) is not None:
+                jar.extract_cookies(response)
             if response.status_code == 401 and attempt == 0:
                 await self._retry_relay_401(alias, proxy_url, response)
                 continue

@@ -27,12 +27,35 @@ export interface AccountLimits {
   fetched_epoch: number;
 }
 
+/** Normalized subscription profile from upstream /auth/me + /auth/referral. */
+export interface AccountProfile {
+  name?: string | null;
+  roles?: string[];
+  plan_expires_epoch?: number | null;
+  next_plan?: string | null;
+}
+
+/** Raw upstream /auth/referral body: progress toward the next plan tier. */
+export interface ReferralInfo {
+  code?: string | null;
+  redeemed?: number;
+  threshold?: number;
+  remaining?: number;
+  reached?: boolean;
+  max_redemptions?: number;
+  current_plan?: string | null;
+  plan_expires_at?: string | null;
+  next_plan?: string | null;
+}
+
 export interface Account {
   alias: string;
   email: string;
   user_id?: string;
   plan?: string | null;
   tenant?: string | null;
+  profile?: AccountProfile;
+  referral?: ReferralInfo;
   quota: { "7d_utilization"?: string | null; "7d_reset_epoch"?: string | null };
   last_usage: { input_tokens?: number; output_tokens?: number };
   last_model?: string | null;

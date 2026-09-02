@@ -27,7 +27,9 @@ sidecar 与 init 容器。
     docker compose exec mirofish cat /data/proxy.key
 
 在 WebUI 中输入密钥后即可：配置代理订阅、添加账号（发送邮箱验证码 → 输入验证码 → 完成登录）、
-查看每个账号绑定的节点、plan / 配额利用率、**用量额度卡片**（来自上游 `/v1/limits` 的
+查看每个账号绑定的节点、套餐资料（套餐层级徽章、到期日与剩余天数、持有人姓名；悬停徽章可见
+用户 ID、租户、邀请升级进度与各窗口预算，数据来自上游 `/auth/me` 与 `/auth/referral`，
+登录与「刷新」时读取，后台扫描每天自动补新）、配额利用率、**用量额度卡片**（来自上游 `/v1/limits` 的
 5 小时 / 7 天 / 30 天窗口：已用百分比、匀速线平均参照、超前 / 落后、剩余额度、重置倒计时；
 不消耗额度）、近 24 小时用量图表、流式测试调用模型、删除本地账号。WebUI 支持浅色 / 深色主题，
 并内置可开关的 Miku 二次元皮肤（默认开启，顶栏可切回标准皮肤）：皮肤本体是纯配色，
@@ -44,19 +46,34 @@ sidecar 与 init 容器。
 - SQLite `/data/accounts.sqlite3` 只保存元数据（邮箱、plan、租户、用量日志）；
 - 丢失主密钥将无法解密已有账号凭证，需要重新登录。
 
-模型 relay 还要求设备签名：0.0.228 客户端在整个安装范围内持久化一个 Ed25519 密钥，
-并按「账号 × 出口」申请约 15 分钟的 device ticket，再为每个请求生成 `mrs-sig-v1` 签名。
+模型 relay 还要求设备签名：0.0.272 客户端在整个安装范围内持久化一个 Ed25519 密钥，
+并按「账号 × 出口」申请约 15 分钟的 device ticket，再为每个请求生成 `mrs-sig-v2` 签名（覆盖
+method、pathname、时间戳、nonce、设备 ID、客户端版本，以及凭证、relay 元数据与请求体的摘要）。
 私钥与账号 token 一样只进入加密凭证存储，不写入 SQLite 或日志。旧版按账号保存的设备密钥会
-自动迁移一个到安装级槽位。当前默认客户端标识为抓包确认的 `0.0.228`。ticket 会提前 120 秒
-刷新；申请端点返回 404/501 时缓存 15 分钟“不支持签名”，其他失败按 1–30 秒退避。没有 ticket
-时严格改用账号 token 且不发送伪签名，后续自动恢复。
+自动迁移一个到安装级槽位。当前默认客户端标识为抓包确认的 `0.0.272`。ticket 会提前 120 秒
+刷新；申请端点返回 404/501 时缓存 15 分钟“不支持签名”，其他失败按 1–30 秒退避。0.0.272 的
+模型请求没有 ticket 时直接返回 503（`device_session_required`，处于退避期时附带 `retry_after` 秒数），不会改用
+账号 token——那会把中转故障变成对用户自有账号的意外扣费；只有把
+`MIROFISH_MIRASIM_CLIENT_VERSION` 固定在 0.0.272 以下时才保留旧的账号 token 降级（不发送伪签名）。
+ticket 恢复后自动继续。
+
+0.0.272 的模型请求还会把 relay 自己的 `x-mirasim-*` 元数据（明文保留的
+`x-mirasim-client` 除外）封装到 `x-mirasim-enc`。封装使用临时 X25519 + HKDF-SHA256
+(`mrs-seal-v1`) + ChaCha20-Poly1305，并把上游 pathname 与 HTTP method 放进 AAD；因此
+session、账号、设备和签名字段不会在网络上明文出现。默认公钥内置于 relay，也可用
+`MIROFISH_MIRASIM_SEAL_PUBLIC_KEY` 或 `MIRASIM_SEAL_PUBKEY` 覆盖。封装失败会停止该请求，
+不会降级为明文；与旧的自托管端点联调时可显式设置 `MIROFISH_MIRASIM_SEAL_METADATA=0`。
 
 Anthropic 请求会保留 `?beta=true` 与白名单内的 Claude SDK 特征头；Codex 的 `/v1/responses`
 和 `/backend-api/codex/responses` 都映射到上游 `/v1/responses`，`/v1/alpha/search` 与
 `/backend-api/codex/alpha/search` 映射到上游 `/v1/alpha/search`；两组路径各自用自己的上游
 pathname 签名，保留查询串但签名只包含 pathname。
 压缩的 Codex 请求体先有界解压，再以最终精确字节计算长度、哈希和签名。调用方的
-`Authorization` / `X-Api-Key` 绝不会转发给上游。模型流量默认发往
+`Authorization` / `X-Api-Key` 绝不会转发给上游。Codex 请求发出时与官方桌面端内置 Codex 的抓包
+一致：`user-agent` 改写为 `MIROFISH_CODEX_USER_AGENT`（默认为抓包值），`originator` 固定为
+`mirasim`，不转发 `openai-beta` 与 `accept-encoding`，调用方 cookie 丢弃，改为回传 relay 自己
+按「账号 × 出口」收到的 Cloudflare cookie。所有请求头的顺序与大小写按抓包写到线上（`Host`、
+`Connection` 在最后；签名的 `/v1/models` 用小写 `authorization`）。模型流量默认发往
 官方客户端当前使用的 `https://relay.mirasim.ai`；旧的 `mirasim-relay.mirofish.ai` 分发可能仍返回
 模型目录；当前观察到它可能对同一 Claude 请求返回 `no upstream available for model`。
 
@@ -226,7 +243,8 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
 - compose 当前把 `8787` 绑定到 `0.0.0.0`（公网可达）。任何能访问该端口的人只需本地代理密钥即可调用；
   公网部署强烈建议在前面加 TLS 与额外鉴权（反向代理 / Cloudflare Access）。改回仅本机：把 ports 设为
   `127.0.0.1:8787:8787`。
-- Mirofish 没有精确余额接口；WebUI 显示 plan、用量日志与 relay 返回的 7 天配额利用率。
+- Mirofish 没有精确余额接口；WebUI 显示套餐层级与到期时间、用量日志与 relay 返回的
+  7 天配额利用率。
 - `/v1/models` 和模型请求会先申请设备 ticket；如果升级上游协议，可通过
   `MIROFISH_RELAY_BASE` 覆盖默认 relay 地址，通过
   `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识，通过
@@ -239,9 +257,9 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   避免出现 `lang: python` 与 `runtime: node` 并存这种任何真实客户端都不会发出的组合；
   只有 `anthropic-version` 和 `anthropic-beta` 这两个会改变请求语义的选项保留调用方的值。
   `MIROFISH_CLAUDE_CLI_USER_AGENT` 可覆盖 User-Agent。
-- 设备与机器字段遵循 0.0.228 的安装级边界，不按账号虚构。非 CLI 调用方统一补全为抓包中的
+- 设备与机器字段遵循 0.0.272 的安装级边界，不按账号虚构。非 CLI 调用方统一补全为抓包中的
   `arm64 / MacOS` Claude CLI 组合；真实 `claude-cli/...` 调用方的 arch / os 原样保留。
-  `x-mirasim-device` 始终是公钥派生的 22 字符安装 ID，签名与无签名降级发出的是同一个值；
+  `x-mirasim-device` 始终是公钥派生的 22 字符安装 ID，签名与（旧版标识下的）无签名降级发出的是同一个值；
   降级路径不会改用形状不同的替代标识，否则单看这个字段就能区分两条路径。
 - 仿真范围只到请求头与请求体。TLS ClientHello 出自 OpenSSL，官方客户端是 Electron 的
   BoringSSL：cipher 列表、扩展顺序与 GREASE 由 TLS 库决定，要对齐 JA3 得换掉 TLS 栈，

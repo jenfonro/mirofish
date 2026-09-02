@@ -11,6 +11,7 @@ from mirofish.errors import RelayError
 from mirofish.proxy.mihomo import RoutedProxyURL
 from mirofish.upstream import LIMITS_PATH, MESSAGES_PATH, _DeviceTicket
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
+from tests.mirasim_protocol import relay_metadata
 
 
 def _device_response(ticket: str) -> httpx.Response:
@@ -225,14 +226,17 @@ async def test_401_retry_keeps_the_session_but_renews_the_call(state):
     first, second = (call.request for call in messages.calls)
     assert first.headers["authorization"] == "Bearer ticket-before-401"
     assert second.headers["authorization"] == "Bearer ticket-after-401"
-    assert first.headers["x-mirasim-session"] == \
-        second.headers["x-mirasim-session"] == session_id
+    first_meta, second_meta = relay_metadata(first), relay_metadata(second)
+    assert first_meta["x-mirasim-session"] == \
+        second_meta["x-mirasim-session"] == session_id
     # x-mirasim-session spans a conversation; x-mirasim-call identifies one HTTP
     # request. A credential-refresh retry is a second request and gets its own.
-    assert first.headers["x-mirasim-call"] != second.headers["x-mirasim-call"]
-    assert uuid.UUID(second.headers["x-mirasim-call"]).version == 4
-    assert first.headers["x-mirasim-nonce"] != second.headers["x-mirasim-nonce"]
-    assert first.headers["x-mirasim-sig"] != second.headers["x-mirasim-sig"]
+    assert first_meta["x-mirasim-call"] != second_meta["x-mirasim-call"]
+    assert uuid.UUID(second_meta["x-mirasim-call"]).version == 4
+    assert first_meta["x-mirasim-nonce"] != second_meta["x-mirasim-nonce"]
+    assert first_meta["x-mirasim-sig"] != second_meta["x-mirasim-sig"]
+    # Each retry is re-sealed with a fresh ephemeral key as well.
+    assert first.headers["x-mirasim-enc"] != second.headers["x-mirasim-enc"]
     assert first.content == second.content
 
 

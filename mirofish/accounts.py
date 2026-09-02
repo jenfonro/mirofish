@@ -6,8 +6,10 @@ small, billable work requests and are only run when the caller asks for them.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
+import math
 import sqlite3
 import time
 from typing import Any, Optional
@@ -28,6 +30,10 @@ SCAN_CANDIDATES = [
     "claude-sonnet-5",
     "claude-haiku-4-5",
     "claude-fable-5",
+    "claude-fable-5-1",
+    # The 0.0.272 roster replaces the short-lived 4-7 entry with 4-6. Keep
+    # both IDs so installations talking to an older relay remain usable.
+    "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-opus-4-8",
     "claude-opus-5",
@@ -35,11 +41,73 @@ SCAN_CANDIDATES = [
 ]
 
 
+def _epoch_value(value: Any) -> Optional[float]:
+    """Normalize a positive finite epoch value from JSON number/string data."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        candidate = float(value)
+    elif isinstance(value, str) and value.strip():
+        try:
+            candidate = float(value.strip())
+        except ValueError:
+            return None
+    else:
+        return None
+    return candidate if math.isfinite(candidate) and candidate > 0 else None
+
+
+def _iso_epoch(value: Any) -> Optional[float]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        parsed = datetime.datetime.fromisoformat(text)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        candidate = parsed.timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return candidate if math.isfinite(candidate) and candidate > 0 else None
+
+
+def profile_fields(me: dict[str, Any], referral: dict[str, Any]) -> dict[str, Any]:
+    """Normalize the subscription profile the upstream returns about an account.
+
+    /auth/me carries the holder's name, roles, and the plan expiry as an epoch
+    (plan_exp); /auth/referral repeats the expiry as an ISO timestamp
+    (plan_expires_at) and knows the tier a completed referral ladder upgrades
+    to. Free accounts simply have no expiry.
+    """
+    if not isinstance(me, dict):
+        me = {}
+    if not isinstance(referral, dict):
+        referral = {}
+    roles = me.get("roles")
+    next_plan = referral.get("next_plan", referral.get("nextPlan"))
+    expiry = (_epoch_value(me.get("plan_exp"))
+              or _epoch_value(me.get("plan_expires_epoch"))
+              or _iso_epoch(me.get("plan_expires_at"))
+              or _iso_epoch(referral.get("plan_expires_at")))
+    return {
+        "name": (me.get("name") if isinstance(me.get("name"), str)
+                 else me.get("display_name")
+                 if isinstance(me.get("display_name"), str) else None),
+        "roles": [role for role in roles if isinstance(role, str)]
+        if isinstance(roles, list) else [],
+        "plan_expires_epoch": expiry,
+        "next_plan": next_plan if isinstance(next_plan, str) else None,
+    }
+
+
 def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
                   proxy: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     metadata = metadata or json.loads(row["metadata_json"])
     return {"alias": row["alias"], "email": row["email"], "user_id": row["user_id"],
             "plan": row["plan"], "tenant": row["tenant"],
+            "profile": metadata.get("profile", {}),
             "referral": metadata.get("referral", {}),
             "quota": metadata.get("quota", {}),
             "last_usage": metadata.get("last_usage", {}),
@@ -105,6 +173,66 @@ class AccountService:
         self.store = store
         self.upstream = upstream
 
+    _OPTIONAL_TENANT_STATUSES = frozenset({404, 405, 501})
+
+    @staticmethod
+    def _tenant_from_payload(
+            me: Any, tenant_response: Any,
+            fallback: Optional[str] = None) -> Optional[str]:
+        """Read a tenant from either profile endpoint shape.
+
+        The 0.0.272 client no longer requests ``/me/tenant`` during startup;
+        newer auth responses may carry the value inline.  Older relay builds
+        still expose the endpoint, so retain it as an optional enrichment and
+        keep the previous value when neither response contains a tenant.
+        """
+        candidates: list[Any] = []
+        if isinstance(tenant_response, dict):
+            candidates.extend((tenant_response.get("tenant"),
+                               tenant_response.get("tenant_id"),
+                               tenant_response.get("tenantId")))
+            nested = tenant_response.get("data")
+            if isinstance(nested, dict):
+                candidates.extend((nested.get("tenant"), nested.get("tenant_id"),
+                                   nested.get("tenantId")))
+        if isinstance(me, dict):
+            candidates.extend((me.get("tenant"), me.get("tenant_id"),
+                               me.get("tenantId")))
+            nested = me.get("organization")
+            if isinstance(nested, dict):
+                candidates.extend((nested.get("tenant"), nested.get("id")))
+        for value in candidates:
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return fallback
+
+    async def _optional_tenant(
+            self, alias: str, access: str, proxy_url: Optional[str], *,
+            authenticated: bool) -> tuple[int, Any]:
+        """Fetch the legacy tenant endpoint without making it a login blocker.
+
+        A 404/405/501 means the current relay simply folded tenant data into
+        ``/auth/me`` (or does not expose tenancy at all).  Network, region and
+        authentication failures remain errors so proxy rotation and credential
+        refresh retain their existing behavior.
+        """
+        try:
+            if authenticated:
+                status, _, data = await self.upstream.authed_json(
+                    alias, "GET", self.settings.relay_base, "/me/tenant",
+                    proxy_url=proxy_url)
+            else:
+                status, _, data = await self.upstream.json(
+                    "GET", self.settings.relay_base, "/me/tenant",
+                    access=access, proxy_url=proxy_url)
+        except RelayError as exc:
+            if exc.status in self._OPTIONAL_TENANT_STATUSES:
+                return exc.status, {}
+            raise
+        if status in self._OPTIONAL_TENANT_STATUSES:
+            return status, {}
+        return status, data
+
     # --- login ------------------------------------------------------------
 
     async def start_login(self, alias: str, email: str,
@@ -141,8 +269,8 @@ class AccountService:
         # 401. A saved account can refresh its profile later without another
         # login code.
         metadata = {"user_id": None, "email": email, "plan": None, "tenant": None,
-                    "referral": {}, "tenant_response": {}, "quota": {},
-                    "last_usage": {}, "profile_pending": True,
+                    "profile": {}, "referral": {}, "tenant_response": {},
+                    "quota": {}, "last_usage": {}, "profile_pending": True,
                     "checked_at": None}
         try:
             previous_email = str(self.store.row(alias)["email"])
@@ -172,9 +300,8 @@ class AccountService:
             s2, _, referral = await self.upstream.json(
                 "GET", self.settings.auth_base, "/auth/referral",
                 access=access, proxy_url=proxy_url)
-            s3, _, tenant = await self.upstream.json(
-                "GET", self.settings.relay_base, "/me/tenant",
-                access=access, proxy_url=proxy_url)
+            s3, tenant = await self._optional_tenant(
+                alias, access, proxy_url, authenticated=False)
         except RelayError as exc:
             logger.warning(
                 "login credentials saved but profile lookup failed: account=%s status=%s",
@@ -184,10 +311,11 @@ class AccountService:
             return result
 
         profile_ok = (
-            all(200 <= status < 300 for status in (s1, s2, s3))
+            200 <= s1 < 300 and 200 <= s2 < 300
+            and (200 <= s3 < 300 or s3 in self._OPTIONAL_TENANT_STATUSES)
             and isinstance(me, dict)
             and isinstance(referral, dict)
-            and isinstance(tenant, dict)
+            and (isinstance(tenant, dict) or s3 in self._OPTIONAL_TENANT_STATUSES)
         )
         if not profile_ok:
             logger.warning(
@@ -200,10 +328,11 @@ class AccountService:
         metadata.update({
             "user_id": me.get("id"),
             "email": me.get("email", email),
-            "plan": referral.get("current_plan"),
-            "tenant": tenant.get("tenant"),
+            "plan": referral.get("current_plan") or me.get("plan"),
+            "tenant": self._tenant_from_payload(me, tenant),
+            "profile": profile_fields(me, referral),
             "referral": referral,
-            "tenant_response": tenant,
+            "tenant_response": tenant if isinstance(tenant, dict) else {},
             "profile_pending": False,
             "checked_at": utc_now(),
         })
@@ -222,22 +351,32 @@ class AccountService:
             raise RelayError("account identity check failed", status, me)
         ref_status, _, referral = await self.upstream.authed_json(
             alias, "GET", base, "/auth/referral", proxy_url=proxy_url)
-        ten_status, _, tenant = await self.upstream.authed_json(
-            alias, "GET", self.settings.relay_base, "/me/tenant", proxy_url=proxy_url)
+        access, _ = self.store.credentials(alias)
+        ten_status, tenant = await self._optional_tenant(
+            alias, access, proxy_url, authenticated=True)
         if ref_status < 200 or ref_status >= 300:
             raise RelayError("account referral check failed", ref_status, referral)
-        if ten_status < 200 or ten_status >= 300:
+        if (ten_status < 200 or ten_status >= 300) \
+                and ten_status not in self._OPTIONAL_TENANT_STATUSES:
             raise RelayError("account tenant check failed", ten_status, tenant)
         if not isinstance(me, dict) or not isinstance(referral, dict) \
-                or not isinstance(tenant, dict):
+                or (not isinstance(tenant, dict)
+                    and ten_status not in self._OPTIONAL_TENANT_STATUSES):
             raise RelayError("account status response is malformed", 502)
-        old = json.loads(row["metadata_json"])
-        metadata = {"user_id": me.get("id"), "email": me.get("email", row["email"]),
-                    "plan": referral.get("current_plan"), "tenant": tenant.get("tenant"),
-                    "referral": referral, "tenant_response": tenant,
-                    "quota": old.get("quota", {}), "last_usage": old.get("last_usage", {}),
-                    "last_model": old.get("last_model"), "checked_at": utc_now()}
-        self.store.update_metadata(alias, metadata)
+        # Merge instead of rebuilding: a status refresh must not wipe fields it
+        # does not produce (cached limits, the panel's disabled switch, usage).
+        old_metadata = json.loads(row["metadata_json"])
+        old_tenant = row["tenant"]
+        tenant_value = self._tenant_from_payload(me, tenant, old_tenant)
+        tenant_snapshot = (tenant if isinstance(tenant, dict)
+                           else old_metadata.get("tenant_response", {}))
+        metadata = self.store.merge_metadata(alias, {
+            "user_id": me.get("id"), "email": me.get("email", row["email"]),
+            "plan": referral.get("current_plan") or me.get("plan"),
+            "tenant": tenant_value,
+            "profile": profile_fields(me, referral),
+            "referral": referral, "tenant_response": tenant_snapshot,
+            "profile_pending": False, "checked_at": utc_now()})
         if probe:
             # Keep the legacy query flag/CLI option, but use the upstream's
             # supported zero-cost availability source instead of a synthetic

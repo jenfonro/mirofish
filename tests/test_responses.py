@@ -1,16 +1,15 @@
-import base64
 import gzip
-import hashlib
 import json
 import uuid
 from typing import Any
 
 import httpx
 import respx
-from cryptography.hazmat.primitives import serialization
 
-from mirofish.upstream import RESPONSES_PATH
+from mirofish.config import DEFAULT_CODEX_USER_AGENT
+from mirofish.upstream import RESPONSES_PATH, SIGNED_MODEL_REQUIRED_MESSAGE
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
+from tests.mirasim_protocol import relay_metadata, verify_signature
 
 
 def _device_session(result: httpx.Response | None = None):
@@ -21,20 +20,7 @@ def _device_session(result: httpx.Response | None = None):
 
 def _verify_signature(state, request: httpx.Request,
                       path: str = RESPONSES_PATH) -> None:
-    canonical = "\n".join((
-        "mrs-sig-v1",
-        "POST",
-        path,
-        request.headers["x-mirasim-ts"],
-        request.headers["x-mirasim-nonce"],
-        hashlib.sha256(request.content).hexdigest(),
-    )).encode("utf-8")
-    signature_text = request.headers["x-mirasim-sig"]
-    signature = base64.urlsafe_b64decode(
-        signature_text + "=" * (-len(signature_text) % 4))
-    public = serialization.load_der_public_key(base64.b64decode(
-        state.upstream._signer("work").public_key))
-    public.verify(signature, canonical)
+    verify_signature(state, request, path)
 
 
 @respx.mock
@@ -95,11 +81,15 @@ async def test_codex_compressed_body_is_decompressed_then_signed_verbatim(
     assert "codex-caller-secret" not in request.headers.values()
     assert request.headers["content-length"] == str(len(raw))
     assert request.headers["content-type"] == "application/json; charset=utf-8"
-    assert request.headers["openai-beta"] == "responses=experimental"
-    assert request.headers["x-mirasim-agent"] == "codex"
-    assert request.headers["x-mirasim-account"] == "u-work"
+    # Fields the desktop's bundled Codex never sends are not relayed either.
+    assert "openai-beta" not in request.headers
+    assert "accept-encoding" not in request.headers
+    assert request.headers["user-agent"] == DEFAULT_CODEX_USER_AGENT
+    metadata = relay_metadata(request)
+    assert metadata["x-mirasim-agent"] == "codex"
+    assert metadata["x-mirasim-account"] == "u-work"
     assert request.headers["originator"] == "mirasim"
-    assert uuid.UUID(request.headers["x-mirasim-session"]).version == 4
+    assert uuid.UUID(metadata["x-mirasim-session"]).version == 4
     assert "content-encoding" not in request.headers
     assert "content-digest" not in request.headers
     assert "x-forwarded-for" not in request.headers
@@ -109,7 +99,9 @@ async def test_codex_compressed_body_is_decompressed_then_signed_verbatim(
     assert "cookie" not in request.headers
     for name in ("x-mirasim-probe", "x-mirasim-collect", "x-mirasim-repo"):
         assert name not in request.headers
+        assert name not in metadata
     assert "caller-spoof" not in request.headers.values()
+    assert "caller-spoof" not in metadata.values()
     assert "caller-originator" not in request.headers.values()
     _verify_signature(state, request)
 
@@ -188,7 +180,7 @@ async def test_alpha_search_relays_under_both_local_paths(
     for call in route.calls:
         request = call.request
         assert request.content == raw
-        assert request.headers["x-mirasim-agent"] == "codex"
+        assert relay_metadata(request)["x-mirasim-agent"] == "codex"
         assert request.headers["authorization"] == "Bearer device-ticket"
     # Signed over its own pathname, not /v1/responses.
     _verify_signature(state, route.calls.last.request, path="/v1/alpha/search")
@@ -256,8 +248,37 @@ async def test_responses_unsupported_model_422_is_not_a_signature_error(
 
 
 @respx.mock
+async def test_device_session_unsupported_fails_closed_for_current_client(
+        client, state, auth_headers):
+    """A 0.0.272 model call never falls back to the plain account token.
+
+    The upstream binds model traffic to a device ticket; sending the account
+    bearer instead would silently bill the user's own account during a relay
+    outage.  The request fails with 503 and nothing reaches the model route.
+    """
+    add_account(state, "work")
+    device = _device_session(httpx.Response(
+        404, json={"error": {"type": "not_found"}}))
+    route = respx.post(RELAY_BASE + RESPONSES_PATH).mock(
+        return_value=httpx.Response(200, json={"id": "response"}))
+    raw = b'{"model":"gpt-5.6-codex","input":"hi"}'
+
+    first = await client.post("/v1/responses", headers=auth_headers, content=raw)
+    second = await client.post("/v1/responses", headers=auth_headers, content=raw)
+
+    assert first.status_code == second.status_code == 503
+    assert SIGNED_MODEL_REQUIRED_MESSAGE in first.text
+    assert "device_session_required" in first.text
+    # The unsupported route is remembered; the mint is not retried per request.
+    assert len(device.calls) == 1
+    assert len(route.calls) == 0
+
+
+@respx.mock
 async def test_device_session_unsupported_falls_back_to_unsigned_account_token(
         client, state, auth_headers):
+    # The historical plain-token fallback exists only for pre-v2 profiles.
+    state.settings.mirasim_client_version = "0.0.228"
     add_account(state, "work")
     device = _device_session(httpx.Response(
         404, json={"error": {"type": "not_found"}}))
@@ -270,21 +291,24 @@ async def test_device_session_unsupported_falls_back_to_unsigned_account_token(
 
     assert first.status_code == second.status_code == 200
     assert len(device.calls) == 1
+    assert len(route.calls) == 2
     for call in route.calls:
         request = call.request
         assert request.headers["authorization"] == "Bearer access-work"
         assert request.headers["x-mirasim-client"] == "0.0.228"
         # Unsigned fallback still carries the real installation device id, not a
-        # differently shaped stand-in.
+        # differently shaped stand-in.  Legacy profiles are never sealed.
         assert request.headers["x-mirasim-device"] == \
             state.upstream._signer("work").device_id
-        for name in ("x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig"):
+        for name in ("x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig",
+                     "x-mirasim-enc"):
             assert name not in request.headers
 
 
 @respx.mock
 async def test_unsigned_fallback_refreshes_account_token_on_401(
         client, state, auth_headers):
+    state.settings.mirasim_client_version = "0.0.228"
     add_account(state, "work")
     _device_session(httpx.Response(
         404, json={"error": {"type": "not_found"}}))
@@ -362,3 +386,46 @@ async def test_invalid_or_oversized_compression_is_rejected_before_forwarding(
     assert malformed.status_code == 400
     assert unsupported.status_code == 415
     assert oversized.status_code == 413
+
+
+@respx.mock
+async def test_cloudflare_cookies_are_replayed_per_account_and_exit_only(
+        client, state, auth_headers):
+    """The bundled Codex keeps one cookie store per install.  The relay keeps
+    one per (account, exit): another account never inherits the jar, and the
+    Claude path (Node fetch, no store) never sends cookies at all."""
+    add_account(state, "work")
+    add_account(state, "other")
+    _device_session()
+    responses = respx.post(RELAY_BASE + RESPONSES_PATH).mock(side_effect=[
+        httpx.Response(200, json={"id": "r1"}, headers=[
+            ("set-cookie", "__cflb=lb; Path=/; Secure; HttpOnly")]),
+        httpx.Response(200, json={"id": "r2"}),
+        httpx.Response(200, json={"id": "r3"}),
+    ])
+    messages = respx.post(RELAY_BASE + "/v1/messages").mock(side_effect=[
+        httpx.Response(200, json={"content": [], "usage": {}}, headers=[
+            ("set-cookie", "__cflb=lb; Path=/; Secure; HttpOnly")]),
+        httpx.Response(200, json={"content": [], "usage": {}}),
+    ])
+    raw = b'{"model":"gpt-5.6-codex","input":"hi"}'
+    pinned = {**auth_headers, "X-Mirofish-Account": "work"}
+
+    await client.post("/v1/responses", headers=pinned, content=raw)
+    await client.post("/v1/responses", headers=pinned, content=raw)
+    await client.post("/v1/responses", content=raw,
+                      headers={**auth_headers, "X-Mirofish-Account": "other"})
+    for _ in range(2):
+        await client.post("/v1/messages", headers=pinned, json={
+            "model": "claude-haiku-4-5", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]})
+
+    first, second, other = (call.request for call in responses.calls)
+    assert "cookie" not in first.headers
+    assert second.headers["cookie"] == "__cflb=lb"
+    assert "cookie" not in other.headers
+    assert all("cookie" not in call.request.headers for call in messages.calls)
+
+    # Re-login drops the jar with the rest of the account's route state.
+    state.upstream.credentials_changed("work")
+    assert not any(key[0] == "work" for key in state.upstream._cookie_jars)

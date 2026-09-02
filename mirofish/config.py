@@ -10,6 +10,8 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 
+from .seal import DEFAULT_SEAL_PUBLIC_KEY
+
 
 def _env_float(name: str, default: float, minimum: float | None = None) -> float:
     try:
@@ -27,13 +29,35 @@ def _env_int(name: str, default: int, minimum: int | None = None) -> int:
     return max(minimum, value) if minimum is not None else value
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    """Read a forgiving boolean environment value.
+
+    Empty/unrecognised values retain the safe configured default instead of
+    accidentally disabling relay metadata protection because of a typo.
+    """
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return default
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
 DEFAULT_DATA_DIR = pathlib.Path.home() / ".config" / "mirofish-relay"
 
 # Captured from an official client's /v1/messages request.  Callers that are
 # not themselves a Claude CLI get this identity synthesized so the relay sees a
 # coherent SDK fingerprint instead of a partial one.  Bump alongside
 # ``mirasim_client_version`` when a newer client build is observed.
-DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.241 (external, mirasim)"
+DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.252 (external, mirasim)"
+DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.272"
+# The desktop's bundled Codex binary identifies itself as the product, not as
+# ``codex_cli_rs``; this is the exact string from the 0.0.272 capture.
+DEFAULT_CODEX_USER_AGENT = (
+    "mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
 
 
 @dataclass
@@ -42,7 +66,14 @@ class Settings:
     relay_base: str = ""
     anthropic_version: str = "2023-06-01"
     claude_cli_user_agent: str = DEFAULT_CLAUDE_CLI_USER_AGENT
-    mirasim_client_version: str = "0.0.228"
+    codex_user_agent: str = DEFAULT_CODEX_USER_AGENT
+    mirasim_client_version: str = DEFAULT_MIRASIM_CLIENT_VERSION
+    # The 0.0.272 relay wraps all generated x-mirasim metadata (except the
+    # visible client build marker) in an authenticated encrypted envelope.
+    # Keep both the key and the switch configurable for staged upstream key
+    # rotation and private relay deployments.
+    mirasim_seal_public_key: str = DEFAULT_SEAL_PUBLIC_KEY
+    mirasim_seal_metadata: bool = True
     mirasim_locale: str = "zh-HK"
     keychain_service: str = "open-reverselab.mirofish-relay"
     default_model: str = "gpt-5.6-luna"
@@ -93,9 +124,24 @@ class Settings:
                     "MIROFISH_CLAUDE_CLI_USER_AGENT",
                     DEFAULT_CLAUDE_CLI_USER_AGENT).strip()
                 or DEFAULT_CLAUDE_CLI_USER_AGENT),
+            codex_user_agent=(
+                os.environ.get(
+                    "MIROFISH_CODEX_USER_AGENT", DEFAULT_CODEX_USER_AGENT).strip()
+                or DEFAULT_CODEX_USER_AGENT),
             mirasim_client_version=(
-                os.environ.get("MIROFISH_MIRASIM_CLIENT_VERSION", "0.0.228").strip()
-                or "0.0.228"),
+                os.environ.get("MIROFISH_MIRASIM_CLIENT_VERSION",
+                               DEFAULT_MIRASIM_CLIENT_VERSION).strip()
+                or DEFAULT_MIRASIM_CLIENT_VERSION),
+            mirasim_seal_public_key=(
+                next((os.environ[name].strip() for name in (
+                    "MIROFISH_MIRASIM_SEAL_PUBLIC_KEY",
+                    "MIROFISH_MIRASIM_SEAL_PUBKEY",
+                    # Match the official client's documented override name so
+                    # an existing deployment can share its environment file.
+                    "MIRASIM_SEAL_PUBKEY",
+                ) if os.environ.get(name, "").strip()), DEFAULT_SEAL_PUBLIC_KEY)),
+            mirasim_seal_metadata=_env_bool(
+                "MIROFISH_MIRASIM_SEAL_METADATA", True),
             mirasim_locale=(
                 os.environ.get("MIROFISH_MIRASIM_LOCALE", "zh-HK").strip()
                 or "zh-HK"),

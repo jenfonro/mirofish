@@ -24,13 +24,15 @@ OFFICIAL_FIXTURE_NAMES = {
     "limits_initial_official.json",
     "limits_signed_official.json",
     "messages_beta_official.json",
+    "models_official.json",
+    "codex_responses_official.json",
 }
-#: Golden profiles with no capture behind them. The desktop's Codex MITM was
-#: read statically, so these record what this relay emits; the ``_official``
-#: suffix is reserved for shapes observed on the wire.
-RELAY_FIXTURE_NAMES = {
-    "codex_responses_relay.json",
-}
+#: The 0.0.272 capture's Codex identity: the desktop's bundled Codex names the
+#: product, not ``codex_cli_rs``, and carries one conversation id in three
+#: header slots.
+CODEX_USER_AGENT = (
+    "mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
+CODEX_CONVERSATION = "c10482cc-6726-48fc-a4e8-965da883d620"
 
 
 def _b64url(value: bytes) -> str:
@@ -88,7 +90,7 @@ def _headers(session: str, authorization: str = "Bearer ticket-secret"):
     return [
         ("accept", "application/json"),
         ("content-type", "application/json"),
-        ("user-agent", "claude-cli/2.1.241 (external, mirasim)"),
+        ("user-agent", "claude-cli/2.1.252 (external, mirasim)"),
         ("x-claude-code-session-id", session),
         ("x-stainless-arch", "arm64"),
         ("x-stainless-lang", "js"),
@@ -104,16 +106,92 @@ def _headers(session: str, authorization: str = "Bearer ticket-secret"):
         ("x-app", "cli"),
         ("accept-encoding", "gzip, deflate, br, zstd"),
         ("authorization", authorization),
-        ("x-mirasim-session", session),
-        ("x-mirasim-agent", "claude"),
-        ("x-mirasim-device", _b64url(b"d" * 16)[:22]),
-        ("x-mirasim-client", "0.0.228"),
-        ("x-mirasim-locale", "zh-HK"),
-        ("x-mirasim-call", str(uuid.uuid4())),
-        ("x-mirasim-ts", "1787560634123"),
-        ("x-mirasim-nonce", _b64url(b"n" * 12)),
-        ("x-mirasim-sig", _b64url(b"s" * 64)),
+        ("x-mirasim-client", "0.0.272"),
+        # ephemeral X25519 key + nonce + ciphertext/tag of a small envelope.
+        ("x-mirasim-enc", _b64url(b"e" * 32 + b"n" * 12 + b"c" * 180)),
         ("content-length", str(len(_body()))),
+        ("Host", "relay.mirasim.ai"),
+        ("Connection", "keep-alive"),
+    ]
+
+
+def codex_body(secret: str = "codex prompt text must disappear") -> bytes:
+    """A Responses body with the captured turn shape: 12 top-level keys, a
+    leading ``additional_tools`` developer item, and 14 typed messages."""
+    def message(role, kind, count=1):
+        return {"type": "message", "role": role,
+                "content": [{"type": kind, "text": secret} for _ in range(count)]}
+
+    turns = [
+        {"type": "additional_tools", "role": "developer", "tools": [secret]},
+        message("developer", "input_text"),
+        message("user", "input_text"),
+        message("user", "input_text"),
+        message("assistant", "output_text"),
+        message("user", "input_text"),
+        message("user", "input_text"),
+        message("user", "input_text"),
+        message("user", "input_text"),
+        message("assistant", "output_text"),
+        message("user", "input_text"),
+        message("user", "input_text"),
+        message("developer", "input_text", 4),
+        message("user", "input_text", 2),
+        message("user", "input_text"),
+    ]
+    return json.dumps({
+        "model": "gpt-5.6-sol",
+        "input": turns,
+        "tool_choice": "auto",
+        "parallel_tool_calls": False,
+        "reasoning": {"effort": "xhigh", "context": "all_turns"},
+        "store": False,
+        "stream": True,
+        "include": ["reasoning.encrypted_content"],
+        "service_tier": "priority",
+        "prompt_cache_key": CODEX_CONVERSATION,
+        "text": {"verbosity": "low"},
+        "client_metadata": {"cwd": secret},
+    }, separators=(",", ":")).encode()
+
+
+def codex_caller_headers(
+        conversation: str = CODEX_CONVERSATION,
+        authorization: str = "Bearer codex-caller-secret",
+        user_agent: str = "codex_cli_rs/0.150.1 (Mac OS 26.6.2; arm64) Apple_Terminal",
+        originator: str = "codex_cli_rs") -> list[tuple[str, str]]:
+    """What a Codex CLI hands the relay, in the order the binary emits it."""
+    return [
+        ("x-codex-beta-features", "remote_compaction_v2"),
+        ("x-codex-window-id", conversation + ":0"),
+        ("x-codex-turn-metadata", json.dumps({
+            "installation_id": "install-secret", "session_id": conversation})),
+        ("x-openai-internal-codex-responses-lite", "true"),
+        ("x-codex-routing-hint", "model=gpt-5.6-sol;tier=priority"),
+        ("x-client-request-id", conversation),
+        ("session-id", conversation),
+        ("thread-id", conversation),
+        ("accept", "text/event-stream"),
+        ("content-type", "application/json"),
+        ("chatgpt-account-id", "0b0b0b0b-1c1c-4d2d-8e3e-4f4f4f4f4f4f"),
+        ("originator", originator),
+        ("user-agent", user_agent),
+        ("authorization", authorization),
+    ]
+
+
+def _codex_wire_headers(body: bytes) -> list[tuple[str, str]]:
+    """The same request as the relay puts it on the wire."""
+    caller = codex_caller_headers(
+        authorization="Bearer synthetic-device-ticket",
+        user_agent=CODEX_USER_AGENT, originator="mirasim")
+    return [
+        *caller[:-1],
+        ("cookie", "__cflb=synthetic-lb; _cfuvid=synthetic-uvid; __cf_bm=synthetic-bm"),
+        caller[-1],
+        ("x-mirasim-client", "0.0.272"),
+        ("x-mirasim-enc", _b64url(b"e" * 32 + b"n" * 12 + b"c" * 300)),
+        ("content-length", str(len(body))),
         ("Host", "relay.mirasim.ai"),
         ("Connection", "keep-alive"),
     ]
@@ -135,7 +213,7 @@ def _representative_profile(name: str):
             "GET", "https://cdn-assets.mirasim.ai/mirasim/releases/latest.json",
             "HTTP/1.1", [
                 ("Accept", "application/json"),
-                ("User-Agent", "mirasim-desktop/0.0.228"),
+                ("User-Agent", "mirasim-desktop/0.0.272"),
                 ("accept-encoding", "identity"),
                 ("Host", "cdn-assets.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -145,7 +223,7 @@ def _representative_profile(name: str):
             "GET", "https://relay.mirasim.ai/v1/limits", "HTTP/1.1", [
                 ("x-mirasim-probe", "usage"),
                 ("Authorization", "Bearer synthetic-access-token"),
-                ("x-mirasim-client", "0.0.228"),
+                ("x-mirasim-client", "0.0.272"),
                 ("accept-encoding", "identity"),
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -160,7 +238,7 @@ def _representative_profile(name: str):
                 ("content-type", "application/json"),
                 ("authorization", "Bearer synthetic-access-token"),
                 *_signed_identity_headers(),
-                ("x-mirasim-client", "0.0.228"),
+                ("x-mirasim-client", "0.0.272"),
                 ("accept-encoding", "identity"),
                 ("content-length", str(len(body))),
                 ("Host", "relay.mirasim.ai"),
@@ -203,13 +281,28 @@ def _representative_profile(name: str):
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),
             ], body)
+    if name == "models_official.json":
+        return request_profile(
+            "GET", "https://relay.mirasim.ai/v1/models", "HTTP/1.1", [
+                ("authorization", "Bearer synthetic-device-ticket"),
+                *_signed_identity_headers(),
+                ("x-mirasim-client", "0.0.272"),
+                ("accept-encoding", "identity"),
+                ("Host", "relay.mirasim.ai"),
+                ("Connection", "keep-alive"),
+            ])
+    if name == "codex_responses_official.json":
+        body = codex_body()
+        return request_profile(
+            "POST", "https://relay.mirasim.ai/v1/responses", "HTTP/1.1",
+            _codex_wire_headers(body), body)
     if name == "limits_signed_official.json":
         return request_profile(
             "GET", "https://relay.mirasim.ai/v1/limits", "HTTP/1.1", [
                 ("x-mirasim-probe", "usage"),
                 ("Authorization", "Bearer synthetic-device-ticket"),
                 *_signed_identity_headers(),
-                ("x-mirasim-client", "0.0.228"),
+                ("x-mirasim-client", "0.0.272"),
                 ("accept-encoding", "identity"),
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -220,8 +313,7 @@ def _representative_profile(name: str):
 def test_all_observed_official_profiles_are_sanitized_and_valid():
     fixture_paths = sorted(FIXTURE_DIR.glob("*.json"))
 
-    assert {path.name for path in fixture_paths} == \
-        OFFICIAL_FIXTURE_NAMES | RELAY_FIXTURE_NAMES
+    assert {path.name for path in fixture_paths} == OFFICIAL_FIXTURE_NAMES
     for path in fixture_paths:
         profile = json.loads(path.read_text())
         validate_profile(profile)
@@ -240,6 +332,11 @@ def test_sanitized_golden_profiles_match_representative_request_shapes(name):
     assert "synthetic-private-event" not in encoded
     assert "synthetic-public-key" not in encoded
     assert "synthetic-device-id" not in encoded
+    assert "synthetic-lb" not in encoded
+    assert "install-secret" not in encoded
+    assert "codex prompt text" not in encoded
+    assert "0b0b0b0b" not in encoded
+    assert CODEX_CONVERSATION not in encoded
 
 
 def test_sanitized_golden_profile_matches_same_request_shape():
@@ -307,6 +404,8 @@ def test_url_authority_userinfo_never_enters_profile():
     ("x-mirasim-sig", _b64url(b"too-short")),
     ("x-mirasim-call", str(uuid.uuid1())),
     ("x-mirasim-device", "not-a-device"),
+    ("x-codex-window-id", "not-a-window"),
+    ("x-codex-window-id", str(uuid.uuid4())),
 ])
 def test_dynamic_identity_fields_are_typed(name, value):
     with pytest.raises(UnsafeProfile):

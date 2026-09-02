@@ -322,7 +322,32 @@ async def test_the_sweep_skips_disabled_accounts(state, monkeypatch):
 
     monkeypatch.setattr(state, "with_proxy", fake_with_proxy)
     await state.refresh_all_limits()
-    assert probed == ["on"]
+    assert set(probed) == {"on"}
+
+
+async def test_the_sweep_refreshes_missing_or_dated_profiles(state, monkeypatch):
+    """The panel reads plan tier and expiry from the stored profile. It only
+    changes on billing-period timescales, so the sweep re-reads it when it is
+    missing (rows saved before profiles existed) or a day old — not every
+    pass."""
+    add_account(state, "fresh")
+    state.store.merge_metadata("fresh", {
+        "profile": {"name": "n", "plan_expires_epoch": time.time() + 7 * 86400}})
+    add_account(state, "stale")  # saved without any profile
+    calls = []
+
+    async def fake_with_proxy(alias, op):
+        calls.append(alias)
+
+    monkeypatch.setattr(state, "with_proxy", fake_with_proxy)
+    await state.refresh_all_limits()
+    assert calls.count("fresh") == 1  # limits probe only
+    assert calls.count("stale") == 2  # limits probe + profile refresh
+
+    calls.clear()
+    state.store.merge_metadata("fresh", {"checked_at": "2020-01-01T00:00:00+00:00"})
+    await state.refresh_all_limits()
+    assert calls.count("fresh") == 2  # a dated profile is re-read too
 
 
 async def test_the_sweep_runs_in_every_mode(state, monkeypatch):

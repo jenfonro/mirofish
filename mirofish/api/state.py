@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import hashlib
 import json
 import logging
@@ -74,6 +75,10 @@ URGENCY_HORIZON_HOURS = 48.0
 # no model tokens, and stale numbers only ever cost one extra attempt, since
 # the upstream 429 plus failover is what actually stops a request.
 LIMITS_REFRESH_SECONDS = 300.0
+# Subscription profiles (plan tier, expiry, holder name) change on the scale
+# of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
+# an account whose stored profile is missing (pre-upgrade rows) or a day old.
+PROFILE_REFRESH_SECONDS = 86400.0
 
 
 def _is_uuid(value: str) -> bool:
@@ -143,11 +148,44 @@ class AppState:
                     alias, lambda url: self.accounts.fetch_limits(alias, proxy_url=url))
             except Exception as exc:  # noqa: BLE001 - one account must not stop the sweep
                 logger.debug("limits refresh failed: account=%s %s", alias, exc)
+            if not self._profile_stale(alias):
+                return
+            try:
+                await self.with_proxy(
+                    alias, lambda url: self.accounts.fetch_status(alias, proxy_url=url))
+            except Exception as exc:  # noqa: BLE001 - profile is best-effort here
+                logger.debug("profile refresh failed: account=%s %s", alias, exc)
 
         aliases = [alias for alias in self.store.aliases()
                    if not self.account_disabled(alias)]
         if aliases:
             await asyncio.gather(*(one(alias) for alias in aliases))
+
+    def _profile_stale(self, alias: str) -> bool:
+        """True when the stored subscription profile should be re-read: never
+        fetched (accounts saved before profiles existed), or older than
+        PROFILE_REFRESH_SECONDS — plan renewals and expiries move the panel's
+        tier/expiry display, but only on billing-period timescales."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except Exception:  # noqa: BLE001 - racing a concurrent account removal
+            return False
+        if not metadata.get("profile"):
+            return True
+        checked = metadata.get("checked_at")
+        if not isinstance(checked, str) or not checked:
+            return True
+        try:
+            text = checked.strip()
+            if text.endswith(("Z", "z")):
+                text = text[:-1] + "+00:00"
+            parsed = datetime.datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            checked_epoch = parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return True
+        return time.time() - checked_epoch >= PROFILE_REFRESH_SECONDS
 
     def start_limits_refresh(self) -> None:
         """Keep the cached windows warm: both schedule modes read them to keep

@@ -1,12 +1,11 @@
 """Capture-derived HTTPX request profiles for upstream endpoints.
 
-The assertions run before h11 serialization. h11 moves Host to the first wire
-field per RFC 7230; the tests intentionally cover profile construction and
-default-header isolation, not a byte-identical socket/TLS fingerprint.
+The assertions run on the HTTPX request model, which is also the wire order:
+``mirofish.wire`` makes h11 emit fields as held instead of Host-first
+(``tests/test_wire_profile.py`` measures that on a loopback socket).  TLS
+remains the one layer that is not byte-identical; see ``upstream.tls_context``.
 """
 
-import base64
-import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -14,12 +13,14 @@ from pathlib import Path
 import httpx
 import pytest
 import respx
-from cryptography.hazmat.primitives import serialization
 
+from mirofish.config import DEFAULT_CODEX_USER_AGENT
 from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, LIMITS_PATH
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
+from tests.mirasim_protocol import relay_metadata, verify_signature
 from tests.test_request_profile import _body as captured_messages_body
 from tests.test_request_profile import _headers as captured_messages_headers
+from tests.test_request_profile import codex_body, codex_caller_headers
 from tools.request_profile import compare_profiles, request_profile
 
 
@@ -62,19 +63,24 @@ def _mock_device_session(ticket: str = "device-ticket"):
 
 
 def _verify_signature(state, request: httpx.Request, path: str) -> None:
-    signed = "\n".join((
-        "mrs-sig-v1",
-        request.method,
-        path,
-        request.headers["x-mirasim-ts"],
-        request.headers["x-mirasim-nonce"],
-        hashlib.sha256(request.content).hexdigest(),
-    )).encode("utf-8")
-    encoded = request.headers["x-mirasim-sig"]
-    signature = base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4))
-    public = serialization.load_der_public_key(
-        base64.b64decode(state.upstream._signer("work").public_key))
-    public.verify(signature, signed)
+    """The mrs-sig-v2 record binds the bearer the request carries, the
+    relay metadata (sealed or clear) and the exact body to this pathname."""
+    verify_signature(state, request, path)
+
+
+#: Field order inside a sealed model envelope: the desktop assigns these onto
+#: its request-header object in this sequence, then signs, then seals every
+#: ``x-mirasim-*`` field except the clear client marker.
+SEALED_MODEL_FIELDS = [
+    "x-mirasim-session",
+    "x-mirasim-agent",
+    "x-mirasim-device",
+    "x-mirasim-locale",
+    "x-mirasim-call",
+    "x-mirasim-ts",
+    "x-mirasim-nonce",
+    "x-mirasim-sig",
+]
 
 
 @pytest.mark.parametrize(("path", "authorization_name"), [
@@ -204,10 +210,41 @@ async def test_signed_limits_profile_is_probe_first_and_lean(state):
     _verify_signature(state, request, LIMITS_PATH)
 
 
+@respx.mock
+async def test_signed_models_profile_matches_the_capture(state):
+    """``/v1/models`` is the one signed GET in the 0.0.272 capture: lower-case
+    ``authorization`` and no probe marker, unlike the usage probe."""
+    add_account(state, "work")
+    state.settings.relay_base = OFFICIAL_RELAY_BASE
+    respx.post(OFFICIAL_RELAY_BASE + "/v1/device/session").mock(
+        return_value=httpx.Response(
+            200, json={"ticket": "device-ticket", "expiresIn": 900}))
+    route = respx.get(OFFICIAL_RELAY_BASE + "/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": []}))
+
+    await state.upstream.signed_json("work", "GET", "/v1/models")
+
+    request = route.calls.last.request
+    assert _header_names(request) == [
+        "authorization",
+        "x-mirasim-device",
+        "x-mirasim-ts",
+        "x-mirasim-nonce",
+        "x-mirasim-sig",
+        "x-mirasim-client",
+        "accept-encoding",
+        "Host",
+        "Connection",
+    ]
+    assert "x-mirasim-probe" not in request.headers
+    _assert_matches_golden(request, "models_official.json")
+    _verify_signature(state, request, "/v1/models")
+
+
 CLAUDE_HEADERS = [
     ("accept", "application/json"),
     ("content-type", "application/json"),
-    ("user-agent", "claude-cli/2.1.241 (external, mirasim)"),
+    ("user-agent", "claude-cli/2.1.252 (external, mirasim)"),
     ("x-claude-code-session-id", "0f20cf48-c292-42e9-a99e-994511307deb"),
     ("x-stainless-arch", "arm64"),
     ("x-stainless-lang", "js"),
@@ -252,15 +289,8 @@ async def test_messages_preserve_sdk_order_and_isolate_caller_credentials(state)
     assert _header_names(request) == [
         *[name for name, _ in CLAUDE_HEADERS],
         "authorization",
-        "x-mirasim-session",
-        "x-mirasim-agent",
-        "x-mirasim-device",
         "x-mirasim-client",
-        "x-mirasim-locale",
-        "x-mirasim-call",
-        "x-mirasim-ts",
-        "x-mirasim-nonce",
-        "x-mirasim-sig",
+        "x-mirasim-enc",
         "content-length",
         "Host",
         "Connection",
@@ -268,6 +298,13 @@ async def test_messages_preserve_sdk_order_and_isolate_caller_credentials(state)
     assert request.content == json.dumps(
         payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert request.headers["authorization"] == "Bearer device-ticket"
+    assert request.headers["x-mirasim-client"] == "0.0.272"
+    sealed = relay_metadata(request, "/v1/messages")
+    assert [name for name in sealed if name != "x-mirasim-client"] == \
+        SEALED_MODEL_FIELDS
+    assert sealed["x-mirasim-session"] == "0f20cf48-c292-42e9-a99e-994511307deb"
+    assert sealed["x-mirasim-agent"] == "claude"
+    assert sealed["x-mirasim-locale"] == "zh-HK"
     assert request.headers["anthropic-beta"] == (
         "claude-code-20250219,effort-2025-11-24")
     assert "x-api-key" not in request.headers
@@ -299,15 +336,8 @@ async def test_generic_messages_get_the_captured_cli_identity(state):
     assert _header_names(request) == [
         *[name for name, _ in CLAUDE_HEADERS],
         "authorization",
-        "x-mirasim-session",
-        "x-mirasim-agent",
-        "x-mirasim-device",
         "x-mirasim-client",
-        "x-mirasim-locale",
-        "x-mirasim-call",
-        "x-mirasim-ts",
-        "x-mirasim-nonce",
-        "x-mirasim-sig",
+        "x-mirasim-enc",
         "content-length",
         "Host",
         "Connection",
@@ -320,7 +350,7 @@ async def test_generic_messages_get_the_captured_cli_identity(state):
     # The official client pairs these two exactly; keeping them equal preserves
     # that correlation without inventing a second session identifier.
     assert request.headers["x-claude-code-session-id"] == "mirofish-session"
-    assert request.headers["x-mirasim-session"] == "mirofish-session"
+    assert relay_metadata(request)["x-mirasim-session"] == "mirofish-session"
     # Only the routing beta is synthesized. context-1m, interleaved-thinking and
     # friends change request semantics and stay opt-in.
     assert request.headers["anthropic-beta"] == "claude-code-20250219"
@@ -362,7 +392,7 @@ async def test_caller_sdk_fingerprint_cannot_survive_beside_the_cli_identity(sta
     assert request.headers["accept-encoding"] == "gzip, deflate, br, zstd"
     assert request.headers["anthropic-dangerous-direct-browser-access"] == "true"
     assert request.headers["x-app"] == "cli"
-    assert request.headers["user-agent"] == "claude-cli/2.1.241 (external, mirasim)"
+    assert request.headers["user-agent"] == "claude-cli/2.1.252 (external, mirasim)"
     assert request.headers["x-stainless-lang"] == "js"
     assert request.headers["x-stainless-runtime"] == "node"
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
@@ -406,7 +436,7 @@ async def test_openai_caller_reaches_upstream_as_the_official_client(
     # the relay no longer names itself in an upstream header.
     session = request.headers["x-claude-code-session-id"]
     assert uuid.UUID(session).version == 4
-    assert request.headers["x-mirasim-session"] == session
+    assert relay_metadata(request)["x-mirasim-session"] == session
 
 
 @respx.mock
@@ -470,10 +500,13 @@ async def test_installation_fingerprint_fields_stay_shared(state):
     first = await _messages_request(state, "work")
     second = await _messages_request(state, "main")
 
-    for header in (*_MACHINE_SLOT, "x-mirasim-locale", "x-mirasim-client",
+    for header in (*_MACHINE_SLOT, "x-mirasim-client",
                    "x-stainless-runtime-version", "x-stainless-package-version"):
         assert first.headers[header] == second.headers[header]
-    assert first.headers["x-mirasim-locale"] == state.settings.mirasim_locale
+    first_fields, second_fields = relay_metadata(first), relay_metadata(second)
+    assert first_fields["x-mirasim-locale"] == second_fields["x-mirasim-locale"]
+    assert first_fields["x-mirasim-device"] == second_fields["x-mirasim-device"]
+    assert first_fields["x-mirasim-locale"] == state.settings.mirasim_locale
 
 
 @respx.mock
@@ -489,7 +522,7 @@ async def test_a_real_cli_caller_keeps_its_own_machine_headers(state):
     assert _machine_slot(request) == ("x64", "Linux")
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
     assert request.headers["x-stainless-package-version"] == "0.112.1"
-    assert request.headers["user-agent"] == "claude-cli/2.1.241 (external, mirasim)"
+    assert request.headers["user-agent"] == "claude-cli/2.1.252 (external, mirasim)"
 
 
 @respx.mock
@@ -551,62 +584,63 @@ async def test_runtime_requests_bridge_to_capture_derived_golden_profiles(state)
         messages.calls.last.request, "messages_beta_official.json")
 
 
-CODEX_CLI_HEADERS: tuple[tuple[str, str], ...] = (
-    ("host", "chatgpt.com"),
-    ("accept", "text/event-stream"),
-    ("content-type", "application/json"),
-    ("authorization", "Bearer codex-caller-token"),
-    ("openai-beta", "responses=experimental"),
-    ("originator", "codex_cli_rs"),
-    ("session_id", "6b2a0f9c-2c2b-4a08-a9d4-6b0a1f4c8f11"),
-    ("user-agent", "codex_cli_rs/0.104.0 (Mac OS 26.0.0; arm64) Apple_Terminal"),
-    ("accept-encoding", "gzip"),
-)
+#: Cloudflare cookies as relay.mirasim.ai served them in the 0.0.272 capture.
+#: ``__cf_bm`` arrives scoped to chatgpt.com (the upstream relays ChatGPT's
+#: own Set-Cookie), which a conforming cookie store must not replay here.
+CLOUDFLARE_SET_COOKIES = [
+    ("set-cookie", "__oailb=lb-secret; Path=/; Max-Age=3600; HttpOnly; Secure; SameSite=Lax"),
+    ("set-cookie", "__cf_bm=bm-secret; HttpOnly; SameSite=None; Secure; Path=/; Domain=chatgpt.com"),
+    ("set-cookie", "__cflb=cflb-secret; HttpOnly; SameSite=None; Secure; Path=/"),
+]
 
 
 @respx.mock
-async def test_codex_relay_request_matches_the_transparent_proxy_profile(state):
-    """Pin the Codex envelope's field set and order.
-
-    Unlike the other fixtures this one has no packet capture behind it: the
-    desktop's Codex MITM was read statically, so the golden file records what
-    this relay emits and is named ``_relay`` rather than ``_official``. It still
-    catches the thing that breaks accidentally — a field appearing, vanishing or
-    moving.
-    """
+async def test_codex_relay_request_matches_the_official_capture(state):
+    """A Codex CLI's request leaves the relay as the desktop's bundled Codex
+    would have sent it: product user-agent and originator, the CLI's own
+    protocol headers in their order, the route's Cloudflare cookies ahead of
+    the credential, no ``openai-beta`` / ``accept-encoding``."""
     alias = "capture"
     add_account(state, alias)
     state.settings.relay_base = OFFICIAL_RELAY_BASE
     respx.post(OFFICIAL_RELAY_BASE + "/v1/device/session").mock(
         return_value=httpx.Response(
             200, json={"ticket": "device-ticket", "expiresIn": 900}))
-    route = respx.post(OFFICIAL_RELAY_BASE + "/v1/responses").mock(
-        return_value=httpx.Response(200, json={"id": "response"}))
-    body = json.dumps({
-        "model": "gpt-5.6-codex",
-        "instructions": "You are Codex.",
-        "input": [{
-            "type": "message", "role": "user",
-            "content": [{"type": "input_text", "text": "private prompt"}],
-        }],
-        "tools": [{"type": "function", "name": "shell"}],
-        "tool_choice": "auto",
-        "parallel_tool_calls": False,
-        "store": False,
-        "stream": True,
-        "prompt_cache_key": "6b2a0f9c-2c2b-4a08-a9d4-6b0a1f4c8f11",
-    }, separators=(",", ":")).encode()
+    route = respx.post(OFFICIAL_RELAY_BASE + "/v1/responses").mock(side_effect=[
+        httpx.Response(200, json={"id": "first"}, headers=CLOUDFLARE_SET_COOKIES),
+        httpx.Response(200, json={"id": "second"}),
+    ])
+    body = codex_body()
+    caller = httpx.Headers([
+        *codex_caller_headers(),
+        # A stand-alone CLI adds these; the bundled Codex does not.
+        ("openai-beta", "responses=experimental"),
+        ("accept-encoding", "gzip"),
+        ("cookie", "caller-jar=must-not-forward"),
+    ])
 
-    response = await state.upstream.stream_responses(
-        alias, body, request_headers=httpx.Headers(CODEX_CLI_HEADERS),
-        session_id="0f20cf48-c292-42e9-a99e-994511307deb",
-        account_id="u-capture")
-    await response.aclose()
+    for _ in range(2):
+        response = await state.upstream.stream_responses(
+            alias, body, request_headers=caller,
+            session_id="0f20cf48-c292-42e9-a99e-994511307deb",
+            account_id="u-capture")
+        await response.aclose()
 
-    request = route.calls.last.request
-    _assert_matches_golden(request, "codex_responses_relay.json")
-    # The caller's own agent string is relayed untouched: this path impersonates
-    # nothing but the transport, and the profile redacts the value it carries.
-    assert request.headers["user-agent"] == dict(CODEX_CLI_HEADERS)["user-agent"]
-    assert request.headers["originator"] == "mirasim"
-    assert "codex-caller-token" not in request.headers.values()
+    first, second = (call.request for call in route.calls)
+    # The first request of a fresh install carries no cookie yet; everything
+    # else already matches the capture.
+    assert "cookie" not in first.headers
+    _assert_matches_golden(second, "codex_responses_official.json")
+    assert second.headers["user-agent"] == DEFAULT_CODEX_USER_AGENT
+    assert second.headers["originator"] == "mirasim"
+    assert second.headers["authorization"] == "Bearer device-ticket"
+    for name in ("openai-beta", "accept-encoding"):
+        assert name not in second.headers
+    cookie = second.headers["cookie"]
+    assert "__cflb=cflb-secret" in cookie
+    assert "__oailb=lb-secret" in cookie
+    assert "__cf_bm" not in cookie  # scoped to chatgpt.com, not this host
+    assert "caller-jar" not in cookie
+    assert "codex-caller-secret" not in second.headers.values()
+    assert second.content == body
+    _verify_signature(state, second, "/v1/responses")

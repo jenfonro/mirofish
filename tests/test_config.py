@@ -9,7 +9,7 @@ def test_default_upstream_endpoints_match_current_official_client(monkeypatch):
 
     assert settings.auth_base == "https://auth.mirasim.ai"
     assert settings.relay_base == "https://relay.mirasim.ai"
-    assert settings.mirasim_client_version == "0.0.228"
+    assert settings.mirasim_client_version == "0.0.272"
 
 
 def test_relay_endpoint_can_be_overridden(monkeypatch):
@@ -33,14 +33,14 @@ def test_empty_default_model_uses_serviceable_fallback(monkeypatch):
 def test_claude_cli_user_agent_matches_the_capture_and_is_overridable(monkeypatch):
     monkeypatch.delenv("MIROFISH_CLAUDE_CLI_USER_AGENT", raising=False)
     assert Settings.from_env().claude_cli_user_agent == \
-        "claude-cli/2.1.241 (external, mirasim)"
+        "claude-cli/2.1.252 (external, mirasim)"
 
     monkeypatch.setenv("MIROFISH_CLAUDE_CLI_USER_AGENT", "claude-cli/9.9.9 (x)")
     assert Settings.from_env().claude_cli_user_agent == "claude-cli/9.9.9 (x)"
 
     monkeypatch.setenv("MIROFISH_CLAUDE_CLI_USER_AGENT", "  ")
     assert Settings.from_env().claude_cli_user_agent == \
-        "claude-cli/2.1.241 (external, mirasim)"
+        "claude-cli/2.1.252 (external, mirasim)"
 
 
 def test_upstream_transport_defaults_cover_observed_long_reuse(monkeypatch):
@@ -72,3 +72,15 @@ def test_transport_limits_are_configurable_and_keepalive_is_capped(monkeypatch):
     assert settings.max_keepalive_connections == 7
     assert settings.stream_read_timeout == 720.0
     assert settings.max_body_bytes == 4096
+
+
+def test_codex_user_agent_defaults_to_the_capture_and_is_overridable(monkeypatch):
+    monkeypatch.delenv("MIROFISH_CODEX_USER_AGENT", raising=False)
+    assert Settings.from_env().codex_user_agent == \
+        "mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)"
+
+    monkeypatch.setenv("MIROFISH_CODEX_USER_AGENT", " mirasim/9.9.9 (x) ")
+    assert Settings.from_env().codex_user_agent == "mirasim/9.9.9 (x)"
+
+    monkeypatch.setenv("MIROFISH_CODEX_USER_AGENT", "  ")
+    assert Settings.from_env().codex_user_agent.startswith("mirasim/0.150.1 ")

@@ -1,12 +1,11 @@
 {
   "schema": 1,
   "method": "GET",
-  "path": "/v1/limits",
+  "path": "/v1/models",
   "query": "",
   "http_version": "HTTP/1.1",
   "headers": [
-    {"name": "x-mirasim-probe", "value": "usage"},
-    {"name": "Authorization", "value": "<redacted:authorization>"},
+    {"name": "authorization", "value": "<redacted:authorization>"},
     {"name": "x-mirasim-device", "value": "<dynamic:device_id>"},
     {"name": "x-mirasim-ts", "value": "<dynamic:unix_ms>"},
     {"name": "x-mirasim-nonce", "value": "<dynamic:base64url_12b>"},

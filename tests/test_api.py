@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import hashlib
 import json
 import time
 import uuid
@@ -9,9 +8,10 @@ from types import SimpleNamespace
 import httpx
 import pytest
 import respx
-from cryptography.exceptions import InvalidSignature
+from cryptography.exceptions import InvalidSignature, InvalidTag
 from cryptography.hazmat.primitives import serialization
 
+from mirofish.accounts import profile_fields
 from mirofish.api.relay import (_MAX_USAGE_LINE_BYTES,
                                 _ManagedStreamingResponse, _UsageWatcher,
                                 _finalize_upstream_stream)
@@ -19,6 +19,8 @@ from mirofish.errors import RelayError
 from mirofish.device import DEVICE_KEY_KIND
 from mirofish.translate import MAX_SSE_EVENT_BYTES
 from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, _DeviceTicket
+from tests.mirasim_protocol import (relay_metadata, signing_payload, unseal,
+                                    verify_signature)
 
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 
@@ -53,18 +55,8 @@ def mock_device_session(ticket: str = "device-ticket"):
 
 
 def verify_relay_signature(state, request: httpx.Request, path: str) -> bytes:
-    headers = request.headers
-    body = request.content
-    signed = "\n".join((
-        "mrs-sig-v1", request.method, path, headers["x-mirasim-ts"],
-        headers["x-mirasim-nonce"], hashlib.sha256(body).hexdigest(),
-    )).encode()
-    signature = base64.urlsafe_b64decode(
-        headers["x-mirasim-sig"] + "=" * (-len(headers["x-mirasim-sig"]) % 4))
-    public = serialization.load_der_public_key(
-        base64.b64decode(state.upstream._signer("work").public_key))
-    public.verify(signature, signed)
-    return signature
+    """Open the sealed envelope and verify its ``mrs-sig-v2`` signature."""
+    return verify_signature(state, request, path)
 
 
 async def test_requires_auth(client):
@@ -286,15 +278,23 @@ async def test_messages_non_stream(client, state, auth_headers):
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
          "cache_control": {"type": "ephemeral"}},
     ]
-    assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
-    assert all(route.calls.last.request.headers.get(name) for name in (
+    upstream_request = route.calls.last.request
+    assert upstream_request.headers["authorization"] == "Bearer device-ticket"
+    # 0.0.272 profile: only the build marker and the sealed envelope travel in
+    # clear; every other relay field lives inside x-mirasim-enc.
+    assert upstream_request.headers["x-mirasim-client"] == "0.0.272"
+    assert upstream_request.headers["x-mirasim-enc"]
+    clear = {name.lower() for name in upstream_request.headers
+             if name.lower().startswith("x-mirasim-")}
+    assert clear == {"x-mirasim-client", "x-mirasim-enc"}
+    metadata = relay_metadata(upstream_request)
+    assert all(metadata.get(name) for name in (
         "x-mirasim-device", "x-mirasim-ts", "x-mirasim-nonce", "x-mirasim-sig",
         "x-mirasim-client"))
-    assert route.calls.last.request.headers["x-mirasim-client"] == "0.0.228"
-    assert route.calls.last.request.headers["x-mirasim-agent"] == "claude"
-    assert uuid.UUID(
-        route.calls.last.request.headers["x-mirasim-session"]).version == 4
-    assert "x-mirasim-probe" not in route.calls.last.request.headers
+    assert metadata["x-mirasim-agent"] == "claude"
+    assert uuid.UUID(metadata["x-mirasim-session"]).version == 4
+    assert "x-mirasim-probe" not in metadata
+    verify_relay_signature(state, upstream_request, "/v1/messages")
     assert session.calls.last.request.headers["authorization"] == "Bearer access-work"
     totals = state.store.usage_summary(1)["totals"]
     assert totals == {"requests": 1, "input_tokens": 12, "output_tokens": 4}
@@ -339,24 +339,29 @@ async def test_messages_preserves_beta_query_and_claude_fingerprint(
     assert sent.headers["x-stainless-package-version"] == "0.112.1"
     assert sent.headers["anthropic-beta"] == (
         "claude-code-20250219,mid-conversation-system-2026-04-07")
-    assert sent.headers["x-mirasim-session"] == session_id
-    assert sent.headers["x-mirasim-agent"] == "claude"
-    assert sent.headers["x-mirasim-locale"] == "zh-HK"
+    metadata = relay_metadata(sent)
+    assert metadata["x-mirasim-session"] == session_id
+    assert metadata["x-mirasim-agent"] == "claude"
+    assert metadata["x-mirasim-locale"] == "zh-HK"
     assert sent.headers["authorization"] == "Bearer device-ticket"
     assert "x-api-key" not in sent.headers
-    uuid.UUID(sent.headers["x-mirasim-call"])
-    assert "x-mirasim-probe" not in sent.headers
+    uuid.UUID(metadata["x-mirasim-call"])
+    assert "x-mirasim-probe" not in metadata
+    # The caller's spoofed session never reaches upstream, clear or sealed.
+    assert "attacker-controlled" not in sent.headers.values()
+    assert "attacker-controlled" not in metadata.values()
 
+    # Signed over the canonical pathname, not the query string.
     signature = verify_relay_signature(state, sent, "/v1/messages")
-    query_payload = "\n".join((
-        "mrs-sig-v1", "POST", "/v1/messages?beta=true",
-        sent.headers["x-mirasim-ts"], sent.headers["x-mirasim-nonce"],
-        hashlib.sha256(sent.content).hexdigest(),
-    )).encode()
     public = serialization.load_der_public_key(
         base64.b64decode(state.upstream._signer("work").public_key))
     with pytest.raises(InvalidSignature):
-        public.verify(signature, query_payload)
+        public.verify(signature, signing_payload(
+            sent, "/v1/messages?beta=true", "device-ticket", fields=metadata))
+    # The seal is bound to the same canonical pathname: opening it under the
+    # query-bearing path fails authentication.
+    with pytest.raises(InvalidTag):
+        unseal(sent.headers["x-mirasim-enc"], "POST", "/v1/messages?beta=true")
 
 
 @respx.mock
@@ -438,7 +443,7 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
     assert '"type":"text_delta","text":"Hi"' in body.replace(" ", "").replace('", "', '","') \
         or 'text_delta' in body
     assert "message_stop" in body
-    assert route.calls.last.request.headers["x-mirasim-session"] == \
+    assert relay_metadata(route.calls.last.request)["x-mirasim-session"] == \
         "0f20cf48-c292-42e9-a99e-994511307deb"
     assert route.calls.last.request.url.query == b"beta=true"
     assert json.loads(route.calls.last.request.content)["system"] == [
@@ -673,7 +678,7 @@ async def test_complete_claude_code_payload_is_forwarded_unchanged(
     assert sent.headers["anthropic-beta"] == betas
     assert sent.headers["user-agent"] == headers["user-agent"]
     assert sent.headers["x-stainless-package-version"] == "0.112.1"
-    assert sent.headers["x-mirasim-session"] == session_id
+    assert relay_metadata(sent)["x-mirasim-session"] == session_id
     assert sent.url.query == b"beta=true"
     verify_relay_signature(state, sent, "/v1/messages")
 
@@ -1019,7 +1024,8 @@ async def test_count_tokens_proxied(client, state, auth_headers):
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
     ]
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
-    assert route.calls.last.request.headers["x-mirasim-session"] == count_session
+    assert relay_metadata(route.calls.last.request)["x-mirasim-session"] == \
+        count_session
     assert route.calls.last.request.url.query == b"beta=true"
     verify_relay_signature(state, route.calls.last.request, "/v1/messages/count_tokens")
 
@@ -1141,6 +1147,53 @@ async def test_status_probe_uses_zero_cost_limits_instead_of_messages(
 
 
 @respx.mock
+async def test_status_refresh_stores_profile_and_keeps_local_fields(
+        client, state, auth_headers):
+    """The upstream knows the subscription tier, its expiry, and the holder;
+    a status refresh stores that as the normalized profile. The refresh merges
+    into metadata, so fields it does not produce — the panel's disabled
+    switch, cached limits — survive it."""
+    add_account(state, "work")
+    state.store.merge_metadata("work", {"disabled": True,
+                                        "limits": {"windows": []}})
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={
+            "id": "u-work", "email": "work@example.com", "name": "Michael Chan",
+            "roles": ["user"], "plan": "plus", "plan_exp": 1789029052}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={
+            "current_plan": "plus", "next_plan": "max", "redeemed": 3,
+            "threshold": 10, "plan_expires_at": "2026-09-10T08:30:52.119910Z"}))
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(200, json={"tenant": "external"}))
+
+    response = await client.get("/accounts/work/status", headers=auth_headers)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["plan"] == "plus"
+    assert body["profile"] == {"name": "Michael Chan", "roles": ["user"],
+                               "plan_expires_epoch": 1789029052.0,
+                               "next_plan": "max"}
+    assert body["referral"]["redeemed"] == 3
+    metadata = json.loads(state.store.row("work")["metadata_json"])
+    assert metadata["disabled"] is True
+    assert metadata["limits"] == {"windows": []}
+    assert state.store.row("work")["plan"] == "plus"
+
+
+def test_profile_fields_falls_back_to_the_referral_iso_expiry():
+    """Free-tier /auth/me bodies may omit plan_exp; the referral endpoint's
+    ISO timestamp is the fallback, and a free account simply has neither."""
+    profile = profile_fields(
+        {"name": "n", "roles": ["user"]},
+        {"plan_expires_at": "2026-09-10T08:30:52.119910Z", "next_plan": "max"})
+    assert profile["plan_expires_epoch"] == pytest.approx(1789029052.119910, abs=1)
+
+    assert profile_fields({}, {})["plan_expires_epoch"] is None
+
+
+@respx.mock
 async def test_model_scan_sends_claude_compatible_work_with_session_not_probe(
         state, monkeypatch):
     add_account(state, "work")
@@ -1159,8 +1212,9 @@ async def test_model_scan_sends_claude_compatible_work_with_session_not_probe(
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
          "cache_control": {"type": "ephemeral"}},
     ]
-    assert uuid.UUID(sent.headers["x-mirasim-session"]).version == 4
-    assert "x-mirasim-probe" not in sent.headers
+    metadata = relay_metadata(sent)
+    assert uuid.UUID(metadata["x-mirasim-session"]).version == 4
+    assert "x-mirasim-probe" not in metadata
 
 
 @respx.mock

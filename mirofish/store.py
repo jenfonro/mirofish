@@ -159,8 +159,23 @@ class Store:
                 if isinstance(incoming, dict) and isinstance(current, dict):
                     patch = {**patch, key: {**current, **incoming}}
             metadata.update(patch)
-            self.db.execute("UPDATE accounts SET metadata_json=?,updated_at=? WHERE alias=?",
-                            (json.dumps(metadata, ensure_ascii=False), utc_now(), alias))
+            # Keep mirrored columns in step with the merged metadata.  Build
+            # the mirror assignments from *patch presence*, not from
+            # ``dict.get``: an absent key must preserve the SQL column, while
+            # an explicit ``None`` is a deliberate clear (for example after a
+            # free-tier downgrade or a tenant removal).
+            mirror_columns = {"user_id": "user_id", "plan": "plan", "tenant": "tenant"}
+            assignments: list[str] = []
+            params: list[Any] = []
+            for key, column in mirror_columns.items():
+                if key in patch:
+                    assignments.append(f"{column}=?")
+                    params.append(metadata.get(key))
+            assignments.extend(("metadata_json=?", "updated_at=?"))
+            params.extend((json.dumps(metadata, ensure_ascii=False), utc_now(), alias))
+            self.db.execute(
+                f"UPDATE accounts SET {', '.join(assignments)} WHERE alias=?",
+                params)
             self.db.commit()
         return metadata
 

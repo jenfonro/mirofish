@@ -149,7 +149,14 @@ curl -N 'http://127.0.0.1:8787/v1/responses?beta=true' \
 上游路径，不会被另一条路径顶替。查询串会保留在 URL 中，但签名只使用 pathname。
 gzip / deflate / br / zstd 请求体会先按大小上限解压，随后以解压后的精确字节重算
 `Content-Length`、正文 SHA-256 与 Ed25519 签名；JSON 不会被重排。调用方的鉴权头和
-`x-mirasim-*` 不能覆盖代理生成的字段，其余 Codex 协议头按 blocklist 方式透传。
+`x-mirasim-*` 不能覆盖代理生成的字段，其余 Codex 协议头（`x-codex-*`、`session-id`、
+`thread-id`、`chatgpt-account-id` 等）按 blocklist 方式、保持原顺序透传。发出去的请求与官方桌面端
+内置 Codex 的抓包一致：`user-agent` 统一改写为 `MIROFISH_CODEX_USER_AGENT`（默认即抓包中的
+`mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)`），`originator`
+固定为 `mirasim`，独立 Codex CLI 才会带的 `openai-beta` 与 `accept-encoding` 不转发；调用方的
+cookie 一律丢弃，relay 按「账号 × 出口」维护自己的 cookie 罐，把上游（Cloudflare）下发给 relay
+域名的 `__cflb` / `_cfuvid` / `__cf_bm` 等按 RFC 6265 规则在 `authorization` 之前回传，作用域
+不匹配的 cookie（例如 `Domain=chatgpt.com`）不会回传；Claude 路径与官方 Node 客户端一样不带 cookie。
 请求体只带 `prompt`（引用已存储的 prompt）而不带 `model` 也是合法的，本地不会拦下来：
 由上游决定，拒绝原样回传。`model` 字段本身仍会校验格式。
 
@@ -178,11 +185,29 @@ SDK system 标记的第三方极简请求误报为 `no upstream available for mo
 会改变请求语义的选项保留调用方的值。上游会话标识同时用于 `x-mirasim-session` 和
 `x-claude-code-session-id`，格式为裸 v4 UUID，对同一对话保持确定性。
 
-0.0.228 客户端使用“每安装一个 Ed25519 密钥”，不会按账号伪造不同机器。非 CLI 调用方补全为
+请求头的顺序与大小写也按抓包写到线上：官方客户端把 `Host`、`Connection` 放在最后，relay 替换了
+h11 默认的 Host 前置写法（`mirofish/wire.py`），loopback 测试逐字节核对。签名的控制面 GET
+（`/v1/models`）使用小写 `authorization`，只有 `/v1/limits` 用量探测保留大写 `Authorization`。
+所有请求形态都以 `tests/fixtures/request_profiles/*_official.json` 为基准，这些文件由抓包经
+`tools/request_profile.py` 脱敏生成。relay 不会复现的整机行为只有 `/events` 遥测、更新检查和
+`/v1/model-roster` 探测。
+
+0.0.272 客户端使用“每安装一个 Ed25519 密钥”，不会按账号伪造不同机器。非 CLI 调用方补全为
 同一套抓包确认的 Claude CLI 指纹；真实 `claude-cli/...` 调用方的 arch / os 等字段保持原值。
-`x-mirasim-device` 始终是那个密钥公钥派生出的 22 字符安装 ID：签名请求与降级到账号 token 的
-请求发出同一个值，只有时间戳、nonce 与签名三个头是签名路径独有的。若降级路径改用形状不同的
-标识（例如 36 字符 UUID），单看这一个字段就能区分两条路径。
+`x-mirasim-device` 始终是那个密钥公钥派生出的 22 字符安装 ID：签名请求与（仅旧版客户端标识
+才允许的）降级到账号 token 的请求发出同一个值，只有时间戳、nonce 与签名三个字段是签名路径独有
+的。若降级路径改用形状不同的标识（例如 36 字符 UUID），单看这一个字段就能区分两条路径。签名为
+`mrs-sig-v2`：签名内容是 method、pathname、时间戳、nonce、设备 ID、客户端版本，以及 bearer
+凭证、relay 元数据和请求体三者的 SHA-256 摘要，凭证本身不会进入被签名的记录。0.0.272 的模型
+请求拿不到 device ticket 时直接返回 503（`device_session_required`），不会用账号 token 顶替。
+
+0.0.272 还会把模型请求的 relay 元数据封装为 `x-mirasim-enc`：除明文保留的
+`x-mirasim-client` 外，session / agent / device / account / locale / call 以及签名字段都不会
+以明文头发送。封装格式是临时 X25519 公钥、12 字节 nonce 与 ChaCha20-Poly1305 密文，HKDF-SHA256
+使用 `mrs-seal-v1` 作为 info，AAD 绑定 HTTP method 与上游 pathname。relay 使用内置公钥，若上游
+轮换可通过 `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY`（或官方兼容的 `MIRASIM_SEAL_PUBKEY`）覆盖；默认
+开启，无法封装时请求会 fail-closed，而不会退回明文元数据。旧中转可临时设置
+`MIROFISH_MIRASIM_SEAL_METADATA=0`。
 
 以上仿真都发生在请求头与请求体层面。TLS 层不在其中：ClientHello 由 OpenSSL 生成，官方客户端
 是 Electron 的 BoringSSL，cipher 列表、扩展顺序与 GREASE 都属于 TLS 库而非本项目，要对齐 JA3
@@ -219,7 +244,11 @@ ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是
 | `MIROFISH_DEFAULT_ACCOUNT` | 空 | 强制使用的默认账号别名 |
 | `MIROFISH_DEFAULT_MODEL` | `gpt-5.6-luna` | OpenAI 兼容请求未提供模型时使用的上游模型 ID |
 | `MIROFISH_RELAY_BASE` | `https://relay.mirasim.ai` | 官方客户端当前使用的模型 relay 地址 |
-| `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.241 (external, mirasim)` | 为非 CLI 调用方补全的官方客户端 User-Agent |
+| `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.252 (external, mirasim)` | 为非 CLI 调用方补全的官方客户端 User-Agent |
+| `MIROFISH_CODEX_USER_AGENT` | `mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)` | Codex 路径统一改写成的官方内置 Codex User-Agent |
+| `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.272` | relay 客户端版本标识 |
+| `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY` | 内置 32 字节公钥 | `x-mirasim-enc` 的 X25519 接收公钥 |
+| `MIROFISH_MIRASIM_SEAL_METADATA` | `1` | 是否封装模型请求的 relay 元数据 |
 | `MIROFISH_PROXY_SUBSCRIPTION_URL` | 空 | Mihomo 代理订阅地址 |
 | `MIROFISH_PROXY_REFRESH_SECONDS` | `600` | 代理池刷新间隔 |
 | `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点停用前的连续失败次数 |

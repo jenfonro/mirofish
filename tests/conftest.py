@@ -5,6 +5,7 @@ from mirofish.api import create_app
 from mirofish.api.state import AppState
 from mirofish.config import Settings
 from mirofish.store import utc_now
+from tests.mirasim_protocol import SEAL_PUBLIC_KEY
 
 AUTH_BASE = "https://auth.test"
 RELAY_BASE = "https://relay.test"
@@ -15,8 +16,11 @@ def settings(tmp_path, monkeypatch):
     monkeypatch.setenv("MIROFISH_MASTER_KEY", "unit-test-master-key")
     monkeypatch.delenv("MIROFISH_PROXY_SUBSCRIPTION_URL", raising=False)
     monkeypatch.delenv("MIROFISH_PROXY_SUBSCRIPTION_URL_FILE", raising=False)
+    # The relay only ever holds the upstream's public seal key; tests install
+    # their own pair so they can open ``x-mirasim-enc`` (tests/mirasim_protocol).
     return Settings(auth_base=AUTH_BASE, relay_base=RELAY_BASE,
-                    data_dir=tmp_path / "data", cred_backend="file", timeout=5.0)
+                    data_dir=tmp_path / "data", cred_backend="file", timeout=5.0,
+                    mirasim_seal_public_key=SEAL_PUBLIC_KEY)
 
 
 @pytest.fixture

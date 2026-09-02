@@ -1,0 +1,51 @@
+{
+  "schema": 1,
+  "method": "POST",
+  "path": "/v1/responses",
+  "query": "",
+  "http_version": "HTTP/1.1",
+  "headers": [
+    {"name": "x-codex-beta-features", "value": "remote_compaction_v2"},
+    {"name": "x-codex-window-id", "value": "<dynamic:window_id>"},
+    {"name": "x-codex-turn-metadata", "value": "<redacted:opaque>"},
+    {"name": "x-openai-internal-codex-responses-lite", "value": "true"},
+    {"name": "x-codex-routing-hint", "value": "<redacted:opaque>"},
+    {"name": "x-client-request-id", "value": "<dynamic:session:1>"},
+    {"name": "session-id", "value": "<dynamic:session:1>"},
+    {"name": "thread-id", "value": "<dynamic:session:1>"},
+    {"name": "accept", "value": "text/event-stream"},
+    {"name": "content-type", "value": "application/json"},
+    {"name": "chatgpt-account-id", "value": "<redacted:account>"},
+    {"name": "originator", "value": "mirasim"},
+    {"name": "user-agent", "value": "mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)"},
+    {"name": "cookie", "value": "<redacted:cookie>"},
+    {"name": "authorization", "value": "<redacted:authorization>"},
+    {"name": "x-mirasim-client", "value": "0.0.272"},
+    {"name": "x-mirasim-enc", "value": "<dynamic:sealed_metadata>"},
+    {"name": "content-length", "value": "<dynamic:content_length>"},
+    {"name": "Host", "value": "relay.mirasim.ai"},
+    {"name": "Connection", "value": "keep-alive"}
+  ],
+  "body": {
+    "kind": "json",
+    "keys": ["model", "input", "tool_choice", "parallel_tool_calls", "reasoning", "store", "stream", "include", "<other>", "prompt_cache_key", "text", "client_metadata"],
+    "types": ["string", "array", "string", "boolean", "object", "boolean", "boolean", "array", "string", "string", "object", "object"],
+    "input": [
+      {"role": "developer", "content_type": "null", "item_type": "<other>"},
+      {"role": "developer", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "assistant", "content_type": "array", "item_type": "message", "block_types": ["output_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "assistant", "content_type": "array", "item_type": "message", "block_types": ["output_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]},
+      {"role": "developer", "content_type": "array", "item_type": "message", "block_types": ["input_text", "input_text", "input_text", "input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text", "input_text"]},
+      {"role": "user", "content_type": "array", "item_type": "message", "block_types": ["input_text"]}
+    ]
+  }
+}

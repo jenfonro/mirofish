@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import binascii
 import json
 import re
 import sys
@@ -57,11 +58,17 @@ _SAFE_HEADER_EXACT_VALUES = {
     "originator": frozenset({"codex_cli_rs", "mirasim"}),
     "user-agent": frozenset({
         "claude-cli/2.1.241 (external, mirasim)",
+        "claude-cli/2.1.252 (external, mirasim)",
         "mirasim-desktop/0.0.228",
+        "mirasim-desktop/0.0.272",
+        "mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
     }),
     "x-app": frozenset({"cli"}),
+    # Codex protocol flags carried by the desktop's bundled Codex.
+    "x-codex-beta-features": frozenset({"remote_compaction_v2"}),
+    "x-openai-internal-codex-responses-lite": frozenset({"true"}),
     "x-mirasim-agent": frozenset({"claude", "codex"}),
-    "x-mirasim-client": frozenset({"0.0.228"}),
+    "x-mirasim-client": frozenset({"0.0.228", "0.0.272"}),
     "x-mirasim-locale": frozenset({"zh-HK"}),
     "x-mirasim-probe": frozenset({"usage"}),
     "x-stainless-arch": frozenset({"arm64"}),
@@ -94,7 +101,11 @@ _VERSION_TEXT = r"[0-9]{1,4}(?:\.[0-9]{1,4}){1,3}"
 _SAFE_HEADER_VALUE_PATTERNS = {
     "user-agent": re.compile(
         rf"claude-cli/{_VERSION_TEXT} \(external, mirasim\)"
-        rf"|mirasim-desktop/{_VERSION_TEXT}"),
+        rf"|mirasim-desktop/{_VERSION_TEXT}"
+        # The bundled Codex: originator/version (OS; arch) terminal/version
+        # (product; version).  Only the build numbers move between captures.
+        rf"|mirasim/{_VERSION_TEXT} \(Mac OS {_VERSION_TEXT}; (?:x86_64|arm64)\)"
+        rf" Apple_Terminal/{_VERSION_TEXT} \(mirasim; {_VERSION_TEXT}\)"),
     "x-mirasim-client": re.compile(_VERSION_TEXT),
     "x-stainless-package-version": re.compile(_VERSION_TEXT),
     "x-stainless-runtime-version": re.compile(rf"v{_VERSION_TEXT}"),
@@ -124,6 +135,7 @@ _SAFE_PATHS = {
     "/v1/messages",
     "/v1/messages/count_tokens",
     "/v1/models",
+    "/v1/model-roster",
     "/v1/responses",
 }
 _REDACTED_PATH = "/<redacted:path>"
@@ -131,6 +143,7 @@ _REDACTED_QUERY_FIELD = "<redacted:query-field>"
 _REDACTED_HEADERS = {
     "x-access-token": "token",
     "authorization": "authorization",
+    "chatgpt-account-id": "account",
     "cookie": "cookie",
     "x-auth-token": "token",
     "x-device-ticket": "ticket",
@@ -147,14 +160,22 @@ _REDACTED_HEADERS = {
 #: profile shows whether two of these headers carry the same id or different
 #: ones without recording either.  ``session_id`` is Codex's own spelling.
 _SESSION_HEADER_NAMES = frozenset({
-    "session_id", "x-claude-code-session-id", "x-mirasim-session",
+    "session_id", "session-id", "thread-id", "x-client-request-id",
+    "x-claude-code-session-id", "x-mirasim-session",
 })
 _DYNAMIC_HEADER_NAMES = frozenset({
-    "content-length", "x-mirasim-call", "x-mirasim-device", "x-mirasim-nonce",
-    "x-mirasim-sig", "x-mirasim-ts",
+    "content-length", "x-codex-window-id", "x-mirasim-call", "x-mirasim-device",
+    "x-mirasim-nonce", "x-mirasim-enc", "x-mirasim-sig", "x-mirasim-ts",
 }) | _SESSION_HEADER_NAMES
+#: Known Codex header names whose values are structured but private (turn
+#: metadata carries the installation id and working directory; the routing
+#: hint names the model tier).  The name is kept, the value never is.
+_OPAQUE_HEADER_NAMES = frozenset({"x-codex-routing-hint", "x-codex-turn-metadata"})
 _SAFE_HEADER_NAMES = (
-    _SAFE_HEADER_VALUE_NAMES | frozenset(_REDACTED_HEADERS) | _DYNAMIC_HEADER_NAMES)
+    _SAFE_HEADER_VALUE_NAMES | frozenset(_REDACTED_HEADERS) | _DYNAMIC_HEADER_NAMES
+    | _OPAQUE_HEADER_NAMES)
+_WINDOW_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}:[0-9]+")
 _REDACTED_HEADER_NAME = "<redacted:header-name>"
 
 
@@ -178,10 +199,30 @@ def _base64url_bytes(value: str, expected: int, label: str) -> bytes:
         raise UnsafeProfile(f"invalid {label}: expected unpadded base64url")
     try:
         decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
-    except (ValueError, TypeError) as exc:
+    except (ValueError, TypeError, binascii.Error) as exc:
         raise UnsafeProfile(f"invalid {label}: malformed base64url") from exc
     if len(decoded) != expected:
         raise UnsafeProfile(f"invalid {label}: expected {expected} decoded bytes")
+    return decoded
+
+
+def _sealed_metadata_bytes(value: str) -> bytes:
+    """Validate the public shape of an ``mrs-seal-v1`` envelope.
+
+    Keep this helper stdlib-only: the profile addon is intentionally usable in
+    a standalone mitmdump installation that does not import the relay package.
+    """
+    if not _BASE64URL.fullmatch(value):
+        raise UnsafeProfile("invalid x-mirasim-enc: expected unpadded base64url")
+    try:
+        decoded = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+    except (ValueError, TypeError, binascii.Error) as exc:
+        raise UnsafeProfile("invalid x-mirasim-enc: malformed sealed metadata") from exc
+    # 32-byte ephemeral key + 12-byte nonce + 16-byte AEAD tag; plaintext may
+    # be empty in a synthetic fixture but the official envelope always carries
+    # at least one metadata byte.
+    if len(decoded) < 32 + 12 + 16:
+        raise UnsafeProfile("invalid x-mirasim-enc: sealed metadata is truncated")
     return decoded
 
 
@@ -321,6 +362,10 @@ def _normalize_header_value(
     if lower == "x-mirasim-call":
         _uuid4(value, lower)
         return "<dynamic:uuid4>"
+    if lower == "x-codex-window-id":
+        if not _WINDOW_ID.fullmatch(value):
+            raise UnsafeProfile("invalid x-codex-window-id: expected <uuid4>:<index>")
+        return "<dynamic:window_id>"
     if lower == "x-mirasim-ts":
         if not _UNIX_MS.fullmatch(value):
             raise UnsafeProfile("invalid x-mirasim-ts: expected 13-digit milliseconds")
@@ -331,6 +376,12 @@ def _normalize_header_value(
     if lower == "x-mirasim-sig":
         _base64url_bytes(value, 64, lower)
         return "<dynamic:ed25519_signature>"
+    if lower == "x-mirasim-enc":
+        # The envelope contains a fresh X25519 public key, nonce, ciphertext,
+        # and Poly1305 tag. Its decoded size varies with the metadata values,
+        # so retain only the structural marker, never its random bytes.
+        _sealed_metadata_bytes(value)
+        return "<dynamic:sealed_metadata>"
     if lower == "x-mirasim-device":
         if len(value) != 22 or not _BASE64URL.fullmatch(value):
             raise UnsafeProfile("invalid x-mirasim-device: expected 22 base64url characters")
@@ -461,8 +512,10 @@ def validate_profile(profile: dict[str, Any]) -> None:
             raise UnsafeProfile(f"sensitive header was not redacted: {name}")
         exact_dynamic = {
             "content-length": "<dynamic:content_length>",
+            "x-codex-window-id": "<dynamic:window_id>",
             "x-mirasim-call": "<dynamic:uuid4>",
             "x-mirasim-device": "<dynamic:device_id>",
+            "x-mirasim-enc": "<dynamic:sealed_metadata>",
             "x-mirasim-nonce": "<dynamic:base64url_12b>",
             "x-mirasim-sig": "<dynamic:ed25519_signature>",
             "x-mirasim-ts": "<dynamic:unix_ms>",
