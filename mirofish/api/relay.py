@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from ..upstream import _claude_compatible_payload, quota_headers
 from ..validate import model_value
 from .deps import get_state, read_json_body, read_json_body_bytes, require_auth
+from .state import ACCOUNT_GENERATION_EXTENSION
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 logger = logging.getLogger("mirofish.relay")
@@ -180,7 +181,8 @@ class _ManagedStreamingResponse(StreamingResponse):
 
 async def _finalize_upstream_stream(
         stack: Any, state: Any, account: str, model: str | None,
-        observer: Any, upstream_headers: dict[str, str]) -> None:
+        observer: Any, upstream_headers: dict[str, str],
+        account_generation: str | None = None) -> None:
     finish = getattr(observer, "finish", None)
     if finish is not None:
         finish()
@@ -189,7 +191,11 @@ async def _finalize_upstream_stream(
     except Exception:  # noqa: BLE001 - cleanup continues without leaking details
         logger.warning("could not fully close upstream stream: account=%s", account)
     try:
-        state.record_usage(account, model, observer.usage, upstream_headers)
+        if account_generation is None:
+            state.record_usage(account, model, observer.usage, upstream_headers)
+        else:
+            state.record_usage(account, model, observer.usage, upstream_headers,
+                               account_generation=account_generation)
     except Exception:  # noqa: BLE001 - response cleanup must never be undone
         logger.warning("could not persist streamed usage: account=%s", account)
 
@@ -213,15 +219,19 @@ async def messages(request: Request) -> Any:
 
     if not payload.get("stream"):
         async def run(account: str):
-            return await state.with_proxy(
+            generation = state.store.account_generation(account)
+            result = await state.with_proxy(
                 account,
                 lambda proxy_url: state.upstream.messages(
                     account, payload, proxy_url, request_headers=request.headers,
                     session_id=relay_session, beta=beta, raw_body=raw_body))
-        account, (result, headers) = await state.with_account_failover(
+            return result, generation
+        account, (upstream_result, account_generation) = await state.with_account_failover(
             requested, session_hint, payload, run)
+        result, headers = upstream_result
         usage = result.get("usage", {}) if isinstance(result, dict) else {}
-        outgoing = state.record_usage(account, model, usage, headers)
+        outgoing = state.record_usage(account, model, usage, headers,
+                                      account_generation=account_generation)
         return JSONResponse(result, headers=outgoing)
 
     async def run_stream(account: str):
@@ -230,6 +240,9 @@ async def messages(request: Request) -> Any:
             session_id=relay_session, beta=beta, raw_body=raw_body)
     account, (response, stack) = await state.with_account_failover(
         requested, session_hint, payload, run_stream)
+    account_generation = response.extensions.get(ACCOUNT_GENERATION_EXTENSION)
+    if not isinstance(account_generation, str):
+        account_generation = None
     upstream_headers = {key.lower(): value for key, value in response.headers.items()}
     quota = quota_headers(upstream_headers)
     outgoing = {"X-Mirofish-Account": account}
@@ -247,7 +260,8 @@ async def messages(request: Request) -> Any:
 
     async def finalize() -> None:
         await _finalize_upstream_stream(
-            stack, state, account, model, watcher, upstream_headers)
+            stack, state, account, model, watcher, upstream_headers,
+            account_generation=account_generation)
 
     return _ManagedStreamingResponse(
         body(), finalize=finalize, media_type="text/event-stream",

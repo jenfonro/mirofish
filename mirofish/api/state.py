@@ -85,6 +85,10 @@ LIMITS_REFRESH_SECONDS = 300.0
 # of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
 # an account whose stored profile is missing (pre-upgrade rows) or a day old.
 PROFILE_REFRESH_SECONDS = 86400.0
+# httpx response extension used to carry the account generation from request
+# start to stream finalization. This keeps an in-flight old-account response
+# from being logged under a newly re-used alias.
+ACCOUNT_GENERATION_EXTENSION = "mirofish_account_generation"
 
 
 def _is_uuid(value: str) -> bool:
@@ -948,9 +952,11 @@ class AppState:
             try:
                 proxy_url = await stack.enter_async_context(
                     self.pool.route(alias, proxy))
+                account_generation = self.store.account_generation(alias)
                 response = await self.upstream.stream_messages(
                     alias, payload, proxy_url, request_headers=request_headers,
                     session_id=session_id, beta=beta, raw_body=raw_body)
+                response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
                 stack.push_async_callback(response.aclose)
                 self.pool.success(proxy)
                 return response, stack
@@ -981,10 +987,12 @@ class AppState:
             try:
                 proxy_url = await stack.enter_async_context(
                     self.pool.route(alias, proxy))
+                account_generation = self.store.account_generation(alias)
                 response = await self.upstream.stream_responses(
                     alias, body, proxy_url, request_headers=request_headers,
                     session_id=session_id, account_id=account_id,
                     query_string=query_string, path=path)
+                response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
                 stack.push_async_callback(response.aclose)
                 # Unlike the Anthropic path, stream_responses *returns* upstream
                 # rejections so the Codex caller sees them verbatim.  Clearing
@@ -1010,22 +1018,34 @@ class AppState:
     # --- usage accounting ---------------------------------------------------
 
     def record_usage(self, alias: str, model: Optional[str], usage: dict[str, Any],
-                     response_headers: dict[str, str]) -> dict[str, str]:
+                     response_headers: dict[str, str],
+                     account_generation: Optional[str] = None) -> dict[str, str]:
         """Persist usage/quota metadata and return the outgoing relay headers."""
+        current_generation: Optional[str] = None
+        try:
+            current_generation = self.store.account_generation(alias)
+        except RelayError:
+            # The stream may finish after the account has been removed. Its
+            # usage row is still retained, but it cannot update live metadata.
+            pass
+        if account_generation is None:
+            account_generation = current_generation
         # Only merge the quota values this response actually carried. A
         # headerless response (e.g. the Codex path) must not wipe the
         # utilization cached by /v1/limits probes — a None there reads as
         # "has room" and would put an exhausted account back into rotation.
         quota = {key: value for key, value in quota_headers(response_headers).items()
                  if value is not None}
-        try:
-            self.store.merge_metadata(alias, {"last_usage": usage, "quota": quota,
-                                              "last_model": model}, deep=("quota",))
-        except RelayError:
-            pass
+        if account_generation is None or account_generation == current_generation:
+            try:
+                self.store.merge_metadata(alias, {"last_usage": usage, "quota": quota,
+                                                  "last_model": model}, deep=("quota",))
+            except RelayError:
+                pass
         if usage:
             try:
-                self.store.log_usage(alias, model, usage)
+                self.store.log_usage(alias, model, usage,
+                                     account_generation=account_generation)
             except RelayError:
                 pass
         outgoing = {"X-Mirofish-Account": alias_value(alias)}

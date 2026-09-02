@@ -107,6 +107,19 @@ async function reload() {
             </span>
           </div>
           <div class="win-reset muted">{{ w.resetText }}</div>
+
+          <!-- 7d_fable is one upstream number shared by every fable model;
+               this is the local split of who spent it this window. -->
+          <div v-if="w.models.length" class="split">
+            <div v-for="m in w.models" :key="m.model" class="split-row"
+                 :title="`${m.model}：${m.requests} 次请求 · `
+                   + `输入 ${m.input_tokens.toLocaleString()} · 输出 ${m.output_tokens.toLocaleString()} · `
+                   + `缓存读 ${m.cache_read_tokens.toLocaleString()} · 缓存写 ${m.cache_write_tokens.toLocaleString()}`">
+              <span class="split-name mono">{{ m.model.replace("claude-", "") }}</span>
+              <span class="split-req muted">{{ m.requests }} 次</span>
+              <span class="split-tok">{{ compact(m.total_tokens) }}</span>
+            </div>
+          </div>
         </div>
       </div>
     </div>
@@ -134,6 +147,18 @@ async function reload() {
 .win-top { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }
 .win-label { font-size: 12px; color: var(--ink-2); }
 .win-pct { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* Per-model split of the shared fable window. */
+.split { margin-top: 6px; display: grid; gap: 2px; }
+.split-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 11px;
+}
+.split-name { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; }
+.split-tok { font-variant-numeric: tabular-nums; }
 
 .meter {
   position: relative;

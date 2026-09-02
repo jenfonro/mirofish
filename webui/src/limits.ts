@@ -3,7 +3,7 @@
 // spent the window's budget at an even rate — the reference for whether an
 // account is ahead of or behind average usage.
 
-import type { AccountLimits, LimitWindow } from "./types";
+import type { AccountLimits, LimitWindow, WindowModelUsage } from "./types";
 
 export interface DerivedWindow {
   name: string;
@@ -18,6 +18,8 @@ export interface DerivedWindow {
   ahead: boolean;
   deltaText: string;
   resetText: string;
+  /** Per-model split of a shared window (7d_fable), highest spend first. */
+  models: WindowModelUsage[];
 }
 
 function round1(x: number): number {
@@ -58,6 +60,9 @@ export function deriveWindow(w: LimitWindow, nowSec: number): DerivedWindow | nu
       ? `匀速线 ${round1(pacePct)}% · ${delta >= 0 ? "超前" : "落后"} ${Math.abs(round1(delta))}%`
       : "",
     resetText: w.reset_at ? resetText(remaining) : "无重置时间",
+    // Sorted so the model that consumed the shared window reads first; a
+    // model with no spend this window still shows, as a 0 row.
+    models: [...(w.models ?? [])].sort((a, b) => b.total_tokens - a.total_tokens),
   };
 }
 

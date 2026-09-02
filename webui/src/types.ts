@@ -9,6 +9,16 @@ export interface ProxyInfo {
   last_error?: string | null;
 }
 
+export interface WindowModelUsage {
+  model: string;
+  requests: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_write_tokens: number;
+  total_tokens: number;
+}
+
 export interface LimitWindow {
   name: string;
   label: string;
@@ -16,6 +26,8 @@ export interface LimitWindow {
   used: number;
   budget: number;
   reset_at: number | null;
+  /** Present on 7d_fable only: the shared window split per fable model. */
+  models?: WindowModelUsage[];
 }
 
 export interface AccountLimits {
