@@ -5,10 +5,18 @@ import { loadSchedule, store, toast } from "../store";
 
 const busy = ref(false);
 const collapsed = ref(false);
-const mode = ref<"balanced" | "reset_first">("balanced");
+type Mode = "balanced" | "reset_first" | "fable_first";
+
+const MODE_LABEL: Record<Mode, string> = {
+  balanced: "均衡分配",
+  reset_first: "优先重置窗口",
+  fable_first: "优先重置窗口 + Fable 已用最高",
+};
+
+const mode = ref<Mode>("balanced");
 const ceiling = ref(0.98);
 
-const resetFirst = computed(() => mode.value === "reset_first");
+const modeLabel = computed(() => MODE_LABEL[mode.value] ?? MODE_LABEL.balanced);
 const dirty = computed(() =>
   !!store.schedule &&
   (store.schedule.mode !== mode.value ||
@@ -51,7 +59,7 @@ async function save(): Promise<void> {
     <h2>
       账号调度
       <span v-if="store.schedule" class="badge">
-        {{ resetFirst ? "优先重置窗口" : "均衡分配" }}
+        {{ modeLabel }}
       </span>
       <span v-if="store.schedule" class="badge">
         用量上限 {{ (store.schedule.max_utilization * 100).toFixed(0) }}%
@@ -77,7 +85,7 @@ async function save(): Promise<void> {
             <small>把新会话交给活跃会话最少的账号，各账号用量平均。</small>
           </span>
         </label>
-        <label class="mode" :class="{ picked: resetFirst }">
+        <label class="mode" :class="{ picked: mode === 'reset_first' }">
           <input v-model="mode" type="radio" value="reset_first" />
           <span>
             <b>优先重置窗口</b>
@@ -85,6 +93,19 @@ async function save(): Promise<void> {
               同样按活跃会话数均分，只是给 48 小时内要重置的账号一点提前量
               （最多相当于 2 个会话），把快清零的额度先花掉；
               提前量用完就回到正常轮换，不会把并发堆到一个账号上。
+            </small>
+          </span>
+        </label>
+        <label class="mode" :class="{ picked: mode === 'fable_first' }">
+          <input v-model="mode" type="radio" value="fable_first" />
+          <span>
+            <b>优先重置窗口 + Fable 已用最高</b>
+            <small>
+              在「优先重置窗口」基础上，对<b>非 fable</b> 模型的请求再看一层：
+              48 小时内要重置的账号中，7 天 Fable 窗口已用越高的越先用。
+              这些账号的 fable 额度本就用尽（发 fable 请求也会被拒），
+              但通用额度即将清零，正好先花掉；fable 额度还有余量的账号则留给
+              fable 请求。fable 请求本身仍按「优先重置窗口」分配。
             </small>
           </span>
         </label>

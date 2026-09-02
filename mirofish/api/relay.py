@@ -311,7 +311,10 @@ async def count_tokens(request: Request) -> Any:
 async def models(request: Request) -> Any:
     state = get_state(request)
     requested = request.headers.get("X-Mirofish-Account", "").strip()
-    account = state.pick_account(requested)
+    # The catalog is a zero-cost read, so an account parked by a 401/503 can
+    # still serve it: otherwise the panel loses its model list at the moment
+    # every account is parked, which is when it is needed most.
+    account = state.pick_account(requested, allow_unhealthy=True)
     cached = state.model_cache.get(account)
     if cached and time.time() - cached[0] < state.settings.model_catalog_ttl:
         return {**cached[1], "default_model": state.settings.default_model}

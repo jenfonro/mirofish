@@ -1139,6 +1139,34 @@ async def test_model_catalog_rejects_explicit_disabled_account(
 
 
 @respx.mock
+async def test_model_catalog_still_answers_when_every_account_is_parked(
+        client, state, auth_headers):
+    """A parked account must not take the model catalog down with it.
+
+    401/503 are verdicts about serving model traffic. `/v1/models` is a
+    zero-cost read, and the panel needs it precisely when accounts are
+    failing — that is where the operator picks a model to retry with.
+    """
+    add_account(state, "work")
+    add_account(state, "spare")
+    mock_device_session()
+    respx.get(RELAY_BASE + "/v1/models").mock(return_value=httpx.Response(
+        200, json={"data": [{"id": "claude-fable-5-1"}]}))
+    for alias in ("work", "spare"):
+        state.store.mark_account_error(alias, 503, "overloaded_error: busy",
+                                       "upstream_503")
+
+    response = await client.get("/v1/models", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["models"] == ["claude-fable-5-1"]
+    # Model traffic is still refused: only the catalog is exempt.
+    with pytest.raises(RelayError) as excinfo:
+        state.route_account("", "", _conv("a window"))
+    assert excinfo.value.status == 503
+
+
+@respx.mock
 async def test_status_probe_uses_zero_cost_limits_instead_of_messages(
         client, state, auth_headers):
     add_account(state, "work")

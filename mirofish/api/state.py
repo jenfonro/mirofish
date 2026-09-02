@@ -50,9 +50,15 @@ HEALTH_ERROR_STATUSES = (401, 503)
 # carrying the fewest live sessions. "reset_first" instead prefers the account
 # whose 7-day window resets soonest, so credit that is about to expire unused
 # is spent before it is thrown away; the balanced key stays as the tie-break.
+# "fable_first" is for non-fable traffic: among the accounts whose window is
+# about to reset it prefers the one whose fable window is fullest, so the
+# general 7-day credit is spent on the accounts whose fable credit is already
+# gone (a fable request there would be refused anyway) and the accounts with
+# fable headroom stay free for fable traffic.
 SCHEDULE_BALANCED = "balanced"
 SCHEDULE_RESET_FIRST = "reset_first"
-SCHEDULE_MODES = (SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST)
+SCHEDULE_FABLE_FIRST = "fable_first"
+SCHEDULE_MODES = (SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST, SCHEDULE_FABLE_FIRST)
 SETTING_SCHEDULE_MODE = "schedule_mode"
 SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
 # Above this utilization an account sorts behind every account with room, in
@@ -276,6 +282,18 @@ class AppState:
             return URGENCY_MAX_BONUS
         return URGENCY_MAX_BONUS * (1.0 - hours / URGENCY_HORIZON_HOURS)
 
+    def _fable_spent(self, alias: str) -> float:
+        """How full this account's own fable window is (0.0 when unknown).
+
+        Used by fable-first to rank the accounts that are already inside the
+        reset horizon: the fullest fable window first.
+        """
+        value = self._window_utilization(self._windows(alias).get(FABLE_WINDOW))
+        return value if value is not None else 0.0
+
+    def _is_fable_model(self, model: Optional[str]) -> bool:
+        return bool(model) and "fable" in model.lower()
+
     def _load(self, alias: str, model: Optional[str]) -> float:
         """How full this account is for the requested model.
 
@@ -284,7 +302,7 @@ class AppState:
         """
         windows = self._windows(alias)
         names = ["7d"]
-        if model and "fable" in model.lower():
+        if self._is_fable_model(model):
             names.append(FABLE_WINDOW)
         loads = [value for value in
                  (self._window_utilization(windows.get(name)) for name in names)
@@ -351,9 +369,17 @@ class AppState:
         not cooling down after an upstream shared-quota or 401/503 refusal.
         Quota load is a soft preference handled separately; these are hard
         exclusions."""
+        return self._serviceable(alias) and not self.account_unhealthy(alias)
+
+    def _serviceable(self, alias: str) -> bool:
+        """Usable for a zero-cost control-plane read.
+
+        Same as ``_selectable`` minus the health verdict: a 401/503 refusal
+        stops model traffic, but the account can still answer the model
+        catalog, and a parked account must not take the panel down with it.
+        """
         return (not self.account_disabled(alias)
-                and self.exhausted_cooldown(alias) <= 0.0
-                and not self.account_unhealthy(alias))
+                and self.exhausted_cooldown(alias) <= 0.0)
 
     def _explicit_account(self, requested: str) -> str:
         """An explicitly requested account is honored even during a cooldown
@@ -367,17 +393,25 @@ class AppState:
         return RelayError("all accounts are disabled or cooling down after a "
                           "shared-quota refusal; enable one in the panel or retry later", 503)
 
-    def pick_account(self, requested: str, model: Optional[str] = None) -> str:
-        """Explicit header > default account > quota-aware round-robin."""
+    def pick_account(self, requested: str, model: Optional[str] = None, *,
+                     allow_unhealthy: bool = False) -> str:
+        """Explicit header > default account > quota-aware round-robin.
+
+        ``allow_unhealthy`` keeps accounts parked by a 401/503 in the running
+        for zero-cost catalog reads: those refusals are about serving model
+        traffic, and refusing to answer `/v1/models` because every account is
+        parked would make the panel unusable exactly when it is needed.
+        """
         requested = requested.strip()
         if requested:
             return self._explicit_account(requested)
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
-        if self.default_account in aliases and self._selectable(self.default_account):
+        eligible = (self._serviceable if allow_unhealthy else self._selectable)
+        if self.default_account in aliases and eligible(self.default_account):
             return self.default_account
-        selectable = [alias for alias in aliases if self._selectable(alias)]
+        selectable = [alias for alias in aliases if eligible(alias)]
         if not selectable:
             raise self._no_selectable_error()
         schedule = self.schedule_settings()
@@ -520,6 +554,15 @@ class AppState:
         than it really does, so it picks up the next conversation earlier and
         its about-to-expire credit gets spent. Ordering by the reset time
         itself would not spread at all, because the timestamps never tie.
+
+        Fable-first refines reset-first for non-fable traffic: among the
+        accounts already inside the reset horizon it prefers the one whose own
+        fable window is fullest. That account's fable credit is spent, so a
+        fable request would be refused there anyway, while its general 7-day
+        credit is about to expire — spend that one, and leave the accounts
+        with fable headroom free for fable traffic. A fable request itself
+        gets plain reset-first ordering: there the fable window is the
+        constraint (``_load`` already weighs it), not the selection criterion.
         """
         live = counts.get(alias, 0)
         recency = self._last_assigned.get(alias, 0.0)
@@ -527,9 +570,19 @@ class AppState:
             # Nearly spent: keep it in service, but let every account with room
             # take a turn first.
             return (float(live) + URGENCY_MAX_BONUS + 1.0, recency)
-        if schedule["mode"] != SCHEDULE_RESET_FIRST:
+        if schedule["mode"] == SCHEDULE_BALANCED:
             return (float(live), recency)
-        return (float(live) - self._urgency_bonus(alias), recency)
+        bonus = self._urgency_bonus(alias)
+        if schedule["mode"] == SCHEDULE_FABLE_FIRST and not self._is_fable_model(model):
+            # Scale the head start by how spent the fable window is, instead of
+            # adding a tie-break after it: the tilted count is a float that
+            # rarely ties, so a separate key would be dead code. An urgent
+            # account with no fable credit left keeps the full bonus and goes
+            # first; one with fable headroom keeps almost none and is left for
+            # fable traffic. The bonus stays capped at URGENCY_MAX_BONUS, so
+            # the ordering still spreads by session count.
+            bonus *= min(1.0, self._fable_spent(alias))
+        return (float(live) - bonus, recency)
 
     def _sticky_account(self, key: str, aliases: list[str],
                         model: Optional[str] = None) -> str:
