@@ -13,6 +13,7 @@ from ..validate import model_value
 from .deps import get_state, read_json_body_bytes, require_auth
 from .relay import (_finalize_upstream_stream, _ManagedStreamingResponse,
                     _ResponsesUsageWatcher)
+from .state import ACCOUNT_GENERATION_EXTENSION
 
 router = APIRouter(dependencies=[Depends(require_auth)])
 
@@ -72,6 +73,9 @@ async def _codex_relay(request: Request, path: str) -> Any:
 
     account, (response, stack) = await state.with_account_failover(
         requested, hint, payload, run)
+    account_generation = response.extensions.get(ACCOUNT_GENERATION_EXTENSION)
+    if not isinstance(account_generation, str):
+        account_generation = None
 
     observer = _ResponsesUsageWatcher()
 
@@ -90,7 +94,8 @@ async def _codex_relay(request: Request, path: str) -> Any:
 
     async def finalize() -> None:
         await _finalize_upstream_stream(
-            stack, state, account, model, observer, upstream_headers)
+            stack, state, account, model, observer, upstream_headers,
+            account_generation=account_generation)
 
     outgoing = [
         (name, value) for name, value in forwarded_response_headers(response)
@@ -129,4 +134,3 @@ async def alpha_search(request: Request) -> Any:
 @router.post("/backend-api/codex/alpha/search")
 async def backend_alpha_search(request: Request) -> Any:
     return await _codex_relay(request, ALPHA_SEARCH_PATH)
-

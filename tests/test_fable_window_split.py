@@ -26,11 +26,13 @@ def _iso(epoch):
 def _log(store, alias, model, *, created_at, inp=0, out=0,
          cache_read=0, cache_write=0):
     """Insert a usage row with an explicit timestamp."""
+    generation = store.account_generation(alias)
     store.db.execute(
         """INSERT INTO usage_log(alias,model,input_tokens,output_tokens,
-                                 cache_read_tokens,cache_write_tokens,created_at)
-           VALUES(?,?,?,?,?,?,?)""",
-        (alias, model, inp, out, cache_read, cache_write, created_at))
+                                 cache_read_tokens,cache_write_tokens,
+                                 account_generation,created_at)
+           VALUES(?,?,?,?,?,?,?,?)""",
+        (alias, model, inp, out, cache_read, cache_write, generation, created_at))
     store.db.commit()
 
 
@@ -127,6 +129,37 @@ def test_split_counts_only_the_requested_account(state):
     assert all(entry["total_tokens"] == 0 for entry in _window(limits)["models"])
 
 
+def test_split_does_not_cross_account_replacement(state):
+    """Reusing an alias for another upstream account starts a new log scope."""
+    add_account(state, "work", "old@example.com")
+    reset_at = time.time() + WEEK / 2
+    old_generation = state.store.account_generation("work")
+    _log(state.store, "work", "claude-fable-5", created_at=_iso(reset_at - WEEK + 60),
+         inp=999, out=1)
+
+    state.store.save(
+        "work", "new@example.com", "new-access", "new-refresh",
+        {"user_id": "u-new", "plan": "pro", "tenant": "t1",
+         "quota": {}, "last_usage": {}, "checked_at": _iso(time.time())})
+    new_generation = state.store.account_generation("work")
+    assert new_generation != old_generation
+
+    # This represents an old stream finishing after the alias was replaced.
+    state.record_usage(
+        "work", "claude-fable-5", {"input_tokens": 500, "output_tokens": 1}, {},
+        account_generation=old_generation)
+    state.record_usage(
+        "work", "claude-fable-5-1", {"input_tokens": 2, "output_tokens": 3}, {})
+
+    limits = _limits(reset_at)
+    state.accounts._attach_fable_split("work", limits)
+    split = _split(limits)
+
+    assert split["claude-fable-5"]["requests"] == 0
+    assert split["claude-fable-5-1"]["requests"] == 1
+    assert split["claude-fable-5-1"]["total_tokens"] == 5
+
+
 def test_split_ignores_non_fable_models(state):
     """Only the models the upstream meters against this window may count."""
     add_account(state, "work")
@@ -138,6 +171,20 @@ def test_split_ignores_non_fable_models(state):
     state.accounts._attach_fable_split("work", limits)
 
     assert all(entry["total_tokens"] == 0 for entry in _window(limits)["models"])
+
+
+@pytest.mark.parametrize(
+    ("reset_at", "length"),
+    [(0, WEEK), (-1, WEEK), (True, WEEK), (float("nan"), WEEK),
+     (float("inf"), WEEK), (time.time() + WEEK, True)],
+)
+def test_split_is_skipped_for_invalid_numeric_window_timing(state, reset_at, length):
+    add_account(state, "work")
+    limits = _limits(reset_at)
+    _window(limits)["length"] = length
+    state.accounts._attach_fable_split("work", limits)
+
+    assert "models" not in _window(limits)
 
 
 @pytest.mark.parametrize("window", [

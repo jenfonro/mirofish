@@ -43,7 +43,7 @@ class Store:
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS accounts (
               alias TEXT PRIMARY KEY, email TEXT NOT NULL, user_id TEXT,
-              plan TEXT, tenant TEXT, proxy_id TEXT,
+              plan TEXT, tenant TEXT, proxy_id TEXT, account_generation TEXT,
               metadata_json TEXT NOT NULL DEFAULT '{}',
               created_at TEXT NOT NULL, updated_at TEXT NOT NULL
             )
@@ -51,6 +51,8 @@ class Store:
         columns = {str(row[1]) for row in self.db.execute("PRAGMA table_info(accounts)")}
         if "proxy_id" not in columns:
             self.db.execute("ALTER TABLE accounts ADD COLUMN proxy_id TEXT")
+        if "account_generation" not in columns:
+            self.db.execute("ALTER TABLE accounts ADD COLUMN account_generation TEXT")
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS proxies (
               proxy_id TEXT PRIMARY KEY, name TEXT NOT NULL, scheme TEXT NOT NULL,
@@ -62,7 +64,7 @@ class Store:
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS usage_log (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
-              alias TEXT NOT NULL, model TEXT,
+              alias TEXT NOT NULL, model TEXT, account_generation TEXT,
               input_tokens INTEGER NOT NULL DEFAULT 0,
               output_tokens INTEGER NOT NULL DEFAULT 0,
               cache_read_tokens INTEGER NOT NULL DEFAULT 0,
@@ -70,13 +72,42 @@ class Store:
               created_at TEXT NOT NULL
             )
         """)
+        usage_columns = {str(row[1]) for row in self.db.execute("PRAGMA table_info(usage_log)")}
+        if "account_generation" not in usage_columns:
+            self.db.execute("ALTER TABLE usage_log ADD COLUMN account_generation TEXT")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_usage_created ON usage_log(created_at)")
+        self.db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_account_model_created "
+            "ON usage_log(alias,account_generation,model,created_at)")
         self.db.execute("""
             CREATE TABLE IF NOT EXISTS settings (
               key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
             )
         """)
+        # A legacy database has no per-account generation. Assign one to every
+        # existing account, then associate its old rows with that generation so
+        # current-window history remains visible after upgrading. Rows from a
+        # later alias replacement receive a new generation and no longer mix.
+        missing_generations = list(self.db.execute(
+            "SELECT alias FROM accounts WHERE account_generation IS NULL "
+            "OR account_generation=''"))
+        for row in missing_generations:
+            self.db.execute(
+                "UPDATE accounts SET account_generation=? WHERE alias=?",
+                (self._new_account_generation(), str(row["alias"])))
+        self.db.execute("""
+            UPDATE usage_log
+               SET account_generation=(
+                   SELECT account_generation FROM accounts
+                    WHERE accounts.alias=usage_log.alias)
+             WHERE account_generation IS NULL
+        """)
         self.db.commit()
+
+    @staticmethod
+    def _new_account_generation() -> str:
+        """Opaque local identity for one account occupying an alias slot."""
+        return secrets.token_hex(16)
 
     # --- local proxy key ----------------------------------------------------
 
@@ -113,6 +144,24 @@ class Store:
         self.row(alias)
         return self.vault.get(alias, "access"), self.vault.get(alias, "refresh")
 
+    def account_generation(self, alias: str) -> str:
+        """Return the generation currently occupying an alias slot."""
+        alias = alias_value(alias)
+        with self.db_lock:
+            row = self.db.execute(
+                "SELECT account_generation FROM accounts WHERE alias=?",
+                (alias,)).fetchone()
+            if row is None:
+                raise RelayError("unknown account: " + alias, 404)
+            generation = row["account_generation"]
+            if not isinstance(generation, str) or not generation:
+                generation = self._new_account_generation()
+                self.db.execute(
+                    "UPDATE accounts SET account_generation=?,updated_at=? WHERE alias=?",
+                    (generation, utc_now(), alias))
+                self.db.commit()
+            return generation
+
     def save(self, alias: str, email: str, access: str, refresh: str,
              metadata: dict[str, Any], proxy_id: Optional[str] = None) -> None:
         alias = alias_value(alias)
@@ -120,17 +169,31 @@ class Store:
         self.vault.put(alias, "access", access)
         stamp = utc_now()
         with self.db_lock:
+            existing = self.db.execute(
+                "SELECT email,account_generation FROM accounts WHERE alias=?",
+                (alias,)).fetchone()
+            if existing is None:
+                generation = self._new_account_generation()
+            elif str(existing["email"]).casefold() != email.casefold():
+                # Reusing an alias for another login must not inherit the
+                # previous account's local usage history.
+                generation = self._new_account_generation()
+            else:
+                generation = existing["account_generation"]
+                if not isinstance(generation, str) or not generation:
+                    generation = self._new_account_generation()
             self.db.execute("""
-            INSERT INTO accounts(alias,email,user_id,plan,tenant,proxy_id,metadata_json,created_at,updated_at)
-            VALUES(?,?,?,?,?,?,?,?,?)
+            INSERT INTO accounts(alias,email,user_id,plan,tenant,proxy_id,account_generation,metadata_json,created_at,updated_at)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(alias) DO UPDATE SET email=excluded.email,user_id=excluded.user_id,
               plan=excluded.plan,tenant=excluded.tenant,
               proxy_id=COALESCE(excluded.proxy_id, accounts.proxy_id),
+              account_generation=excluded.account_generation,
               metadata_json=excluded.metadata_json,
               updated_at=excluded.updated_at
             """, (alias, email, metadata.get("user_id"), metadata.get("plan"),
-                  metadata.get("tenant"), proxy_id, json.dumps(metadata, ensure_ascii=False),
-                  stamp, stamp))
+                  metadata.get("tenant"), proxy_id, generation,
+                  json.dumps(metadata, ensure_ascii=False), stamp, stamp))
             self.db.commit()
 
     def update_metadata(self, alias: str, metadata: dict[str, Any]) -> None:
@@ -324,7 +387,18 @@ class Store:
 
     # --- usage log ----------------------------------------------------------
 
-    def log_usage(self, alias: str, model: Optional[str], usage: dict[str, Any]) -> None:
+    def log_usage(self, alias: str, model: Optional[str], usage: dict[str, Any],
+                  account_generation: Optional[str] = None) -> None:
+        alias = alias_value(alias)
+        if account_generation is None:
+            try:
+                account_generation = self.account_generation(alias)
+            except RelayError:
+                # Preserve the existing behavior for a stream that finishes
+                # after its account was deleted: retain the log as legacy data,
+                # but it cannot be attributed to a live account generation.
+                pass
+
         def _int(key: str) -> int:
             try:
                 return int(usage.get(key) or 0)
@@ -333,14 +407,18 @@ class Store:
         with self.db_lock:
             self.db.execute("""
                 INSERT INTO usage_log(alias,model,input_tokens,output_tokens,
-                                      cache_read_tokens,cache_write_tokens,created_at)
-                VALUES(?,?,?,?,?,?,?)
+                                      cache_read_tokens,cache_write_tokens,
+                                      account_generation,created_at)
+                VALUES(?,?,?,?,?,?,?,?)
             """, (alias_value(alias), model, _int("input_tokens"), _int("output_tokens"),
-                  _int("cache_read_input_tokens"), _int("cache_creation_input_tokens"), utc_now()))
+                  _int("cache_read_input_tokens"), _int("cache_creation_input_tokens"),
+                  account_generation, utc_now()))
             self.db.commit()
 
     def usage_by_model_since(self, alias: str, since_epoch: float,
-                             models: Sequence[str]) -> dict[str, dict[str, int]]:
+                             models: Sequence[str],
+                             account_generation: Optional[str] = None
+                             ) -> dict[str, dict[str, int]]:
         """Per-model token totals logged since ``since_epoch``.
 
         Used to split a shared upstream window (7d_fable covers every fable
@@ -351,9 +429,29 @@ class Store:
         """
         if not models:
             return {}
-        since = datetime.datetime.fromtimestamp(
-            since_epoch, datetime.timezone.utc).isoformat()
+        alias = alias_value(alias)
+        if account_generation is None:
+            try:
+                # Keep the original three-argument API scoped to the account
+                # currently occupying this alias. The explicit generation is
+                # used by request finalization, where an old in-flight stream
+                # must remain attributable to the account that started it.
+                account_generation = self.account_generation(alias)
+            except RelayError:
+                # A deleted alias has no current generation. Preserve the
+                # historical alias-only lookup for its orphaned rows.
+                pass
+        try:
+            since = datetime.datetime.fromtimestamp(
+                since_epoch, datetime.timezone.utc).isoformat()
+        except (OverflowError, OSError, TypeError, ValueError) as exc:
+            raise RelayError("invalid usage window start", 400) from exc
         placeholders = ",".join("?" for _ in models)
+        where = "alias=? AND created_at >= ? AND model IN (" + placeholders + ")"
+        params: list[Any] = [alias, since, *models]
+        if account_generation is not None:
+            where += " AND account_generation=?"
+            params.append(account_generation)
         with self.db_lock:
             rows = self.db.execute(f"""
                 SELECT model,
@@ -363,9 +461,9 @@ class Store:
                        COALESCE(SUM(cache_read_tokens),0) AS cache_read_tokens,
                        COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens
                 FROM usage_log
-                WHERE alias=? AND created_at >= ? AND model IN ({placeholders})
+                WHERE {where}
                 GROUP BY model
-            """, (alias_value(alias), since, *models)).fetchall()
+            """, params).fetchall()
         return {str(row["model"]): {
             "requests": int(row["requests"]),
             "input_tokens": int(row["input_tokens"]),

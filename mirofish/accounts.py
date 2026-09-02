@@ -428,19 +428,30 @@ class AccountService:
         breakdown counts only the usage logged since this window started, so
         it resets exactly when the window does: ``reset_at - length`` is the
         current window's start, and older rows fall out of the range on their
-        own. Missing/oversized upstream numbers leave the window untouched
-        rather than showing a total that spans two windows.
+        own. Missing or invalid upstream window timing leaves the window
+        untouched rather than showing a total that spans two windows.
         """
         window = next((entry for entry in limits.get("windows", [])
                        if entry.get("name") == FABLE_WINDOW), None)
         if window is None:
             return
         reset_at, length = window.get("reset_at"), window.get("length")
-        if not isinstance(reset_at, (int, float)) or not length:
+        if (isinstance(reset_at, bool) or not isinstance(reset_at, (int, float))
+                or isinstance(length, bool)):
             return
         try:
+            reset_epoch = float(reset_at)
+            length_seconds = float(length)
+        except (TypeError, ValueError, OverflowError):
+            return
+        if (not math.isfinite(reset_epoch) or reset_epoch <= 0
+                or not math.isfinite(length_seconds) or length_seconds <= 0):
+            return
+        try:
+            generation = self.store.account_generation(alias)
             per_model = self.store.usage_by_model_since(
-                alias, float(reset_at) - float(length), FABLE_MODELS)
+                alias, reset_epoch - length_seconds, FABLE_MODELS,
+                account_generation=generation)
         except RelayError:
             return
         window["models"] = [{
