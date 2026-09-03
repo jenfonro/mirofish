@@ -21,7 +21,8 @@ from ..errors import RelayError
 from ..proxy import ProxyPool
 from ..store import HEALTH_ERROR, Store
 from ..upstream import (CREDIT_EXHAUSTED_TYPE, RESPONSES_PATH, Upstream,
-                        account_scoped_429, quota_headers)
+                        account_overloaded_503, account_scoped_429,
+                        quota_headers)
 from ..validate import alias_value
 from ..vault import make_credential_store
 
@@ -40,19 +41,20 @@ SHARED_QUOTA_COOLDOWN = 600.0
 # would bench a single-account deployment for 10 minutes over one hiccup.
 TRANSIENT_429_COOLDOWN = 60.0
 
-# Upstream statuses that mean "this account cannot serve model traffic at all",
+# Upstream refusals that mean "this account cannot serve model traffic at all",
 # mapped to how long automatic selection avoids it afterwards.
 #
 # 401: its credentials or signed session are rejected. That does not heal on
 # its own — the account has to be logged in again — so it is parked with no
 # retry deadline at all.
 #
-# 503: the upstream has no capacity for THIS account ("overloaded_error", the
+# 503 `overloaded_error`: the upstream has no capacity for THIS account (the
 # message points at a Discord status channel). It does recover eventually, but
 # on the order of hours, not minutes: re-probing sooner just burns a request
 # and re-parks the account. A day is long enough to be nearly free while still
 # guaranteeing the account comes back without anyone watching it.
-HEALTH_ERROR_STATUSES = (401, 503)
+#
+# Every other 503 is deliberately absent: see ``_is_health_refusal``.
 HEALTH_RETRY_AFTER = {503: 86400.0}
 
 # Account scheduling. "balanced" spreads new conversations over the accounts
@@ -865,15 +867,34 @@ class AppState:
                         else message).strip()
         return str(exc)
 
+    @staticmethod
+    def _is_health_refusal(exc: RelayError) -> bool:
+        """Whether this refusal is a verdict on the ACCOUNT rather than a fault
+        on the way to the upstream.
+
+        401 always is: the credentials or the signed session were rejected.
+        503 only is when the upstream says ``overloaded_error``. The relay also
+        raises 503 for its own reasons (no device ticket, no usable proxy exit)
+        and the edge in front of the upstream serves 503 HTML error pages or
+        body-less rejections during a hiccup — none of which say anything about
+        the account that happened to carry the request. Parking on those is
+        actively harmful: one bad minute at the edge walks the whole pool out
+        of rotation for a day, which is exactly what a shared fault should not
+        be allowed to do.
+        """
+        if exc.status == 401:
+            return True
+        return account_overloaded_503(exc.status, exc.data)
+
     def note_account_error(self, alias: str, exc: RelayError) -> bool:
-        """Park an account the upstream refused with 401 or 503.
+        """Park an account the upstream refused with 401 or a capacity 503.
 
         Returns True when the error was one of those, letting the caller fail
         over to another account. How long it stays parked depends on whether
         the refusal heals by itself (see ``HEALTH_RETRY_AFTER``); a successful
         explicitly-pinned request clears it at any point.
         """
-        if exc.status not in HEALTH_ERROR_STATUSES:
+        if not self._is_health_refusal(exc):
             return False
         message = self._refusal_message(exc)
         retry_after = HEALTH_RETRY_AFTER.get(exc.status)

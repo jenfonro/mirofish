@@ -111,7 +111,8 @@ function retryLabel(seconds: number): string {
   return cooldownLabel(seconds);
 }
 
-// 状态列：上游 401/503 会把账号标记为异常并停止调度，恢复靠手动重试。
+// 状态列：上游 401 或 503 overloaded_error 会把账号标记为异常并停止调度，恢复靠手动重试。
+// 其他 503（边缘错误页、relay 自身的 503）是共享故障，不会标记任何账号。
 function healthState(account: Account): "disabled" | "error" | "ok" {
   if (account.disabled) return "disabled";
   return account.healthy === false ? "error" : "ok";

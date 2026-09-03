@@ -1,9 +1,13 @@
-"""Parking accounts the upstream refuses with 401 or 503.
+"""Parking accounts the upstream refuses for a reason that is about the ACCOUNT.
 
-Those two statuses say the upstream will not serve this ACCOUNT: 401 rejects
-its credentials/signed session, 503 means there is no capacity for it. Every
-further request on it fails, so it is marked abnormal, dropped from automatic
-selection, and the request fails over.
+Two refusals qualify: 401 rejects its credentials/signed session, and a 503
+``overloaded_error`` says the upstream has no capacity for it. Every further
+request on such an account fails, so it is marked abnormal, dropped from
+automatic selection, and the request fails over.
+
+Any other 503 is a fault in front of the upstream (edge error page, the
+relay's own "no device session" / "no proxy node" refusals) that every account
+shares, so it parks nothing — see the transient-503 tests below.
 
 How long it stays parked depends on whether the refusal heals by itself:
 
@@ -40,6 +44,11 @@ SIGNED_SESSION_401 = {"type": "error", "error": {
     "message": "this client version must upgrade to a signed session"}}
 OVERLOADED_503 = {"type": "error", "error": {
     "type": "overloaded_error", "message": "no upstream available"}}
+# The 503 shapes seen in production that say nothing about the account: an
+# edge HTML error page and a rejection with no parseable envelope at all.
+EDGE_HTML_503 = {"_raw": "<html><head><title>503 Service Unavailable</title>"}
+TRANSIENT_503_BODIES = (None, EDGE_HTML_503, {"error": "service unavailable"},
+                        {"kind": "device_session_required"})
 
 
 def _conv(text):
@@ -60,15 +69,46 @@ def refusal(status, body=None):
     return RelayError("upstream refused", status, body)
 
 
-@pytest.mark.parametrize("status", [401, 503])
-def test_401_and_503_park_the_account(state, status):
+@pytest.mark.parametrize("status,body", [(401, SIGNED_SESSION_401),
+                                         (401, None),
+                                         (503, OVERLOADED_503)])
+def test_a_refusal_aimed_at_the_account_parks_it(state, status, body):
     add_account(state, "work")
 
-    assert state.note_account_unserviceable("work", refusal(status))
+    assert state.note_account_unserviceable("work", refusal(status, body))
     assert state.account_unhealthy("work")
     assert state.account_health("work")["status"] == status
     # A health verdict, not a quota one: the shared-quota cooldown is untouched.
     assert state.exhausted_cooldown("work") == 0
+
+
+@pytest.mark.parametrize("body", TRANSIENT_503_BODIES)
+def test_a_503_that_is_not_a_capacity_refusal_parks_nothing(state, body):
+    """503 alone is not a verdict on the account.
+
+    The relay answers 503 for its own reasons (no device ticket, no usable
+    proxy exit) and the edge in front of the upstream serves 503 pages during a
+    hiccup. Those hit whichever account carried the request, so parking on them
+    walks the entire pool out of rotation over a shared fault — which is
+    exactly what happened in production: one bad minute left 81 of 82 accounts
+    benched for a day.
+    """
+    add_account(state, "work")
+
+    assert not state.note_account_unserviceable("work", refusal(503, body))
+    assert not state.account_unhealthy("work")
+    assert state.account_health("work") == {}
+    # Nor is it quota pressure: no cooldown either, the caller just retries.
+    assert state.exhausted_cooldown("work") == 0
+
+
+def test_a_transient_503_leaves_the_account_in_the_rotation(state):
+    """The point of not parking: the pool still serves the next request."""
+    add_account(state, "work")
+
+    assert not state.note_account_unserviceable("work", refusal(503, EDGE_HTML_503))
+
+    assert state.route_account("", "", _conv("a window")) == "work"
 
 
 @respx.mock

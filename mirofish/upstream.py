@@ -530,6 +530,7 @@ def _rejection_detail(body: Any) -> str:
 
 REGION_REFUSAL_TYPE = "shared_quota_unavailable"
 CREDIT_EXHAUSTED_TYPE = "credit_exhausted_shared"
+OVERLOADED_TYPE = "overloaded_error"
 
 
 def _is_region_blocked(status: int, body: Any) -> bool:
@@ -557,6 +558,24 @@ def account_scoped_429(status: int, body: Any) -> bool:
     if not isinstance(error, dict):
         return True
     return str(error.get("type")) != REGION_REFUSAL_TYPE
+
+
+def account_overloaded_503(status: int, body: Any) -> bool:
+    """The upstream has no capacity for THIS account, as opposed to a 503 that
+    merely happened on the way to it.
+
+    Only the documented ``overloaded_error`` envelope says anything about the
+    account. The other 503s seen in practice — an edge HTML error page, a
+    body-less rejection, the relay's own "no device session" / "no proxy node"
+    refusals — are transient faults in front of the upstream that every account
+    shares, so they must not be read as a verdict on the one that happened to
+    carry the request.
+    """
+    if status != 503 or not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    return (isinstance(error, dict)
+            and str(error.get("type")) == OVERLOADED_TYPE)
 
 
 def _region_block_error(status: int, body: Any,
