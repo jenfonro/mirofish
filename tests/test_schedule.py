@@ -12,6 +12,7 @@ import time
 import pytest
 
 from mirofish.api.state import (DEFAULT_SCHEDULE_MAX_UTILIZATION,
+                                MAX_QUOTA_COOLDOWN,
                                 SCHEDULE_BALANCED, SCHEDULE_FABLE_FIRST,
                                 SCHEDULE_RESET_FIRST,
                                 SHARED_QUOTA_COOLDOWN, TRANSIENT_429_COOLDOWN)
@@ -297,6 +298,70 @@ def test_credit_exhaustion_cools_much_longer_than_a_transient_429(state):
     state.note_account_unserviceable("work", refusal(429, "rate_limit_error"))
     assert state.exhausted_cooldown("work") == \
         pytest.approx(TRANSIENT_429_COOLDOWN, abs=5)
+
+
+def exhausted_refusal(code, message=""):
+    """The shape the upstream actually sends for a spent window: the window is
+    named in `code`, while `type` is the same generic value a momentary rate
+    refusal carries."""
+    return RelayError("upstream refused", 429, {"error": {
+        "code": code, "type": "rate_limit_error", "message": message}})
+
+
+@pytest.mark.parametrize("code", ["credit_exhausted_5h", "credit_exhausted_7d",
+                                  "credit_exhausted_shared"])
+def test_a_spent_window_is_read_from_the_error_code(state, code):
+    """`type` cannot tell a spent window from a hiccup — only `code` can.
+
+    Reading just `type` classified every exhausted window as transient, so the
+    account came back after 60s, was refused again, and enough of those earn an
+    upstream 403 suspension for "repeated rate-limit refusals".
+    """
+    add_account(state, "work")
+
+    assert state.note_account_unserviceable("work", exhausted_refusal(code))
+
+    assert state.exhausted_cooldown("work") > TRANSIENT_429_COOLDOWN
+
+
+def test_a_spent_window_cools_until_that_window_resets(state):
+    """The error names the window, so the cooldown can match the refusal
+    instead of being a fixed guess."""
+    add_account(state, "work")
+    reset_in = 1800.0
+    state.store.merge_metadata("work", {"limits": {"windows": [
+        {"name": "5h", "used": 39200.0, "budget": 39200.0,
+         "reset_at": time.time() + reset_in},
+    ]}})
+
+    state.note_account_unserviceable("work", exhausted_refusal("credit_exhausted_5h"))
+
+    assert state.exhausted_cooldown("work") == pytest.approx(reset_in, abs=30)
+
+
+def test_a_far_off_reset_is_still_re_probed_within_the_hour(state):
+    """A 7-day window can be days away. Benching an account that long on one
+    refusal would hide a window that was raised or reset early."""
+    add_account(state, "work")
+    state.store.merge_metadata("work", {"limits": {"windows": [
+        {"name": "7d", "used": 140000.0, "budget": 140000.0,
+         "reset_at": time.time() + 5 * 86400},
+    ]}})
+
+    state.note_account_unserviceable("work", exhausted_refusal("credit_exhausted_7d"))
+
+    assert state.exhausted_cooldown("work") == pytest.approx(
+        MAX_QUOTA_COOLDOWN, abs=5)
+
+
+def test_an_unknown_window_falls_back_to_the_fixed_cooldown(state):
+    """No cached window for the named code: still bench it properly."""
+    add_account(state, "work")
+
+    state.note_account_unserviceable("work", exhausted_refusal("credit_exhausted_9z"))
+
+    assert state.exhausted_cooldown("work") == pytest.approx(
+        SHARED_QUOTA_COOLDOWN, abs=5)
 
 
 def test_region_refusal_stays_with_the_proxy_pool(state):

@@ -20,9 +20,10 @@ from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool
 from ..store import HEALTH_ERROR, Store
-from ..upstream import (CREDIT_EXHAUSTED_TYPE, RESPONSES_PATH, Upstream,
-                        account_overloaded_503, account_scoped_429,
-                        account_suspended_403, quota_headers)
+from ..upstream import (CREDIT_EXHAUSTED_CODE_PREFIX, RESPONSES_PATH,
+                        Upstream, account_overloaded_503, account_scoped_429,
+                        account_suspended_403, credit_exhausted_429,
+                        quota_headers)
 from ..validate import alias_value
 from ..vault import make_credential_store
 
@@ -31,14 +32,22 @@ logger = logging.getLogger("mirofish.state")
 LOGIN_TTL_SECONDS = 600.0
 QUOTA_EXHAUSTED = 0.999
 MAX_NETWORK_PROXY_ATTEMPTS = 4
-# How long automatic selection avoids an account after the upstream refuses it
-# with credit_exhausted_shared. The reset time is unknown to us, so re-probe
-# occasionally instead of blacklisting until restart.
+# Fallback cooldown for a spent window whose reset time we cannot read. The
+# refusal holds until the window resets, so re-probing every 10 minutes is
+# already generous; the cached `reset_at` is preferred when available.
 SHARED_QUOTA_COOLDOWN = 600.0
+# Ceiling on a reset-derived cooldown. A 7-day window can be days away, and
+# benching an account that long on one refusal would hide a window that got
+# raised or reset early, so re-probe at least once an hour.
+MAX_QUOTA_COOLDOWN = 3600.0
 # Cooldown for a 429 the relay does not recognize. Those are usually transient
 # rate pressure that clears in seconds, so the account only needs to sit out
 # long enough for its dropped sessions to land elsewhere; the full cooldown
 # would bench a single-account deployment for 10 minutes over one hiccup.
+#
+# It is deliberately short, which makes correct classification essential: a
+# spent window sent back after a minute is refused again, and enough of those
+# earn an upstream 403 suspension for "repeated rate-limit refusals".
 TRANSIENT_429_COOLDOWN = 60.0
 
 # Upstream refusals that mean "this account cannot serve model traffic at all",
@@ -771,14 +780,31 @@ class AppState:
 
     @staticmethod
     def _is_credit_exhausted(exc: RelayError) -> bool:
-        """The documented shared-credit exhaustion, which holds until the
-        weekly window resets — unlike other 429 shapes, which are usually
-        transient rate pressure."""
-        if not isinstance(exc.data, dict):
-            return False
-        error = exc.data.get("error")
-        return (isinstance(error, dict)
-                and str(error.get("type")) == CREDIT_EXHAUSTED_TYPE)
+        """A spent usage window, which holds until that window resets — unlike
+        other 429 shapes, which are usually transient rate pressure."""
+        return credit_exhausted_429(exc.status, exc.data)
+
+    def _quota_cooldown(self, alias: str, exc: RelayError) -> float:
+        """How long to bench an account whose window the upstream says is spent.
+
+        The refusal lasts until that window resets, and the error names which
+        window it was (``credit_exhausted_5h`` -> the 5h window), so the cached
+        `reset_at` gives a cooldown that actually matches the refusal instead of
+        a fixed guess. Capped by ``MAX_QUOTA_COOLDOWN`` so a multi-day 7-day
+        window still gets re-probed, and floored by ``SHARED_QUOTA_COOLDOWN``
+        so a reset that is seconds away does not put the account straight back
+        into rotation to be refused again.
+        """
+        error = exc.data.get("error") if isinstance(exc.data, dict) else None
+        code = str((error or {}).get("code") or "")
+        window = code[len(CREDIT_EXHAUSTED_CODE_PREFIX) + 1:] if code.startswith(
+            CREDIT_EXHAUSTED_CODE_PREFIX + "_") else ""
+        reset_at = (self._windows(alias).get(window) or {}).get("reset_at")
+        try:
+            remaining = float(reset_at) - time.time() if reset_at else 0.0
+        except (TypeError, ValueError):
+            remaining = 0.0
+        return min(MAX_QUOTA_COOLDOWN, max(SHARED_QUOTA_COOLDOWN, remaining))
 
     def drop_account_sessions(self, alias: str) -> None:
         """Detach live sessions pinned to an account so each conversation's next
@@ -846,7 +872,8 @@ class AppState:
         """
         if self._is_account_exhausted(exc):
             if self._is_credit_exhausted(exc):
-                cooldown, reason = SHARED_QUOTA_COOLDOWN, "shared-quota refusal"
+                cooldown = self._quota_cooldown(alias, exc)
+                reason = "spent usage window"
             else:
                 cooldown, reason = TRANSIENT_429_COOLDOWN, "account-scoped 429"
         elif self._is_region_refused_everywhere(exc):

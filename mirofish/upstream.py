@@ -532,6 +532,11 @@ def _rejection_detail(body: Any) -> str:
 
 REGION_REFUSAL_TYPE = "shared_quota_unavailable"
 CREDIT_EXHAUSTED_TYPE = "credit_exhausted_shared"
+# The upstream reports quota exhaustion in `code`, not `type`: `type` is the
+# generic "rate_limit_error" for both a spent window and momentary rate
+# pressure, and only the code distinguishes them (credit_exhausted_5h,
+# credit_exhausted_7d, credit_exhausted_shared, ...).
+CREDIT_EXHAUSTED_CODE_PREFIX = "credit_exhausted"
 OVERLOADED_TYPE = "overloaded_error"
 PERMISSION_ERROR_TYPE = "permission_error"
 # The upstream states the exact moment access returns, so the account can be
@@ -584,6 +589,28 @@ def account_overloaded_503(status: int, body: Any) -> bool:
     error = body.get("error")
     return (isinstance(error, dict)
             and str(error.get("type")) == OVERLOADED_TYPE)
+
+
+def credit_exhausted_429(status: int, body: Any) -> bool:
+    """A 429 that means "this account's window is spent", not "slow down".
+
+    The window does not free up until it resets, so the account has to sit out
+    for a long time; a momentary rate refusal clears in seconds. Both arrive as
+    ``type: rate_limit_error``, so the distinction lives in ``code``
+    (``credit_exhausted_5h`` / ``_7d`` / ``_shared``). Reading only ``type``
+    means every spent window is mistaken for a hiccup and the account returns
+    after a minute to be refused again — which is what earns an upstream
+    suspension for "repeated rate-limit refusals".
+    """
+    if status != 429 or not isinstance(body, dict):
+        return False
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return False
+    if str(error.get("code") or "").startswith(CREDIT_EXHAUSTED_CODE_PREFIX):
+        return True
+    # Older/other shapes put it in `type`; keep honoring that spelling.
+    return str(error.get("type")) == CREDIT_EXHAUSTED_TYPE
 
 
 def account_suspended_403(status: int, body: Any) -> Optional[float]:
