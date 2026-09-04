@@ -71,6 +71,24 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   deliberately left alone. `tests/test_tls_profile.py` measures the hello on loopback so a
   dependency bump cannot change it silently.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
+- A Messages request capped at one output token (`max_tokens<=1`) is answered by
+  the relay itself and never forwarded: the upstream reads that shape as an
+  availability probe and refuses it with a 400 pointing at `/v1/limits`, so
+  relaying it only spends a signed round trip and a device ticket per probe.
+  The reply is a valid Messages envelope with empty `content` and
+  `stop_reason: "max_tokens"`; `usage.input_tokens` comes from the non-billable
+  upstream `/v1/messages/count_tokens` (shared with the relay's own
+  `count_tokens` endpoint through `_input_token_count`) and falls back to
+  `_estimate_input_tokens`. No usage row is recorded, the response carries
+  `X-Mirofish-Probe: short-circuit`, and the caller's `user-agent` is logged
+  because the access log only shows the Docker bridge address for anything
+  reaching a published port. The OpenAI path short-circuits the same way
+  (`openai_to_anthropic` clamps `max_tokens` to a floor of 1, so a caller
+  asking for 0 or 1 builds the same refused shape) and renders it through the
+  existing `anthropic_to_openai_response` / `OpenAIStreamTranslator`. Do not
+  "fix" this by attaching a session or raising `max_tokens` so the upstream
+  accepts it — that converts free rejections into billable requests against the
+  7-day window. `MIROFISH_ONE_TOKEN_SHORT_CIRCUIT=0` restores plain passthrough.
 - Docker runs a single container: `docker-entrypoint.sh` generates the Mihomo config and starts the bundled Mihomo engine (skipped when no subscription is set), then starts the relay; the relay reaches the engine over loopback (`127.0.0.1:9090`/`7890`). If either process exits the container restarts. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Configs without slots fall back to the legacy single-selector mode automatically. Mihomo config + provider cache live under `/data/mihomo/`.
 - Each account binds persistently to one proxy node, rotating on proxy network failure, on an
   upstream 429 `shared_quota_unavailable` (the exit's region is not served to THIS account —

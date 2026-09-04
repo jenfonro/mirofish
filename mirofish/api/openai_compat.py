@@ -6,7 +6,7 @@ import json
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..errors import RelayError
 from ..translate import (OpenAIStreamTranslator, anthropic_to_openai_response,
@@ -14,7 +14,9 @@ from ..translate import (OpenAIStreamTranslator, anthropic_to_openai_response,
 from ..upstream import quota_headers
 from ..validate import model_value
 from .deps import get_state, read_json_body, require_auth
-from .relay import _ManagedStreamingResponse, _finalize_upstream_stream
+from .relay import (_ManagedStreamingResponse, _answer_one_token_probe,
+                    _finalize_upstream_stream, _is_one_token_probe,
+                    _probe_stream_events)
 from .state import ACCOUNT_GENERATION_EXTENSION
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -37,6 +39,29 @@ async def chat_completions(request: Request) -> Any:
     relay_session = state.relay_session_id("", session_hint, payload)
     anthropic_payload = openai_to_anthropic(payload)
     model = str(payload.get("model"))
+
+    # openai_to_anthropic clamps max_tokens to a floor of 1, so a caller asking
+    # for 0 or 1 completion tokens lands on the same shape the upstream refuses
+    # as an availability probe. Answer it here instead of relaying a request
+    # that is guaranteed to fail.
+    if state.settings.one_token_short_circuit and _is_one_token_probe(anthropic_payload):
+        envelope, outgoing = await _answer_one_token_probe(
+            state, request, anthropic_payload, model,
+            stream=bool(payload.get("stream")))
+        if not payload.get("stream"):
+            return JSONResponse(anthropic_to_openai_response(envelope, model),
+                                headers=outgoing)
+        probe_translator = OpenAIStreamTranslator(model)
+
+        async def probe_body() -> AsyncIterator[bytes]:
+            for event, data in _probe_stream_events(envelope):
+                for chunk in probe_translator.feed(event, data):
+                    yield _dump(chunk)
+            yield b"data: [DONE]\n\n"
+
+        return StreamingResponse(
+            probe_body(), media_type="text/event-stream",
+            headers={**outgoing, "Cache-Control": "no-cache"})
 
     if not payload.get("stream"):
         async def run(account: str):

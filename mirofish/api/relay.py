@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 import anyio
@@ -217,6 +218,20 @@ async def messages(request: Request) -> Any:
     beta = _beta_enabled(request)
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
 
+    if state.settings.one_token_short_circuit and _is_one_token_probe(payload):
+        envelope, outgoing = await _answer_one_token_probe(
+            state, request, payload, model, stream=bool(payload.get("stream")))
+        if not payload.get("stream"):
+            return JSONResponse(envelope, headers=outgoing)
+
+        async def probe_body() -> AsyncIterator[bytes]:
+            for event, data in _probe_stream_events(envelope):
+                yield _sse_frame(event, data)
+
+        return StreamingResponse(
+            probe_body(), media_type="text/event-stream",
+            headers={**outgoing, "Cache-Control": "no-cache"})
+
     if not payload.get("stream"):
         async def run(account: str):
             generation = state.store.account_generation(account)
@@ -292,6 +307,111 @@ def _estimate_input_tokens(payload: dict[str, Any]) -> int:
     return max(1, chars // 4)
 
 
+async def _input_token_count(state: Any, request: Request,
+                             payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Route an account and count a payload's input tokens.
+
+    The upstream count endpoint is device-signed and not billable, so this is
+    free. Any failure (endpoint missing, proxy hop down) falls back to the
+    local estimate, so a caller always gets a number. ``payload`` must already
+    be model-validated and Claude-normalized: the count has to describe the
+    same body generation would send.
+    """
+    session_hint = request.headers.get("X-Mirofish-Session", "")
+    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
+                                  session_hint, payload)
+    relay_session = state.relay_session_id(
+        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
+    try:
+        async def op(proxy_url):
+            return await state.upstream.signed_json(
+                account, "POST", "/v1/messages/count_tokens", payload, proxy_url,
+                request_headers=request.headers, session_id=relay_session,
+                beta=_beta_enabled(request))
+        status, _, data = await state.with_proxy(account, op)
+        if 200 <= status < 300 and isinstance(data, dict) and "input_tokens" in data:
+            return account, data
+    except Exception:  # noqa: BLE001 - any failure falls back to the estimate
+        pass
+    return account, {"input_tokens": _estimate_input_tokens(payload)}
+
+
+def _is_one_token_probe(payload: dict[str, Any]) -> bool:
+    """True for a Messages request that can emit at most one output token.
+
+    The upstream reads that shape as an availability probe rather than work and
+    answers 400, pointing the caller at /v1/limits. A missing max_tokens is not
+    a probe; it stays the upstream's own validation problem.
+    """
+    max_tokens = payload.get("max_tokens")
+    if isinstance(max_tokens, bool) or not isinstance(max_tokens, int):
+        return False
+    return max_tokens <= 1
+
+
+def _probe_envelope(model: str | None, input_tokens: int) -> dict[str, Any]:
+    """A structurally valid Messages response for a one-token probe.
+
+    Empty content with stop_reason "max_tokens" is what a request capped at one
+    token can honestly return: nothing was generated, and nothing is invented
+    here either.
+    """
+    return {
+        "id": "msg_" + uuid.uuid4().hex,
+        "type": "message",
+        "role": "assistant",
+        "model": model or "",
+        "content": [],
+        "stop_reason": "max_tokens",
+        "stop_sequence": None,
+        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+    }
+
+
+def _probe_stream_events(envelope: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    """The probe envelope as an Anthropic SSE event sequence.
+
+    Single source of truth for both streaming paths: /v1/messages serializes
+    these frames as-is and the OpenAI path feeds them to OpenAIStreamTranslator.
+    """
+    return [
+        ("message_start", {"type": "message_start", "message": envelope}),
+        ("message_delta", {"type": "message_delta",
+                           "delta": {"stop_reason": "max_tokens",
+                                     "stop_sequence": None},
+                           "usage": {"output_tokens": 0}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+
+
+def _sse_frame(event: str, data: dict[str, Any]) -> bytes:
+    return (f"event: {event}\ndata: "
+            + json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            + "\n\n").encode("utf-8")
+
+
+async def _answer_one_token_probe(
+        state: Any, request: Request, payload: dict[str, Any],
+        model: str | None, *, stream: bool) -> tuple[dict[str, Any], dict[str, str]]:
+    """Answer a one-token availability probe without touching generation.
+
+    Returns the Messages envelope and the relay's response headers. The caller's
+    user agent is logged because the access log only carries the source address,
+    which is the Docker bridge for anything reaching a published port.
+    """
+    account, counted = await _input_token_count(
+        state, request, _claude_compatible_payload(payload))
+    logger.info(
+        "answered one-token probe locally: account=%s model=%s max_tokens=%s "
+        "tools=%s stream=%s user_agent=%s",
+        account, model, payload.get("max_tokens"),
+        len(payload["tools"]) if isinstance(payload.get("tools"), list) else 0,
+        stream, request.headers.get("user-agent", "-"))
+    envelope = _probe_envelope(model, int(counted.get("input_tokens") or 0))
+    return envelope, {"X-Mirofish-Account": account,
+                      "X-Mirofish-Probe": "short-circuit"}
+
+
 @router.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request) -> Any:
     """Anthropic token-counting endpoint. Proxied to upstream (device-signed,
@@ -301,24 +421,8 @@ async def count_tokens(request: Request) -> Any:
     payload = await read_json_body(request)
     payload["model"] = model_value(str(payload.get("model", "")))
     payload = _claude_compatible_payload(payload)
-    session_hint = request.headers.get("X-Mirofish-Session", "")
-    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
-                                  session_hint, payload)
-    relay_session = state.relay_session_id(
-        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
-    outgoing = {"X-Mirofish-Account": account}
-    try:
-        async def op(proxy_url):
-            return await state.upstream.signed_json(
-                account, "POST", "/v1/messages/count_tokens", payload, proxy_url,
-                request_headers=request.headers, session_id=relay_session,
-                beta=_beta_enabled(request))
-        status, _, data = await state.with_proxy(account, op)
-        if 200 <= status < 300 and isinstance(data, dict) and "input_tokens" in data:
-            return JSONResponse(data, headers=outgoing)
-    except Exception:  # noqa: BLE001 - any failure falls back to the estimate
-        pass
-    return JSONResponse({"input_tokens": _estimate_input_tokens(payload)}, headers=outgoing)
+    account, data = await _input_token_count(state, request, payload)
+    return JSONResponse(data, headers={"X-Mirofish-Account": account})
 
 
 @router.get("/v1/models")

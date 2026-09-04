@@ -89,6 +89,13 @@ class Settings:
     in_docker: bool = False
     default_account: str = ""
     session_ttl: float = 1800.0
+    # A Messages request capped at one output token is an availability probe,
+    # not work: the upstream refuses that shape outright and points the caller
+    # at /v1/limits, so forwarding it only spends a signed round trip and a
+    # device ticket per probe. Answer it locally instead. Turn this off to
+    # restore plain passthrough for a caller that really wants one token of
+    # model output (and the upstream 400 that comes with it).
+    one_token_short_circuit: bool = True
 
     proxy_refresh_seconds: float = 600.0
     proxy_fetch_timeout: float = 10.0
@@ -152,6 +159,8 @@ class Settings:
                 os.environ.get("MIROFISH_DEFAULT_MODEL", "gpt-5.6-luna").strip()
                 or "gpt-5.6-luna"),
             session_ttl=_env_float("MIROFISH_SESSION_TTL", 1800.0, minimum=60.0),
+            one_token_short_circuit=_env_bool(
+                "MIROFISH_ONE_TOKEN_SHORT_CIRCUIT", True),
             stream_read_timeout=_env_float(
                 "MIROFISH_STREAM_READ_TIMEOUT", 600.0, minimum=30.0),
             keepalive_expiry=_env_float(

@@ -149,6 +149,7 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
     GET    /proxies
     GET    /v1/models                # 按账号缓存 5 分钟
     POST   /v1/messages              # Anthropic Messages；"stream":true 为真 SSE 透传
+                                     # max_tokens<=1 由 relay 本地作答，不转发（见下）
     POST   /v1/messages/count_tokens # Anthropic token 计数（转发上游，不计费；失败则本地估算）
     POST   /v1/chat/completions      # OpenAI 兼容；支持 tools/图片/流式
                                      # 注意：上游以 thinking 模式服务，仅接受 temperature=1
@@ -288,4 +289,12 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   `MIROFISH_MAX_BODY_BYTES`（默认 8388608）同时限制压缩输入与解压后的正文，防止解压炸弹。
 - `status?probe=1` 使用 `/v1/limits`，不产生模型调用；显式模型扫描会发送最小工作请求，
   可能消耗少量额度。
+- `max_tokens<=1` 的 Messages 请求按构造不可能产出有效内容，上游把它当作可用性探针直接
+  返回 400（并要求改用 `GET /v1/limits`）。relay 因此在本地作答：返回 `content` 为空、
+  `stop_reason` 为 `max_tokens` 的合法 Messages 信封，`usage.input_tokens` 取自不计费的上游
+  `/v1/messages/count_tokens`（不可用时退回本地估算），响应头带 `X-Mirofish-Probe:
+  short-circuit`，并记录调用方 `user-agent` 便于定位来源。这既不计费也不记入用量日志。
+  `/v1/chat/completions` 同理（`max_tokens` 为 0 或 1 都会被翻译成同一形状）。需要恢复原样
+  转发时设置 `MIROFISH_ONE_TOKEN_SHORT_CIRCUIT=0`。可用性请查 `GET /v1/limits`，数 token 请用
+  `POST /v1/messages/count_tokens`。
 - 删除账号只清除本地凭证，不注销远端账号。

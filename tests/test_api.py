@@ -1046,6 +1046,167 @@ async def test_count_tokens_falls_back_on_upstream_404(client, state, auth_heade
 
 
 @respx.mock
+async def test_one_token_probe_answered_without_generation(client, state, auth_headers):
+    """max_tokens<=1 is an availability probe the upstream refuses outright."""
+    add_account(state, "work")
+    mock_device_session()
+    count = respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(200, json={"input_tokens": 42}))
+    generate = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+
+    response = await client.post("/v1/messages?beta=true", headers=auth_headers, json={
+        "model": "claude-opus-5", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["type"] == "message" and body["role"] == "assistant"
+    assert body["model"] == "claude-opus-5"
+    assert body["content"] == []
+    assert body["stop_reason"] == "max_tokens"
+    assert body["usage"] == {"input_tokens": 42, "output_tokens": 0}
+    assert response.headers["X-Mirofish-Probe"] == "short-circuit"
+    assert response.headers["X-Mirofish-Account"] == "work"
+    # Nothing was generated upstream, so nothing is billed or logged as usage.
+    assert not generate.called
+    assert count.called
+    assert state.store.usage_summary(1)["totals"]["requests"] == 0
+
+
+@respx.mock
+async def test_one_token_probe_streams_synthetic_events(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(200, json={"input_tokens": 42}))
+    generate = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, content=SSE_BODY.encode(),
+                                    headers={"content-type": "text/event-stream"}))
+
+    async with client.stream("POST", "/v1/messages", headers=auth_headers, json={
+        "model": "claude-opus-5", "max_tokens": 1, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}]}) as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        assert response.headers["X-Mirofish-Probe"] == "short-circuit"
+        body = (await response.aread()).decode()
+
+    events = [line[7:] for line in body.split("\n") if line.startswith("event: ")]
+    assert events == ["message_start", "message_delta", "message_stop"]
+    start = json.loads(body.split("data: ", 1)[1].split("\n", 1)[0])
+    assert start["message"]["usage"]["input_tokens"] == 42
+    assert start["message"]["stop_reason"] == "max_tokens"
+    assert not generate.called
+
+
+@respx.mock
+async def test_one_token_probe_falls_back_to_local_estimate(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(404, json={"error": {"message": "no such endpoint"}}))
+    generate = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-opus-5", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi there"}]})
+
+    assert response.status_code == 200
+    assert response.json()["usage"]["input_tokens"] == \
+        (len(CLAUDE_AGENT_SYSTEM_MARKER) + len("hi there")) // 4
+    assert not generate.called
+
+
+@respx.mock
+async def test_two_token_request_still_reaches_upstream(client, state, auth_headers):
+    """Only the shape the upstream refuses is short-circuited."""
+    add_account(state, "work")
+    mock_device_session()
+    generate = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-opus-5", "max_tokens": 2,
+        "messages": [{"role": "user", "content": "hi"}]})
+
+    assert response.status_code == 200
+    assert generate.called
+    assert json.loads(generate.calls.last.request.content)["max_tokens"] == 2
+
+
+@respx.mock
+async def test_one_token_short_circuit_switch_restores_passthrough(
+        client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    state.settings.one_token_short_circuit = False
+    generate = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+
+    response = await client.post("/v1/messages", headers=auth_headers, json={
+        "model": "claude-opus-5", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]})
+
+    assert response.status_code == 200
+    assert generate.called
+    assert "X-Mirofish-Probe" not in response.headers
+
+
+@respx.mock
+async def test_chat_completions_one_token_probe_answered_locally(
+        client, state, auth_headers):
+    """openai_to_anthropic clamps max_tokens to 1, so the OpenAI path can build
+    the refused shape from a max_tokens of 0 or 1 as well."""
+    add_account(state, "work")
+    mock_device_session()
+    respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(200, json={"input_tokens": 42}))
+    generate = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, json=ANTHROPIC_RESPONSE))
+
+    response = await client.post("/v1/chat/completions", headers=auth_headers, json={
+        "model": "claude-opus-5", "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]})
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "chat.completion"
+    assert data["choices"][0]["finish_reason"] == "length"
+    assert data["choices"][0]["message"]["content"] is None
+    assert data["usage"] == {"prompt_tokens": 42, "completion_tokens": 0,
+                             "total_tokens": 42}
+    assert response.headers["X-Mirofish-Probe"] == "short-circuit"
+    assert not generate.called
+
+
+@respx.mock
+async def test_chat_completions_one_token_probe_streams(client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(200, json={"input_tokens": 42}))
+    generate = respx.post(RELAY_BASE + "/v1/messages").mock(
+        return_value=httpx.Response(200, content=SSE_BODY.encode(),
+                                    headers={"content-type": "text/event-stream"}))
+
+    async with client.stream("POST", "/v1/chat/completions", headers=auth_headers, json={
+        "model": "claude-opus-5", "max_tokens": 1, "stream": True,
+        "messages": [{"role": "user", "content": "hi"}]}) as response:
+        assert response.status_code == 200
+        body = (await response.aread()).decode()
+
+    lines = [line for line in body.split("\n") if line.startswith("data: ")]
+    assert lines[-1] == "data: [DONE]"
+    chunks = [json.loads(line[6:]) for line in lines[:-1]]
+    assert chunks[0]["choices"][0]["delta"]["role"] == "assistant"
+    assert chunks[-1]["choices"][0]["finish_reason"] == "length"
+    assert chunks[-1]["usage"]["prompt_tokens"] == 42
+    assert not generate.called
+
+
+@respx.mock
 async def test_account_limits(client, state, auth_headers):
     add_account(state, "work")
     mock_device_session()
