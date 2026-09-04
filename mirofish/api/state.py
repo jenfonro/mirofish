@@ -22,7 +22,7 @@ from ..proxy import ProxyPool
 from ..store import HEALTH_ERROR, Store
 from ..upstream import (CREDIT_EXHAUSTED_TYPE, RESPONSES_PATH, Upstream,
                         account_overloaded_503, account_scoped_429,
-                        quota_headers)
+                        account_suspended_403, quota_headers)
 from ..validate import alias_value
 from ..vault import make_credential_store
 
@@ -55,7 +55,13 @@ TRANSIENT_429_COOLDOWN = 60.0
 # guaranteeing the account comes back without anyone watching it.
 #
 # Every other 503 is deliberately absent: see ``_is_health_refusal``.
-HEALTH_RETRY_AFTER = {503: 86400.0}
+#
+# 403 `permission_error`: the upstream suspended the account after repeated
+# rate-limit refusals and states when access returns. That deadline is used
+# verbatim; this entry only covers a suspension whose deadline could not be
+# parsed, where an hour is short enough to cost little and long enough to stop
+# the account from absorbing more refusals.
+HEALTH_RETRY_AFTER = {503: 86400.0, 403: 3600.0}
 
 # Account scheduling. "balanced" spreads new conversations over the accounts
 # carrying the fewest live sessions. "reset_first" instead prefers the account
@@ -873,6 +879,8 @@ class AppState:
         on the way to the upstream.
 
         401 always is: the credentials or the signed session were rejected.
+        403 is when the upstream suspended the account for repeated rate-limit
+        refusals; every request until its stated deadline is refused.
         503 only is when the upstream says ``overloaded_error``. The relay also
         raises 503 for its own reasons (no device ticket, no usable proxy exit)
         and the edge in front of the upstream serves 503 HTML error pages or
@@ -884,10 +892,13 @@ class AppState:
         """
         if exc.status == 401:
             return True
+        if account_suspended_403(exc.status, exc.data) is not None:
+            return True
         return account_overloaded_503(exc.status, exc.data)
 
     def note_account_error(self, alias: str, exc: RelayError) -> bool:
-        """Park an account the upstream refused with 401 or a capacity 503.
+        """Park an account the upstream refused with 401, a suspension 403, or
+        a capacity 503.
 
         Returns True when the error was one of those, letting the caller fail
         over to another account. How long it stays parked depends on whether
@@ -897,8 +908,16 @@ class AppState:
         if not self._is_health_refusal(exc):
             return False
         message = self._refusal_message(exc)
-        retry_after = HEALTH_RETRY_AFTER.get(exc.status)
-        retry_at = time.time() + retry_after if retry_after else None
+        # A suspension states its own deadline, which beats any window we could
+        # pick: retrying before it is guaranteed to fail, and retrying long
+        # after it wastes an account that is already back.
+        suspended_until = account_suspended_403(exc.status, exc.data)
+        if suspended_until:
+            retry_at = suspended_until
+            retry_after = max(0.0, suspended_until - time.time())
+        else:
+            retry_after = HEALTH_RETRY_AFTER.get(exc.status)
+            retry_at = time.time() + retry_after if retry_after else None
         self.drop_account_sessions(alias)
         try:
             self.store.mark_account_error(alias, exc.status, message,

@@ -111,7 +111,7 @@ function retryLabel(seconds: number): string {
   return cooldownLabel(seconds);
 }
 
-// 状态列：上游 401 或 503 overloaded_error 会把账号标记为异常并停止调度，恢复靠手动重试。
+// 状态列：上游 401、403 封停、503 overloaded_error 会把账号标记为异常并停止调度。
 // 其他 503（边缘错误页、relay 自身的 503）是共享故障，不会标记任何账号。
 function healthState(account: Account): "disabled" | "error" | "ok" {
   if (account.disabled) return "disabled";
@@ -131,7 +131,7 @@ function healthTitle(account: Account): string {
     const at = account.health?.at
       ? `（${account.health.at.slice(0, 19).replace("T", " ")} UTC）`
       : "";
-    // 401 需要重新登录；503 是上游容量问题，会自己好，到点自动重试。
+    // 401 需要重新登录；403 封停与 503 容量问题都会自己好，到点自动重试。
     const recovery = account.health?.status === 401
       ? "已暂停调度；凭证已失效，需要重新登录该账号，或在测试台指定它成功发送一次请求"
       : typeof account.health_retry_in === "number"

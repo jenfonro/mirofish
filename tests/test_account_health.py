@@ -44,6 +44,13 @@ SIGNED_SESSION_401 = {"type": "error", "error": {
     "message": "this client version must upgrade to a signed session"}}
 OVERLOADED_503 = {"type": "error", "error": {
     "type": "overloaded_error", "message": "no upstream available"}}
+# The upstream benches an account after repeated rate-limit refusals and says
+# exactly when it comes back.
+SUSPENDED_403 = {"type": "error", "error": {
+    "type": "permission_error",
+    "message": "this account is temporarily suspended after repeated upstream "
+               "rate-limit refusals; access resumes at 2026-09-05T07:11:58Z. "
+               "Contact support if this is unexpected"}}
 # The 503 shapes seen in production that say nothing about the account: an
 # edge HTML error page and a rejection with no parseable envelope at all.
 EDGE_HTML_503 = {"_raw": "<html><head><title>503 Service Unavailable</title>"}
@@ -109,6 +116,63 @@ def test_a_transient_503_leaves_the_account_in_the_rotation(state):
     assert not state.note_account_unserviceable("work", refusal(503, EDGE_HTML_503))
 
     assert state.route_account("", "", _conv("a window")) == "work"
+
+
+def test_a_suspension_403_parks_the_account_until_its_stated_deadline(state):
+    """The upstream suspends an account after repeated rate-limit refusals and
+    states when access returns.
+
+    Every request until then is refused, so leaving the account in rotation
+    means scheduling keeps electing it while the panel still calls it healthy
+    — which is what happened in production: 1832 refusals across 10 accounts,
+    none of them marked abnormal. The stated deadline is used verbatim because
+    retrying before it is guaranteed to fail.
+    """
+    add_account(state, "work")
+    add_account(state, "spare")
+
+    assert state.note_account_unserviceable("work", refusal(403, SUSPENDED_403))
+
+    assert state.account_unhealthy("work")
+    health = state.account_health("work")
+    assert health["status"] == 403
+    assert health["retry_at"] == datetime.datetime(
+        2026, 9, 5, 7, 11, 58, tzinfo=datetime.timezone.utc).timestamp()
+    # It leaves automatic selection; the pinned recovery path still reaches it.
+    assert state.route_account("", "", _conv("a window")) == "spare"
+    assert state.route_account("work", "", {}) == "work"
+
+
+def test_a_suspension_without_a_readable_deadline_still_parks(state):
+    """A suspension whose deadline cannot be read must not stay in rotation.
+
+    Falling back to the status window keeps it out long enough to stop
+    absorbing refusals, without benching it for a day over an unparseable
+    message.
+    """
+    add_account(state, "work")
+    body = {"error": {"type": "permission_error",
+                      "message": "this account is temporarily suspended"}}
+
+    assert state.note_account_unserviceable("work", refusal(403, body))
+
+    assert state.account_unhealthy("work")
+    assert state.health_retry_in("work") == pytest.approx(
+        HEALTH_RETRY_AFTER[403], abs=30)
+
+
+@pytest.mark.parametrize("body", [
+    None,                                                    # panel-disabled
+    {"error": {"type": "permission_error", "message": "forbidden"}},
+    {"error": {"type": "invalid_request_error", "message": "suspended"}},
+])
+def test_other_403s_are_not_account_suspensions(state, body):
+    """Only the suspension envelope parks. The relay's own 403 for a
+    panel-disabled account must not be read as an upstream verdict."""
+    add_account(state, "work")
+
+    assert not state.note_account_unserviceable("work", refusal(403, body))
+    assert not state.account_unhealthy("work")
 
 
 @respx.mock

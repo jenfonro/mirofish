@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import math
+import re
 import ssl
 import time
 import uuid
@@ -531,6 +533,12 @@ def _rejection_detail(body: Any) -> str:
 REGION_REFUSAL_TYPE = "shared_quota_unavailable"
 CREDIT_EXHAUSTED_TYPE = "credit_exhausted_shared"
 OVERLOADED_TYPE = "overloaded_error"
+PERMISSION_ERROR_TYPE = "permission_error"
+# The upstream states the exact moment access returns, so the account can be
+# parked for precisely that long instead of guessing a window. The timestamp is
+# followed by more prose, so match the stamp itself rather than the line end.
+_SUSPENDED_UNTIL = re.compile(
+    r"access resumes at\s*(\d{4}-\d{2}-\d{2}[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)")
 
 
 def _is_region_blocked(status: int, body: Any) -> bool:
@@ -576,6 +584,41 @@ def account_overloaded_503(status: int, body: Any) -> bool:
     error = body.get("error")
     return (isinstance(error, dict)
             and str(error.get("type")) == OVERLOADED_TYPE)
+
+
+def account_suspended_403(status: int, body: Any) -> Optional[float]:
+    """Epoch when an upstream-suspended account may serve traffic again.
+
+    The upstream benches an account after repeated rate-limit refusals and
+    answers 403 ``permission_error`` until a stated deadline. Every request in
+    the meantime is refused, so the account has to leave automatic selection —
+    otherwise scheduling keeps electing it and the caller sees 403s from an
+    account the panel still calls healthy.
+
+    Returns the parsed deadline, ``0.0`` when the refusal is a suspension whose
+    deadline could not be read (park it, but let the shorter default window
+    decide when to retry), or ``None`` when this is some other 403.
+    """
+    if status != 403 or not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict) \
+            or str(error.get("type")) != PERMISSION_ERROR_TYPE:
+        return None
+    message = str(error.get("message") or "")
+    if "suspended" not in message:
+        return None
+    match = _SUSPENDED_UNTIL.search(message)
+    if not match:
+        return 0.0
+    stamp = match.group(1).rstrip(".")
+    try:
+        parsed = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return parsed.timestamp()
 
 
 def _region_block_error(status: int, body: Any,
