@@ -1,4 +1,7 @@
-from mirofish.cli import _cmd_add, _cmd_remove, _proxy_key_notice
+import logging
+
+from mirofish.cli import (_cmd_add, _cmd_remove, _configure_logging,
+                          _proxy_key_notice)
 
 
 def test_proxy_key_notice_never_contains_secret(state):
@@ -53,3 +56,28 @@ def test_cli_remove_uses_state_lifecycle(capsys):
 
     assert state.removed == ["work"]
     assert "已删除本地账号：work" in capsys.readouterr().out
+
+
+def test_serve_logging_makes_package_info_visible():
+    """The relay's own INFO lines must reach stdout.
+
+    Without this the one-token probe log — the only record of which caller is
+    sending them — is dropped by logging's WARNING-level last-resort handler
+    and never appears in ``docker logs``.
+    """
+    root = logging.getLogger()
+    package = logging.getLogger("mirofish")
+    saved = (root.level, list(root.handlers), package.level)
+    try:
+        _configure_logging()
+
+        assert logging.getLogger("mirofish.relay").isEnabledFor(logging.INFO)
+        # Third-party chatter stays off: one line per upstream request would
+        # double the log volume this change is meant to reduce.
+        assert not logging.getLogger("httpx").isEnabledFor(logging.INFO)
+        assert logging.getLogger("httpx").isEnabledFor(logging.WARNING)
+        assert root.handlers
+    finally:
+        root.setLevel(saved[0])
+        root.handlers[:] = saved[1]
+        package.setLevel(saved[2])

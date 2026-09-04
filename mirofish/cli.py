@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import getpass
 import json
+import logging
 import os
 import pathlib
 import sys
@@ -106,6 +107,29 @@ def _run(coroutine) -> None:
     asyncio.run(coroutine)
 
 
+def _configure_logging() -> None:
+    """Give the package's own logger a handler, at INFO.
+
+    Nothing else installs one: uvicorn configures only its own loggers, so a
+    ``logger.info`` call anywhere in ``mirofish.*`` used to reach just
+    logging's last-resort handler — which starts at WARNING — and be dropped.
+    That is why operationally useful lines had to be raised to WARNING to show
+    up in ``docker logs`` at all.
+
+    Root keeps WARNING so httpx and httpcore do not narrate every upstream
+    request, and an operator who already configured logging keeps their
+    handlers: only the package level is set unconditionally, because that is
+    the part this relay depends on.
+    """
+    root = logging.getLogger()
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:     %(message)s"))
+        root.addHandler(handler)
+        root.setLevel(logging.WARNING)
+    logging.getLogger("mirofish").setLevel(logging.INFO)
+
+
 def main() -> int:
     args = make_parser().parse_args()
     try:
@@ -140,6 +164,7 @@ def main() -> int:
                     state.store.row(state.default_account)
                 import uvicorn
                 app = create_app(state)
+                _configure_logging()
                 print(f"中转地址：http://{args.host}:{args.port}")
                 print(_proxy_key_notice(state))
                 print("账号选择头：X-Mirofish-Account")

@@ -89,6 +89,16 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   "fix" this by attaching a session or raising `max_tokens` so the upstream
   accepts it — that converts free rejections into billable requests against the
   7-day window. `MIROFISH_ONE_TOKEN_SHORT_CIRCUIT=0` restores plain passthrough.
+- `cli.py:_configure_logging` (serve path only) is what makes the package's own
+  `logger.info` calls visible: uvicorn configures only its own loggers, so
+  before this an INFO record in `mirofish.*` reached just logging's last-resort
+  handler — which starts at WARNING — and was silently dropped, which is why
+  operational lines had to be logged as warnings to appear in `docker logs`.
+  The `mirofish` logger is set to INFO unconditionally; root keeps WARNING (so
+  httpx/httpcore do not narrate every upstream request) and an operator's
+  existing root handlers are left alone. Adding a diagnostic `logger.info`
+  anywhere in the package now works; removing this makes the one-token probe
+  log — the only record of which caller sends them — invisible again.
 - Docker runs a single container: `docker-entrypoint.sh` generates the Mihomo config and starts the bundled Mihomo engine (skipped when no subscription is set), then starts the relay; the relay reaches the engine over loopback (`127.0.0.1:9090`/`7890`). If either process exits the container restarts. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Configs without slots fall back to the legacy single-selector mode automatically. Mihomo config + provider cache live under `/data/mihomo/`.
 - Each account binds persistently to one proxy node, rotating on proxy network failure, on an
   upstream 429 `shared_quota_unavailable` (the exit's region is not served to THIS account —
