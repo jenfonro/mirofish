@@ -364,6 +364,48 @@ def test_an_unknown_window_falls_back_to_the_fixed_cooldown(state):
         SHARED_QUOTA_COOLDOWN, abs=5)
 
 
+def _window(name, utilization, hours=5):
+    budget = 1000.0
+    return {"name": name, "used": budget * utilization, "budget": budget,
+            "reset_at": time.time() + hours * 3600}
+
+
+@pytest.mark.parametrize("model", ["claude-opus-5", "claude-fable-5-1"])
+def test_a_spent_burst_window_leaves_automatic_selection(state, model):
+    """Every request draws on the 5h window, whatever the model.
+
+    It is the window that fills first, so an account with days of weekly
+    credit can still be unable to serve anything. Leaving it out of the load
+    calculation meant scheduling kept electing it, the upstream refused with
+    credit_exhausted_5h, and repeating that is what earns a suspension.
+    """
+    add_account(state, "spent")
+    add_account(state, "fresh")
+    state.store.merge_metadata("spent", {"limits": {"windows": [
+        _window("5h", 1.0), _window("7d", 0.02, 24 * 7),
+        _window("7d_fable", 0.02, 24 * 7)]}})
+    state.store.merge_metadata("fresh", {"limits": {"windows": [
+        _window("5h", 0.1), _window("7d", 0.5, 24 * 7),
+        _window("7d_fable", 0.5, 24 * 7)]}})
+
+    assert not state._quota_ok("spent", model)
+    assert state.route_account("", "", {"model": model,
+                                        "messages": [{"role": "user",
+                                                      "content": "a window"}]}) == "fresh"
+
+
+def test_a_spent_burst_window_still_serves_when_every_account_is_spent(state):
+    """The skip is a preference between accounts, not a way to refuse service:
+    with nothing better available the request still goes out and the upstream
+    stays the final authority."""
+    add_account(state, "only")
+    state.store.merge_metadata("only", {"limits": {"windows": [
+        _window("5h", 1.0), _window("7d", 0.02, 24 * 7)]}})
+
+    assert state.route_account("", "", {
+        "messages": [{"role": "user", "content": "a window"}]}) == "only"
+
+
 def test_region_refusal_stays_with_the_proxy_pool(state):
     # Rotating the exit fixes this one; taking the account out would not.
     add_account(state, "work")

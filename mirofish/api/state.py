@@ -96,6 +96,12 @@ SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
 DEFAULT_SCHEDULE_MAX_UTILIZATION = 0.98
 # The model whose spend is metered against its own weekly window as well.
 FABLE_WINDOW = "7d_fable"
+# The burst window every request draws on, whatever the model. It is the one
+# that fills first — the weekly windows have days of room while this one is
+# already spent — so leaving it out of the load calculation means scheduling
+# keeps electing an account the upstream will refuse with
+# credit_exhausted_5h.
+BURST_WINDOW = "5h"
 # Reset-first is a tilt on the balanced ordering, not a replacement for it.
 # An account is treated as carrying up to this many fewer sessions than it
 # really does as its weekly window approaches expiry, so it takes the next few
@@ -365,11 +371,14 @@ class AppState:
     def _load(self, alias: str, model: Optional[str]) -> float:
         """How full this account is for the requested model.
 
-        A fable request also draws on the model's own weekly window, so take
-        whichever of the two is tighter; the spend lands on both.
+        Every request draws on the 5h burst window and the 7d window; a fable
+        request additionally draws on the model's own weekly window. The spend
+        lands on all of them, so the tightest one decides: an account whose
+        burst window is spent cannot serve the request no matter how much
+        weekly credit it still has.
         """
         windows = self._windows(alias)
-        names = ["7d"]
+        names = [BURST_WINDOW, "7d"]
         if self._is_fable_model(model):
             names.append(FABLE_WINDOW)
         loads = [value for value in
