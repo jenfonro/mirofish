@@ -456,6 +456,51 @@ def test_an_unscoped_429_still_cools_the_whole_account(state):
     assert state.exhausted_cooldown("work", "claude-fable-5") > 0
 
 
+def test_a_pool_wide_fable_refusal_answers_429_without_calling_upstream(state):
+    """Once every account's fable allowance is spent, the relay answers itself.
+
+    Sending the request anyway earns one more upstream refusal per attempt,
+    and enough of those suspend the account for a day — the exact loop that
+    benched ten accounts. The answer carries the upstream's own vocabulary so
+    a client can tell "wait for the window" from "the relay is down".
+    """
+    add_account(state, "one")
+    add_account(state, "two")
+    for alias in ("one", "two"):
+        state.note_account_unserviceable(alias, fable_exhausted())
+
+    with pytest.raises(RelayError) as excinfo:
+        state.route_account("", "", {
+            "model": "claude-fable-5-1",
+            "messages": [{"role": "user", "content": "a window"}]})
+
+    error = excinfo.value
+    assert error.status == 429
+    body = error.payload()["error"]
+    assert body["type"] == "rate_limit_error"
+    assert body["code"] == "credit_exhausted_7d_fable"
+    # Non-fable traffic is untouched by the same state.
+    assert state.route_account("", "", {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "a window"}]}) in {"one", "two"}
+
+
+def test_a_mixed_outage_does_not_claim_the_allowance_is_spent(state):
+    """Only claim a spent allowance when that is really why the pool is empty;
+    a disabled account plus a cooling one is a different situation."""
+    add_account(state, "cooling")
+    add_account(state, "off")
+    state.store.merge_metadata("off", {"disabled": True})
+    state.note_account_unserviceable("cooling", refusal(429, "rate_limit_error"))
+
+    with pytest.raises(RelayError) as excinfo:
+        state.route_account("", "", {
+            "model": "claude-fable-5-1",
+            "messages": [{"role": "user", "content": "a window"}]})
+
+    assert excinfo.value.status == 503
+
+
 def test_region_refusal_stays_with_the_proxy_pool(state):
     # Rotating the exit fixes this one; taking the account out would not.
     add_account(state, "work")

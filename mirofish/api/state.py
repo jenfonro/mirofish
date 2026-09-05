@@ -552,9 +552,58 @@ class AppState:
             raise RelayError("account is disabled in the panel: " + alias, 403)
         return alias
 
-    def _no_selectable_error(self) -> RelayError:
+    def _no_selectable_error(self, model: Optional[str] = None) -> RelayError:
+        """Why no account can take this request.
+
+        When every account is merely cooling down on the window this model
+        spends, the honest answer is the upstream's own verdict: the allowance
+        is gone until it resets. Answering it here matters — sending the
+        request anyway would earn one more refusal per attempt, and enough of
+        those suspend the account for a day. A shorter model keeps working, so
+        the refusal names the window rather than claiming the relay is down.
+        """
+        window = self._pool_exhausted_window(model)
+        if window:
+            resets_in = self._pool_cooldown(model)
+            return RelayError(
+                "every account has spent its %s allowance; it comes back when "
+                "the window resets%s. Other models are unaffected." % (
+                    window,
+                    " (about %d min)" % round(resets_in / 60) if resets_in else ""),
+                429, {"error": {
+                    "type": "rate_limit_error",
+                    "code": "credit_exhausted_" + window,
+                    "message": "every account has spent its %s allowance; "
+                               "switch models or wait for the window to reset"
+                               % window}})
         return RelayError("all accounts are disabled or cooling down after a "
                           "shared-quota refusal; enable one in the panel or retry later", 503)
+
+    def _pool_exhausted_window(self, model: Optional[str]) -> str:
+        """The window every otherwise-usable account is cooling down on, if the
+        whole pool is held back by exactly that one. Empty when the accounts
+        are unavailable for mixed or unrelated reasons, where a spent-allowance
+        answer would be a lie."""
+        windows: set[str] = set()
+        for alias in self.store.aliases():
+            if self.account_disabled(alias) or self.account_unhealthy(alias):
+                continue
+            scoped = self._exhausted_until.get(alias) or {}
+            now = time.time()
+            live = {window for window, until in scoped.items()
+                    if until > now and self._window_applies(window, model)}
+            if not live:
+                return ""  # this account could have served it
+            windows |= live
+        return windows.pop() if len(windows) == 1 else ""
+
+    def _pool_cooldown(self, model: Optional[str]) -> float:
+        """Shortest wait until some account can serve this model again."""
+        waits = [self.exhausted_cooldown(alias, model)
+                 for alias in self.store.aliases()
+                 if not self.account_disabled(alias)
+                 and not self.account_unhealthy(alias)]
+        return min(waits) if waits else 0.0
 
     def pick_account(self, requested: str, model: Optional[str] = None, *,
                      allow_unhealthy: bool = False) -> str:
@@ -578,7 +627,7 @@ class AppState:
             return self.default_account
         selectable = [alias for alias in aliases if eligible(alias)]
         if not selectable:
-            raise self._no_selectable_error()
+            raise self._no_selectable_error(model)
         schedule = self.schedule_settings()
         if schedule["mode"] == SCHEDULE_RESET_FIRST:
             # There is no session key to stay stable for, but the live session
@@ -764,7 +813,7 @@ class AppState:
             # New window: order the eligible accounts by the configured mode.
             serviceable = [alias for alias in aliases if self._selectable(alias, model)]
             if not serviceable:
-                raise self._no_selectable_error()
+                raise self._no_selectable_error(model)
             eligible = [alias for alias in serviceable
                         if self._quota_ok(alias, model)] or serviceable
             counts = {alias: 0 for alias in eligible}
