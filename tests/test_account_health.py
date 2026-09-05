@@ -44,13 +44,24 @@ SIGNED_SESSION_401 = {"type": "error", "error": {
     "message": "this client version must upgrade to a signed session"}}
 OVERLOADED_503 = {"type": "error", "error": {
     "type": "overloaded_error", "message": "no upstream available"}}
-# The upstream benches an account after repeated rate-limit refusals and says
-# exactly when it comes back.
-SUSPENDED_403 = {"type": "error", "error": {
-    "type": "permission_error",
-    "message": "this account is temporarily suspended after repeated upstream "
-               "rate-limit refusals; access resumes at 2026-09-05T07:11:58Z. "
-               "Contact support if this is unexpected"}}
+
+def suspended_403(resumes_in=3600.0):
+    """The upstream benches an account after repeated rate-limit refusals and
+    says exactly when it comes back.
+
+    The deadline is relative to now: a hard-coded date silently stops testing
+    anything once it passes.
+    """
+    resumes_at = (datetime.datetime.now(datetime.timezone.utc)
+                  + datetime.timedelta(seconds=resumes_in))
+    return {"type": "error", "error": {
+        "type": "permission_error",
+        "message": "this account is temporarily suspended after repeated "
+                   "upstream rate-limit refusals; access resumes at "
+                   + resumes_at.isoformat().replace("+00:00", "Z")
+                   + ". Contact support if this is unexpected"}}
+
+
 # The 503 shapes seen in production that say nothing about the account: an
 # edge HTML error page and a rejection with no parseable envelope at all.
 EDGE_HTML_503 = {"_raw": "<html><head><title>503 Service Unavailable</title>"}
@@ -131,13 +142,15 @@ def test_a_suspension_403_parks_the_account_until_its_stated_deadline(state):
     add_account(state, "work")
     add_account(state, "spare")
 
-    assert state.note_account_unserviceable("work", refusal(403, SUSPENDED_403))
+    resumes_in = 3600.0
+    assert state.note_account_unserviceable(
+        "work", refusal(403, suspended_403(resumes_in)))
 
     assert state.account_unhealthy("work")
     health = state.account_health("work")
     assert health["status"] == 403
-    assert health["retry_at"] == datetime.datetime(
-        2026, 9, 5, 7, 11, 58, tzinfo=datetime.timezone.utc).timestamp()
+    # The stated deadline is used verbatim, not a window of our choosing.
+    assert health["retry_at"] == pytest.approx(time.time() + resumes_in, abs=5)
     # It leaves automatic selection; the pinned recovery path still reaches it.
     assert state.route_account("", "", _conv("a window")) == "spare"
     assert state.route_account("work", "", {}) == "work"

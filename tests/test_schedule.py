@@ -406,6 +406,56 @@ def test_a_spent_burst_window_still_serves_when_every_account_is_spent(state):
         "messages": [{"role": "user", "content": "a window"}]}) == "only"
 
 
+def fable_exhausted():
+    """The refusal the upstream sends once a fable allowance is spent. Its own
+    message says the account still serves everything else."""
+    return RelayError("upstream refused", 429, {"error": {
+        "code": "credit_exhausted_7d_fable", "type": "rate_limit_error",
+        "message": "已用满 7d_fable 用量上限，可切换其它模型继续 (this model "
+                   "family's allowance is spent; other models still work)"}})
+
+
+def test_a_spent_fable_allowance_does_not_bench_other_models(state):
+    """A cooldown only covers the window the upstream named.
+
+    Every account exhausts its fable allowance long before its 7d window, so
+    benching the whole account on that refusal emptied the pool for opus too:
+    81 of 82 accounts sat out over a refusal that never applied to them, while
+    the upstream itself said "other models still work".
+    """
+    add_account(state, "work")
+
+    assert state.note_account_unserviceable("work", fable_exhausted())
+
+    assert state.exhausted_cooldown("work", "claude-fable-5") > 0
+    assert state.exhausted_cooldown("work", "claude-fable-5-1") > 0
+    assert state.exhausted_cooldown("work", "claude-opus-5") == 0
+    # The panel asks the account-wide question and still sees the cooldown.
+    assert state.exhausted_cooldown("work") > 0
+
+
+def test_the_last_account_still_routes_non_fable_traffic_after_a_fable_refusal(state):
+    """The pool must not look empty to opus because fable is spent."""
+    add_account(state, "work")
+    state.note_account_unserviceable("work", fable_exhausted())
+
+    assert state.route_account("", "", {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "a window"}]}) == "work"
+    assert state.pick_account("", "claude-opus-5") == "work"
+
+
+def test_an_unscoped_429_still_cools_the_whole_account(state):
+    """A refusal that names no window says nothing about which models are
+    affected, so it has to cover all of them."""
+    add_account(state, "work")
+
+    state.note_account_unserviceable("work", refusal(429, "rate_limit_error"))
+
+    assert state.exhausted_cooldown("work", "claude-opus-5") > 0
+    assert state.exhausted_cooldown("work", "claude-fable-5") > 0
+
+
 def test_region_refusal_stays_with_the_proxy_pool(state):
     # Rotating the exit fixes this one; taking the account out would not.
     add_account(state, "work")

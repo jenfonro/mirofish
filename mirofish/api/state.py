@@ -169,7 +169,9 @@ class AppState:
         self._session_lock = threading.Lock()
         # alias -> epoch until which automatic selection avoids the account
         # (upstream refused it with credit_exhausted_shared).
-        self._exhausted_until: dict[str, float] = {}
+        # alias -> {window name: epoch until}. Scoped per window so a spent
+        # fable allowance does not bench the account for every other model.
+        self._exhausted_until: dict[str, dict[str, float]] = {}
         self._limits_task: Optional[asyncio.Task[None]] = None
         self._limits_wake: Optional[asyncio.Event] = None
 
@@ -490,25 +492,57 @@ class AppState:
         except (TypeError, ValueError):
             return None
 
-    def exhausted_cooldown(self, alias: str) -> float:
-        """Seconds left in this account's shared-quota cooldown (0 = serviceable)."""
-        return max(0.0, self._exhausted_until.get(alias, 0.0) - time.time())
+    def exhausted_cooldown(self, alias: str,
+                           model: Optional[str] = None) -> float:
+        """Seconds left in this account's quota cooldown (0 = serviceable).
 
-    def _selectable(self, alias: str) -> bool:
+        A cooldown is scoped to the window the upstream named: exhausting
+        ``7d_fable`` only blocks fable models, and the upstream says so
+        outright ("other models still work"). Benching the whole account there
+        is what emptied the pool — every account has a spent fable window long
+        before its 7d window is gone, so opus traffic lost 81 of 82 accounts
+        over a refusal that never applied to it.
+
+        ``model=None`` asks the account-wide question (panel display, health
+        checks) and reports the longest cooldown in force.
+        """
+        now = time.time()
+        scoped = self._exhausted_until.get(alias)
+        if not scoped:
+            return 0.0
+        if model is None:
+            return max([0.0, *(until - now for until in scoped.values())])
+        return max([0.0, *(until - now for window, until in scoped.items()
+                           if self._window_applies(window, model))])
+
+    def _window_applies(self, window: str, model: Optional[str]) -> bool:
+        """Whether a request for ``model`` spends this usage window.
+
+        The empty window is a refusal that named none, so it counts against
+        everything; the fable window only against fable models.
+        """
+        if not window:
+            return True
+        if window == FABLE_WINDOW:
+            return self._is_fable_model(model)
+        return True
+
+    def _selectable(self, alias: str, model: Optional[str] = None) -> bool:
         """Eligible for automatic selection: not switched off in the panel and
-        neither cooling down after an upstream shared-quota refusal nor parked
-        by a 401/503. Quota load is a soft preference handled separately; these
+        neither cooling down for this model's windows nor parked by a
+        401/403/503. Quota load is a soft preference handled separately; these
         are hard exclusions."""
-        return self._serviceable(alias) and not self.account_unhealthy(alias)
+        return self._serviceable(alias, model) and not self.account_unhealthy(alias)
 
-    def _serviceable(self, alias: str) -> bool:
+    def _serviceable(self, alias: str, model: Optional[str] = None) -> bool:
         """Usable for a zero-cost control-plane read.
 
         Same as ``_selectable`` minus the health verdict: a 401/503 refusal
         stops model traffic, but the account can still answer the model
         catalog, and a parked account must not take the panel down with it.
         """
-        return not self.account_disabled(alias) and self.exhausted_cooldown(alias) <= 0.0
+        return (not self.account_disabled(alias)
+                and self.exhausted_cooldown(alias, model) <= 0.0)
 
     def _explicit_account(self, requested: str) -> str:
         """An explicitly requested account is honored even during a cooldown
@@ -537,7 +571,9 @@ class AppState:
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
-        eligible = self._serviceable if allow_unhealthy else self._selectable
+        base = self._serviceable if allow_unhealthy else self._selectable
+        def eligible(alias: str) -> bool:
+            return base(alias, model)
         if self.default_account in aliases and eligible(self.default_account):
             return self.default_account
         selectable = [alias for alias in aliases if eligible(alias)]
@@ -720,11 +756,13 @@ class AppState:
             self._prune_sessions(now)
             entry = self._sessions.get(key)
             if entry and entry["account"] in aliases and self._selectable(entry["account"]) \
-                    and self._quota_ok(entry["account"], model):
+                    and self._quota_ok(entry["account"], model) \
+                    and self.exhausted_cooldown(entry["account"], model) <= 0.0:
                 entry["last"] = now
+                entry["model"] = model
                 return entry["account"]
             # New window: order the eligible accounts by the configured mode.
-            serviceable = [alias for alias in aliases if self._selectable(alias)]
+            serviceable = [alias for alias in aliases if self._selectable(alias, model)]
             if not serviceable:
                 raise self._no_selectable_error()
             eligible = [alias for alias in serviceable
@@ -737,7 +775,7 @@ class AppState:
             chosen = min(eligible,
                          key=lambda alias: self._assignment_key(
                              alias, counts, schedule, model))
-            self._sessions[key] = {"account": chosen, "last": now}
+            self._sessions[key] = {"account": chosen, "last": now, "model": model}
             self._last_assigned[chosen] = now
             return chosen
 
@@ -765,14 +803,15 @@ class AppState:
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
-        if self.default_account in aliases and self._selectable(self.default_account):
-            return self.default_account
         key = (session_hint or "").strip() or self._session_key_from_payload(payload)
         model = payload.get("model") if isinstance(payload, dict) else None
+        model = model if isinstance(model, str) else None
+        if self.default_account in aliases \
+                and self._selectable(self.default_account, model):
+            return self.default_account
         if not key:
-            return self.pick_account("", model if isinstance(model, str) else None)
-        return self._sticky_account(key, aliases,
-                                    model if isinstance(model, str) else None)
+            return self.pick_account("", model)
+        return self._sticky_account(key, aliases, model)
 
     # --- account-level failover -----------------------------------------------
 
@@ -793,6 +832,21 @@ class AppState:
         other 429 shapes, which are usually transient rate pressure."""
         return credit_exhausted_429(exc.status, exc.data)
 
+    @staticmethod
+    def _exhausted_window(exc: RelayError) -> str:
+        """Which usage window the upstream says is spent, from the error code.
+
+        ``credit_exhausted_7d_fable`` -> ``7d_fable``. An empty string means the
+        refusal did not name one, in which case it has to be treated as
+        covering the whole account.
+        """
+        error = exc.data.get("error") if isinstance(exc.data, dict) else None
+        code = str((error or {}).get("code") or "")
+        prefix = CREDIT_EXHAUSTED_CODE_PREFIX + "_"
+        window = code[len(prefix):] if code.startswith(prefix) else ""
+        # "shared" is the generic spelling, not a window in /v1/limits.
+        return "" if window == "shared" else window
+
     def _quota_cooldown(self, alias: str, exc: RelayError) -> float:
         """How long to bench an account whose window the upstream says is spent.
 
@@ -804,23 +858,27 @@ class AppState:
         so a reset that is seconds away does not put the account straight back
         into rotation to be refused again.
         """
-        error = exc.data.get("error") if isinstance(exc.data, dict) else None
-        code = str((error or {}).get("code") or "")
-        window = code[len(CREDIT_EXHAUSTED_CODE_PREFIX) + 1:] if code.startswith(
-            CREDIT_EXHAUSTED_CODE_PREFIX + "_") else ""
-        reset_at = (self._windows(alias).get(window) or {}).get("reset_at")
+        reset_at = (self._windows(alias).get(
+            self._exhausted_window(exc)) or {}).get("reset_at")
         try:
             remaining = float(reset_at) - time.time() if reset_at else 0.0
         except (TypeError, ValueError):
             remaining = 0.0
         return min(MAX_QUOTA_COOLDOWN, max(SHARED_QUOTA_COOLDOWN, remaining))
 
-    def drop_account_sessions(self, alias: str) -> None:
+    def drop_account_sessions(self, alias: str, window: str = "") -> None:
         """Detach live sessions pinned to an account so each conversation's next
-        turn is reassigned instead of repeating a failing or disabled account."""
+        turn is reassigned instead of repeating a failing or disabled account.
+
+        ``window`` narrows this to the conversations a scoped cooldown actually
+        covers: a spent fable allowance must not tear down the account's opus
+        conversations, which keep working. The default drops everything, which
+        is what a whole-account refusal (401/403/503, an unscoped 429) needs.
+        """
         with self._session_lock:
             stale = [key for key, entry in self._sessions.items()
-                     if entry["account"] == alias]
+                     if entry["account"] == alias
+                     and self._window_applies(window, entry.get("model"))]
             for key in stale:
                 del self._sessions[key]
 
@@ -882,15 +940,20 @@ class AppState:
         if self._is_account_exhausted(exc):
             if self._is_credit_exhausted(exc):
                 cooldown = self._quota_cooldown(alias, exc)
-                reason = "spent usage window"
+                window = self._exhausted_window(exc)
+                reason = "spent %s window" % (window or "usage")
             else:
                 cooldown, reason = TRANSIENT_429_COOLDOWN, "account-scoped 429"
+                window = ""
         elif self._is_region_refused_everywhere(exc):
             cooldown, reason = SHARED_QUOTA_COOLDOWN, "region refusal from every exit"
+            window = ""
         else:
             return self.note_account_error(alias, exc)
-        self._exhausted_until[alias] = time.time() + cooldown
-        self.drop_account_sessions(alias)
+        self._exhausted_until.setdefault(alias, {})[window] = time.time() + cooldown
+        # Only the traffic this cooldown covers has to be reassigned; a spent
+        # fable window must not tear down the account's other conversations.
+        self.drop_account_sessions(alias, window)
         logger.warning(
             "account cooling down for %ds after %s: account=%s",
             int(cooldown), reason, alias)
