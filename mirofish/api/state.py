@@ -580,22 +580,34 @@ class AppState:
                           "shared-quota refusal; enable one in the panel or retry later", 503)
 
     def _pool_exhausted_window(self, model: Optional[str]) -> str:
-        """The window every otherwise-usable account is cooling down on, if the
-        whole pool is held back by exactly that one. Empty when the accounts
-        are unavailable for mixed or unrelated reasons, where a spent-allowance
-        answer would be a lie."""
-        windows: set[str] = set()
+        """The spent allowance to report when no account can take this request.
+
+        Every otherwise-usable account must be held back by a spent window this
+        model draws on — if even one is free for another reason, the pool is
+        not out of allowance and saying so would be a lie. Accounts commonly
+        sit on different windows (some spent `7d`, most spent `7d_fable`), so
+        report the one that holds back the most of them rather than demanding
+        they all match; the client only needs to know which allowance to wait
+        on. An unnamed window ("") cannot be reported and disqualifies the
+        whole answer.
+        """
+        counts: dict[str, int] = {}
+        now = time.time()
         for alias in self.store.aliases():
             if self.account_disabled(alias) or self.account_unhealthy(alias):
                 continue
             scoped = self._exhausted_until.get(alias) or {}
-            now = time.time()
-            live = {window for window, until in scoped.items()
-                    if until > now and self._window_applies(window, model)}
+            live = [window for window, until in scoped.items()
+                    if until > now and self._window_applies(window, model)]
             if not live:
                 return ""  # this account could have served it
-            windows |= live
-        return windows.pop() if len(windows) == 1 else ""
+            if not all(live):
+                return ""  # an unscoped refusal: no allowance to name
+            for window in live:
+                counts[window] = counts.get(window, 0) + 1
+        if not counts:
+            return ""
+        return max(counts, key=lambda window: (counts[window], window))
 
     def _pool_cooldown(self, model: Optional[str]) -> float:
         """Shortest wait until some account can serve this model again."""

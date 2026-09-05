@@ -501,6 +501,32 @@ def test_a_mixed_outage_does_not_claim_the_allowance_is_spent(state):
     assert excinfo.value.status == 503
 
 
+def test_accounts_spent_on_different_windows_still_report_one(state):
+    """Real pools are not uniform: a few accounts have spent 7d while most have
+    spent 7d_fable. Both hold back a fable request, so the pool is genuinely
+    out of allowance and must not fall back to the generic 503."""
+    add_account(state, "weekly")
+    for alias in ("fable_a", "fable_b"):
+        add_account(state, alias)
+        state.note_account_unserviceable(alias, fable_exhausted())
+    state.note_account_unserviceable("weekly", RelayError(
+        "upstream refused", 429, {"error": {
+            "code": "credit_exhausted_7d", "type": "rate_limit_error"}}))
+
+    with pytest.raises(RelayError) as excinfo:
+        state.route_account("", "", {
+            "model": "claude-fable-5-1",
+            "messages": [{"role": "user", "content": "a window"}]})
+
+    assert excinfo.value.status == 429
+    # The window holding back the most accounts is the useful one to name.
+    assert excinfo.value.payload()["error"]["code"] == "credit_exhausted_7d_fable"
+    # The 7d account is spent for everything, but the fable ones still serve opus.
+    assert state.route_account("", "", {
+        "model": "claude-opus-5",
+        "messages": [{"role": "user", "content": "a window"}]}) in {"fable_a", "fable_b"}
+
+
 def test_region_refusal_stays_with_the_proxy_pool(state):
     # Rotating the exit fixes this one; taking the account out would not.
     add_account(state, "work")
