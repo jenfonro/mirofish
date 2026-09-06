@@ -394,16 +394,41 @@ def test_a_spent_burst_window_leaves_automatic_selection(state, model):
                                                       "content": "a window"}]}) == "fresh"
 
 
-def test_a_spent_burst_window_still_serves_when_every_account_is_spent(state):
-    """The skip is a preference between accounts, not a way to refuse service:
-    with nothing better available the request still goes out and the upstream
-    stays the final authority."""
+def test_a_pool_wide_spent_burst_window_is_answered_locally(state):
+    """A spent window is not a preference to fall back from — it is a fact.
+
+    Serving anyway was the old behaviour, on the grounds that the upstream is
+    the final authority. But the cache says this request cannot succeed, so
+    sending it only buys one refusal per attempt, and repeating that is what
+    suspends an account for a day.
+    """
     add_account(state, "only")
     state.store.merge_metadata("only", {"limits": {"windows": [
         _window("5h", 1.0), _window("7d", 0.02, 24 * 7)]}})
 
+    with pytest.raises(RelayError) as excinfo:
+        state.route_account("", "", {
+            "messages": [{"role": "user", "content": "a window"}]})
+
+    assert excinfo.value.status == 429
+    assert excinfo.value.payload()["error"]["code"] == "credit_exhausted_5h"
+
+
+def test_missing_or_stale_numbers_still_serve(state):
+    """The local refusal must rest on positive evidence only.
+
+    An account with no cached windows, or whose window already reset, has no
+    spend to speak of — refusing there would take the relay down over missing
+    data rather than a real limit.
+    """
+    add_account(state, "unknown")
+    add_account(state, "reset")
+    state.store.merge_metadata("reset", {"limits": {"windows": [
+        {"name": "5h", "used": 1000.0, "budget": 1000.0,
+         "reset_at": time.time() - 60}]}})
+
     assert state.route_account("", "", {
-        "messages": [{"role": "user", "content": "a window"}]}) == "only"
+        "messages": [{"role": "user", "content": "a window"}]}) in {"unknown", "reset"}
 
 
 def fable_exhausted():

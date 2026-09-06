@@ -36,9 +36,14 @@ MAX_NETWORK_PROXY_ATTEMPTS = 4
 # refusal holds until the window resets, so re-probing every 10 minutes is
 # already generous; the cached `reset_at` is preferred when available.
 SHARED_QUOTA_COOLDOWN = 600.0
-# Ceiling on a reset-derived cooldown. A 7-day window can be days away, and
-# benching an account that long on one refusal would hide a window that got
-# raised or reset early, so re-probe at least once an hour.
+# Ceiling on a cooldown derived from a window whose reset time we do NOT know.
+# A known `reset_at` is used in full instead: the refusal provably lasts until
+# then, and the limits sweep re-reads the window every LIMITS_REFRESH_SECONDS,
+# so a window that is raised or reset early is picked up from the cache rather
+# than by spending an upstream refusal to discover it. Capping a known deadline
+# at an hour meant a 7-day window was re-probed hourly forever: 76 accounts
+# refused every hour, which is exactly the "repeated rate-limit refusals" the
+# upstream suspends accounts for.
 MAX_QUOTA_COOLDOWN = 3600.0
 # Cooldown for a 429 the relay does not recognize. Those are usually transient
 # rate pressure that clears in seconds, so the account only needs to sit out
@@ -617,6 +622,65 @@ class AppState:
                  and not self.account_unhealthy(alias)]
         return min(waits) if waits else 0.0
 
+    def _last_resort(self, serviceable: list[str],
+                     model: Optional[str]) -> list[str]:
+        """What to do when no account is under the exhaustion mark.
+
+        Serving anyway is right when the numbers are merely stale or missing —
+        the upstream stays the final authority. It is wrong when the cache
+        positively says every window this model spends is used up: the request
+        cannot succeed, and sending it costs one upstream refusal per attempt.
+        Repeating that is what suspends an account for a day, and with 76
+        accounts over their fable budget it meant 76 refusals an hour forever.
+        """
+        if all(self._load(alias, model) >= QUOTA_EXHAUSTED
+               for alias in serviceable):
+            raise self._spent_allowance_error(model, serviceable)
+        return serviceable
+
+    def _spent_allowance_error(self, model: Optional[str],
+                               aliases: list[str]) -> RelayError:
+        """The upstream's own verdict, answered locally: this model's allowance
+        is gone on every account until its window resets."""
+        window = self._tightest_window(model, aliases)
+        resets_in = min((self._window_reset_in(alias, window)
+                         for alias in aliases), default=0.0)
+        return RelayError(
+            "every account has spent its %s allowance; it comes back when the "
+            "window resets%s. Other models are unaffected." % (
+                window,
+                " (about %d h)" % round(resets_in / 3600) if resets_in else ""),
+            429, {"error": {
+                "type": "rate_limit_error",
+                "code": "credit_exhausted_" + window,
+                "message": "every account has spent its %s allowance; switch "
+                           "models or wait for the window to reset" % window}})
+
+    def _tightest_window(self, model: Optional[str],
+                         aliases: list[str]) -> str:
+        """The window that is spent on the most accounts, which is the one a
+        caller has to wait on."""
+        counts: dict[str, int] = {}
+        names = [BURST_WINDOW, "7d"]
+        if self._is_fable_model(model):
+            names.append(FABLE_WINDOW)
+        for alias in aliases:
+            windows = self._windows(alias)
+            for name in names:
+                value = self._window_utilization(windows.get(name))
+                if value is not None and value >= QUOTA_EXHAUSTED:
+                    counts[name] = counts.get(name, 0) + 1
+        if not counts:
+            return FABLE_WINDOW if self._is_fable_model(model) else "7d"
+        return max(counts, key=lambda name: (counts[name], name))
+
+    def _window_reset_in(self, alias: str, window: str) -> float:
+        reset_at = (self._windows(alias).get(window) or {}).get("reset_at")
+        try:
+            return max(0.0, float(reset_at) - time.time()) if reset_at else 0.0
+        except (TypeError, ValueError):
+            return 0.0
+
     def pick_account(self, requested: str, model: Optional[str] = None, *,
                      allow_unhealthy: bool = False) -> str:
         """Explicit header > default account > quota-aware round-robin.
@@ -663,9 +727,11 @@ class AppState:
                     self._rr_index = (start + offset + 1) % len(aliases)
                     break
             if chosen is None:
-                # Every serviceable account looks exhausted; round-robin among
-                # the serviceable ones anyway.
-                chosen = selectable[start % len(selectable)]
+                # Every serviceable account looks exhausted. Serve anyway when
+                # the numbers are stale or missing, but not when the cache says
+                # this model's windows are provably spent (see _last_resort).
+                fallback = self._last_resort(selectable, model)
+                chosen = fallback[start % len(fallback)]
                 self._rr_index = (start + 1) % len(aliases)
             return chosen
 
@@ -827,7 +893,9 @@ class AppState:
             if not serviceable:
                 raise self._no_selectable_error(model)
             eligible = [alias for alias in serviceable
-                        if self._quota_ok(alias, model)] or serviceable
+                        if self._quota_ok(alias, model)]
+            if not eligible:
+                eligible = self._last_resort(serviceable, model)
             counts = {alias: 0 for alias in eligible}
             for existing in self._sessions.values():
                 if existing["account"] in counts:
