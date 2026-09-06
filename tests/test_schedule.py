@@ -293,7 +293,7 @@ def test_credit_exhaustion_cools_much_longer_than_a_transient_429(state):
     state.note_account_unserviceable(
         "work", refusal(429, "credit_exhausted_shared"))
     assert state.exhausted_cooldown("work") == \
-        pytest.approx(SHARED_QUOTA_COOLDOWN, abs=5)
+        pytest.approx(MAX_QUOTA_COOLDOWN, abs=5)
     state._exhausted_until.clear()
     state.note_account_unserviceable("work", refusal(429, "rate_limit_error"))
     assert state.exhausted_cooldown("work") == \
@@ -339,14 +339,30 @@ def test_a_spent_window_cools_until_that_window_resets(state):
     assert state.exhausted_cooldown("work") == pytest.approx(reset_in, abs=30)
 
 
-def test_a_far_off_reset_is_still_re_probed_within_the_hour(state):
-    """A 7-day window can be days away. Benching an account that long on one
-    refusal would hide a window that was raised or reset early."""
+def test_a_known_reset_is_waited_out_in_full(state):
+    """A stated deadline is used as-is, however far off.
+
+    Capping it at an hour re-probed a 7-day window hourly for days, spending
+    one upstream refusal per account every time — the very pattern that earns
+    a suspension. An early reset is noticed by the limits sweep instead, which
+    re-reads the window every few minutes for free.
+    """
     add_account(state, "work")
+    reset_in = 5 * 86400
     state.store.merge_metadata("work", {"limits": {"windows": [
         {"name": "7d", "used": 140000.0, "budget": 140000.0,
-         "reset_at": time.time() + 5 * 86400},
+         "reset_at": time.time() + reset_in},
     ]}})
+
+    state.note_account_unserviceable("work", exhausted_refusal("credit_exhausted_7d"))
+
+    assert state.exhausted_cooldown("work") == pytest.approx(reset_in, abs=30)
+
+
+def test_an_unknown_reset_falls_back_to_the_ceiling(state):
+    """With no cached deadline there is nothing to wait out, so re-probe on the
+    fixed ceiling rather than guessing."""
+    add_account(state, "work")
 
     state.note_account_unserviceable("work", exhausted_refusal("credit_exhausted_7d"))
 
@@ -359,6 +375,20 @@ def test_an_unknown_window_falls_back_to_the_fixed_cooldown(state):
     add_account(state, "work")
 
     state.note_account_unserviceable("work", exhausted_refusal("credit_exhausted_9z"))
+
+    assert state.exhausted_cooldown("work") == pytest.approx(
+        MAX_QUOTA_COOLDOWN, abs=5)
+
+
+def test_an_imminent_reset_is_not_retried_immediately(state):
+    """SHARED_QUOTA_COOLDOWN survives as the floor: a window seconds from
+    resetting must not put the account straight back to be refused again."""
+    add_account(state, "work")
+    state.store.merge_metadata("work", {"limits": {"windows": [
+        {"name": "5h", "used": 100.0, "budget": 100.0,
+         "reset_at": time.time() + 30}]}})
+
+    state.note_account_unserviceable("work", exhausted_refusal("credit_exhausted_5h"))
 
     assert state.exhausted_cooldown("work") == pytest.approx(
         SHARED_QUOTA_COOLDOWN, abs=5)

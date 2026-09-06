@@ -993,7 +993,14 @@ class AppState:
             remaining = float(reset_at) - time.time() if reset_at else 0.0
         except (TypeError, ValueError):
             remaining = 0.0
-        return min(MAX_QUOTA_COOLDOWN, max(SHARED_QUOTA_COOLDOWN, remaining))
+        if remaining > 0:
+            # A known deadline is used in full. Capping it meant a 7-day window
+            # was re-probed every hour for days, spending one refusal per
+            # account each time; the limits sweep already re-reads the window
+            # every LIMITS_REFRESH_SECONDS, so an early reset is noticed from
+            # the cache instead.
+            return max(SHARED_QUOTA_COOLDOWN, remaining)
+        return MAX_QUOTA_COOLDOWN
 
     def drop_account_sessions(self, alias: str, window: str = "") -> None:
         """Detach live sessions pinned to an account so each conversation's next
