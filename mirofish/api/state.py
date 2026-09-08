@@ -31,6 +31,11 @@ from ..vault import make_credential_store
 logger = logging.getLogger("mirofish.state")
 
 LOGIN_TTL_SECONDS = 600.0
+# A window at or above this is spent, and automatic selection skips the
+# account for the models that draw on it. There is no configurable soft
+# ceiling below it: an account is used until its window is actually gone, at
+# which point the upstream refuses it and the cooldown takes over. Reserving
+# headroom would only leave credit unspent at the reset.
 QUOTA_EXHAUSTED = 0.999
 MAX_NETWORK_PROXY_ATTEMPTS = 4
 # Fallback cooldown for a spent window whose reset time we cannot read. The
@@ -77,28 +82,21 @@ TRANSIENT_429_COOLDOWN = 60.0
 # a fallback window is what had 46 banned accounts probing hourly.
 HEALTH_RETRY_AFTER = {503: 86400.0}
 
-# Account scheduling. "balanced" spreads new conversations over the accounts
-# carrying the fewest live sessions. "reset_first" instead prefers the account
-# whose 7-day window resets soonest, so credit that is about to expire unused
-# is spent before it is thrown away; the balanced key stays as the tie-break.
-# "fable_first" is for non-fable traffic: among the accounts whose window is
-# about to reset it prefers the one whose fable window is fullest, so the
-# general 7-day credit is spent on the accounts whose fable credit is already
-# gone (a fable request there would be refused anyway) and the accounts with
-# fable headroom stay free for fable traffic.
-SCHEDULE_BALANCED = "balanced"
-SCHEDULE_RESET_FIRST = "reset_first"
-SCHEDULE_FABLE_FIRST = "fable_first"
-SCHEDULE_MODES = (SCHEDULE_BALANCED, SCHEDULE_RESET_FIRST, SCHEDULE_FABLE_FIRST)
-SETTING_SCHEDULE_MODE = "schedule_mode"
-SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
-# Above this utilization an account sorts behind every account with room, in
-# both schedule modes, so one nearly-spent account does not absorb every new
-# conversation. The ceiling is a soft preference; QUOTA_EXHAUSTED is the hard
-# skip (a ceiling deliberately set above it raises the skip mark too). Both
-# matter because the upstream meters lazily enough that a window kept in
-# rotation can be driven far past 100% before a 429 ever lands.
-DEFAULT_SCHEDULE_MAX_UTILIZATION = 0.98
+# Account scheduling: spend the credit that is about to expire, on the account
+# that can least use it for anything else.
+#
+# There is one policy, not a choice of three. The earlier "balanced" mode
+# ordered by live session count, which was never the thing that mattered:
+# what keeps load even is the window utilization every candidate is already
+# filtered and ordered by, so an account that takes more conversations simply
+# fills up and sorts behind the rest. Session count only decided which of two
+# equally-loaded accounts went next, and reset time answers that better.
+#
+# Order: the account whose 7-day window resets soonest first, so credit that
+# would otherwise expire unused is spent; among accounts resetting at the same
+# time, the one whose fable window is fullest, because its general credit is
+# all it has left to give while accounts with fable headroom stay free for
+# fable traffic.
 # The model whose spend is metered against its own weekly window as well.
 FABLE_WINDOW = "7d_fable"
 # The weekly window every Claude model draws on, fable included. It sits
@@ -113,16 +111,15 @@ CLAUDE_WINDOW = "7d_claude"
 # keeps electing an account the upstream will refuse with
 # credit_exhausted_5h.
 BURST_WINDOW = "5h"
-# Reset-first is a tilt on the balanced ordering, not a replacement for it.
-# An account is treated as carrying up to this many fewer sessions than it
-# really does as its weekly window approaches expiry, so it takes the next few
-# conversations and then rejoins the rotation once its real count catches up.
-# Keeping the bonus small is deliberate: a large one would hand it every
-# conversation and concentrate the concurrency on one account.
-URGENCY_MAX_BONUS = 2.0
-# Only a window closing within this many hours is worth diverting toward; the
-# rest of the week there is time to spend the credit at the normal rate.
+# Only a window closing within this many hours is worth ordering by; beyond it
+# there is still time to spend the credit at the normal rate, so those accounts
+# share one rank and the fable tie-break decides between them.
 URGENCY_HORIZON_HOURS = 48.0
+# Reset times are grouped into bands this wide. Ordering by the raw timestamp
+# would never tie — accounts provisioned together still differ by microseconds
+# — so the first key would decide every comparison and the fable tie-break
+# would be dead code. An hour is well inside the noise of "about to expire".
+RESET_BAND_HOURS = 1.0
 # Account ordering in both modes reads the cached /v1/limits windows (the
 # fable window has no response header to keep it fresh), so they are refreshed
 # in the background rather than on the request path: probing there would put
@@ -325,27 +322,6 @@ class AppState:
 
     # --- account selection ----------------------------------------------------
 
-    def schedule_settings(self) -> dict[str, Any]:
-        mode = self.store.setting(SETTING_SCHEDULE_MODE, SCHEDULE_BALANCED)
-        if mode not in SCHEDULE_MODES:
-            mode = SCHEDULE_BALANCED
-        try:
-            ceiling = float(self.store.setting(
-                SETTING_SCHEDULE_MAX_UTILIZATION,
-                str(DEFAULT_SCHEDULE_MAX_UTILIZATION)))
-        except ValueError:
-            ceiling = DEFAULT_SCHEDULE_MAX_UTILIZATION
-        return {"mode": mode, "max_utilization": ceiling}
-
-    def set_schedule_settings(self, mode: str, max_utilization: float) -> dict[str, Any]:
-        if mode not in SCHEDULE_MODES:
-            raise RelayError("unknown schedule mode: " + str(mode), 400)
-        if not 0.0 < max_utilization <= 2.0:
-            raise RelayError("max_utilization must be within (0, 2]", 400)
-        self.store.set_setting(SETTING_SCHEDULE_MODE, mode)
-        self.store.set_setting(SETTING_SCHEDULE_MAX_UTILIZATION, repr(max_utilization))
-        return self.schedule_settings()
-
     def _windows(self, alias: str) -> dict[str, dict[str, Any]]:
         """Cached per-window usage from the last /v1/limits probe."""
         try:
@@ -388,26 +364,6 @@ class AppState:
             return float(reset) if reset is not None else None
         except (TypeError, ValueError):
             return None
-
-    def _urgency_bonus(self, alias: str) -> float:
-        """How many live sessions of head start an expiring window is worth.
-
-        Expressed in the same unit the balanced ordering counts in, so the two
-        combine instead of one overriding the other: an account resetting
-        within the hour is handed the next few conversations, but once it has
-        taken them its real session count catches up and the others get their
-        turn. Accounts with no probe yet, or resets beyond the horizon, get
-        nothing and simply sort by session count.
-        """
-        reset_at = self._reset_at(alias)
-        if reset_at is None:
-            return 0.0
-        hours = (reset_at - time.time()) / 3600.0
-        if hours >= URGENCY_HORIZON_HOURS:
-            return 0.0
-        if hours <= 0:
-            return URGENCY_MAX_BONUS
-        return URGENCY_MAX_BONUS * (1.0 - hours / URGENCY_HORIZON_HOURS)
 
     def _fable_spent(self, alias: str) -> float:
         """How full this account's own fable window is (0.0 when unknown).
@@ -465,19 +421,16 @@ class AppState:
         return names
 
     def _quota_ok(self, alias: str, model: Optional[str] = None) -> bool:
-        """Below the exhaustion mark on every window this model draws on.
+        """Whether every window this model draws on still has credit.
 
         The cached /v1/limits windows are the model-aware source — a fable
         request also spends the model's own weekly window, and skipping that
         check is how a 7d_fable window ends up at 130%. The header-fed scalar
-        still covers the 7d window between sweeps, since every response
-        refreshes it. A ceiling deliberately configured above 100% raises the
-        skip mark with it (the operator chose to overspend). No usable data
-        means the account is assumed to have room; the upstream 429 stays the
-        final authority either way.
+        still covers the 7d window between reads, since every response
+        refreshes it. No usable data means the account is assumed to have
+        room; the upstream 429 stays the final authority either way.
         """
-        mark = max(QUOTA_EXHAUSTED, self.schedule_settings()["max_utilization"])
-        if self._load(alias, model) >= mark:
+        if self._load(alias, model) >= QUOTA_EXHAUSTED:
             return False
         try:
             quota = json.loads(self.store.row(alias)["metadata_json"]).get("quota", {})
@@ -487,7 +440,7 @@ class AppState:
             reset = quota.get("7d_reset_epoch")
             if reset is not None and float(reset) <= time.time():
                 return True  # that window has since reset; the number is history
-            return float(utilization) < mark
+            return float(utilization) < QUOTA_EXHAUSTED
         except (RelayError, ValueError, TypeError, json.JSONDecodeError):
             return True
 
@@ -797,35 +750,17 @@ class AppState:
         selectable = [alias for alias in aliases if eligible(alias)]
         if not selectable:
             raise self._no_selectable_error(model)
-        schedule = self.schedule_settings()
-        if schedule["mode"] == SCHEDULE_RESET_FIRST:
-            # There is no session key to stay stable for, but the live session
-            # counts still say where the load already is, so reuse the same
-            # tilted ordering instead of sending every keyless request to the
-            # one account with the nearest reset.
-            counts = self.session_counts()
-            with self._rr_lock:
-                chosen = min(selectable,
-                             key=lambda alias: self._assignment_key(
-                                 alias, counts, schedule, model))
-                self._last_assigned[chosen] = time.time()
-                return chosen
+        # No session key to stay stable for, but the ordering is the same one a
+        # keyed request gets: expiring credit first. Round-robin used to live
+        # here instead, which spent whichever account happened to be next
+        # rather than the one about to lose its credit.
+        eligible_now = [alias for alias in selectable
+                        if self._quota_ok(alias, model)] \
+            or self._last_resort(selectable, model)
         with self._rr_lock:
-            start = self._rr_index
-            chosen = None
-            for offset in range(len(aliases)):
-                candidate = aliases[(start + offset) % len(aliases)]
-                if candidate in selectable and self._quota_ok(candidate, model):
-                    chosen = candidate
-                    self._rr_index = (start + offset + 1) % len(aliases)
-                    break
-            if chosen is None:
-                # Every serviceable account looks exhausted. Serve anyway when
-                # the numbers are stale or missing, but not when the cache says
-                # this model's windows are provably spent (see _last_resort).
-                fallback = self._last_resort(selectable, model)
-                chosen = fallback[start % len(fallback)]
-                self._rr_index = (start + 1) % len(aliases)
+            chosen = min(eligible_now,
+                         key=lambda alias: self._assignment_key(alias, model))
+            self._last_assigned[chosen] = time.time()
             return chosen
 
     # --- session-affinity routing --------------------------------------------
@@ -926,48 +861,51 @@ class AppState:
         for key in stale:
             del self._sessions[key]
 
-    def _assignment_key(self, alias: str, counts: dict[str, int],
-                        schedule: dict[str, Any], model: Optional[str]):
+    def _assignment_key(self, alias: str, model: Optional[str]):
         """Ordering for a new conversation; lowest wins.
 
-        Both modes spread conversations by live session count, so no single
-        account absorbs the concurrency, and both demote an account above the
-        utilization ceiling — spreading by session count alone is what let a
-        nearly-dead window keep attracting conversations until it overshot its
-        budget. Reset-first additionally tilts the count: an account whose
-        weekly window expires sooner is treated as carrying fewer sessions
-        than it really does, so it picks up the next conversation earlier and
-        its about-to-expire credit gets spent. Ordering by the reset time
-        itself would not spread at all, because the timestamps never tie.
+        1. 7-day reset time, soonest first: that credit is about to expire
+           unused, while every other account still has a week to spend its own
+           at the normal rate.
+        2. Then how spent the account's fable window is, fullest first. Its
+           general credit is all it has left to give, whereas an account with
+           fable headroom is worth keeping free for fable traffic. A fable
+           request needs no special case: `_load` weighs the fable window, so a
+           full one is already excluded by ``_quota_ok``.
+        3. Least-recently-assigned breaks a remaining tie, which keeps a pool
+           of identical fresh accounts fanning out instead of piling onto
+           whichever alias sorts first.
 
-        Fable-first refines reset-first for non-fable traffic: among the
-        accounts already inside the reset horizon it prefers the one whose own
-        fable window is fullest. That account's fable credit is spent, so a
-        fable request would be refused there anyway, while its general 7-day
-        credit is about to expire — spend that one, and leave the accounts
-        with fable headroom free for fable traffic. A fable request itself
-        gets plain reset-first ordering: there the fable window is the
-        constraint (``_load`` already weighs it), not the selection criterion.
+        No session count and no configurable ceiling. An account is used until
+        its window is actually spent, and ``_quota_ok`` then removes it — a
+        soft ceiling below that would only leave credit unspent at the reset,
+        which is the thing this ordering exists to avoid.
         """
-        live = counts.get(alias, 0)
-        recency = self._last_assigned.get(alias, 0.0)
-        if self._load(alias, model) >= schedule["max_utilization"]:
-            # Nearly spent: keep it in service, but let every account with room
-            # take a turn first.
-            return (float(live) + URGENCY_MAX_BONUS + 1.0, recency)
-        if schedule["mode"] == SCHEDULE_BALANCED:
-            return (float(live), recency)
-        bonus = self._urgency_bonus(alias)
-        if schedule["mode"] == SCHEDULE_FABLE_FIRST and not self._is_fable_model(model):
-            # Scale the head start by how spent the fable window is, instead of
-            # adding a tie-break after it: the tilted count is a float that
-            # rarely ties, so a separate key would be dead code. An urgent
-            # account with no fable credit left keeps the full bonus and goes
-            # first; one with fable headroom keeps almost none and is left for
-            # fable traffic. The bonus stays capped at URGENCY_MAX_BONUS, so
-            # the ordering still spreads by session count.
-            bonus *= min(1.0, self._fable_spent(alias))
-        return (float(live) - bonus, recency)
+        return (self._reset_rank(alias), -self._fable_spent(alias),
+                self._last_assigned.get(alias, 0.0))
+
+    def _reset_rank(self, alias: str) -> float:
+        """Which urgency band this account's 7-day window falls in; lower first.
+
+        Deliberately a band, not the timestamp. Raw reset times never tie —
+        they differ by microseconds even for accounts provisioned together — so
+        ordering by them directly would decide every comparison on the first
+        key and make the fable tie-break dead code. Rounding to
+        ``RESET_BAND_HOURS`` groups accounts that expire at practically the
+        same time and lets the next key choose between them.
+
+        Beyond ``URGENCY_HORIZON_HOURS`` the exact time stops mattering at all:
+        there is still time to spend the credit at the normal rate, so those
+        accounts share the last band. An account with no cached window sorts
+        with them rather than jumping the queue on missing data.
+        """
+        reset_at = self._reset_at(alias)
+        if reset_at is None:
+            return URGENCY_HORIZON_HOURS
+        hours = max(0.0, (reset_at - time.time()) / 3600.0)
+        if hours >= URGENCY_HORIZON_HOURS:
+            return URGENCY_HORIZON_HOURS
+        return (hours // RESET_BAND_HOURS) * RESET_BAND_HOURS
 
     def _sticky_account(self, key: str, aliases: list[str],
                         model: Optional[str] = None) -> str:
@@ -981,7 +919,7 @@ class AppState:
                 entry["last"] = now
                 entry["model"] = model
                 return entry["account"]
-            # New window: order the eligible accounts by the configured mode.
+            # New conversation: order the eligible accounts by expiring credit.
             serviceable = [alias for alias in aliases if self._selectable(alias, model)]
             if not serviceable:
                 raise self._no_selectable_error(model)
@@ -989,14 +927,8 @@ class AppState:
                         if self._quota_ok(alias, model)]
             if not eligible:
                 eligible = self._last_resort(serviceable, model)
-            counts = {alias: 0 for alias in eligible}
-            for existing in self._sessions.values():
-                if existing["account"] in counts:
-                    counts[existing["account"]] += 1
-            schedule = self.schedule_settings()
             chosen = min(eligible,
-                         key=lambda alias: self._assignment_key(
-                             alias, counts, schedule, model))
+                         key=lambda alias: self._assignment_key(alias, model))
             self._sessions[key] = {"account": chosen, "last": now, "model": model}
             self._last_assigned[chosen] = now
             return chosen

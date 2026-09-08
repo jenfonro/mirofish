@@ -107,11 +107,6 @@ export interface LimitsSummary {
   accounts: AccountLimitsResult[];
 }
 
-export interface ScheduleSettings {
-  mode: "balanced" | "reset_first" | "fable_first";
-  max_utilization: number;
-}
-
 export interface ProxySummary {
   configured: boolean;
   backend: "mihomo" | "direct";
