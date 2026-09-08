@@ -39,7 +39,7 @@ MAX_NETWORK_PROXY_ATTEMPTS = 4
 SHARED_QUOTA_COOLDOWN = 600.0
 # Ceiling on a cooldown derived from a window whose reset time we do NOT know.
 # A known `reset_at` is used in full instead: the refusal provably lasts until
-# then, and the limits sweep re-reads the window every LIMITS_REFRESH_SECONDS,
+# then, and an elected account re-reads its window once per LIMITS_TTL_SECONDS,
 # so a window that is raised or reset early is picked up from the cache rather
 # than by spending an upstream refusal to discover it. Capping a known deadline
 # at an hour meant a 7-day window was re-probed hourly forever: 76 accounts
@@ -129,7 +129,13 @@ URGENCY_HORIZON_HOURS = 48.0
 # an upstream round-trip in front of every new conversation. The probe costs
 # no model tokens, and stale numbers only ever cost one extra attempt, since
 # the upstream 429 plus failover is what actually stops a request.
-LIMITS_REFRESH_SECONDS = 300.0
+#
+# How long a cached window is trusted. Nothing polls: the numbers are refreshed
+# for the one account a request elects, and only when they are older than this.
+# An idle relay therefore makes no upstream calls at all — a 5-minute sweep
+# across every account was ~16k calls a day with nobody using it, which is
+# both pointless and the kind of traffic that draws rate-limit attention.
+LIMITS_TTL_SECONDS = 3600.0
 # Subscription profiles (plan tier, expiry, holder name) change on the scale
 # of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
 # an account whose stored profile is missing (pre-upgrade rows) or a day old.
@@ -195,13 +201,21 @@ class AppState:
 
     async def refresh_all_limits(self) -> None:
         """Re-probe every selectable account's usage windows, one failure at a
-        time.
+        time. Only a deliberate request runs this — the panel's refresh or a
+        settings change — never a timer.
 
         Scheduling only reads these numbers, so an account that cannot be
         probed keeps its previous values instead of dropping out of the
         ordering. Accounts switched off in the panel are skipped: they never
         take part in automatic selection, so keeping their windows warm would
         contact the upstream for nothing.
+
+        An account the upstream suspended outright is skipped for the same
+        reason, and a stronger one: every probe is a guaranteed refusal that
+        teaches us nothing (the numbers stay frozen at the moment of the ban),
+        and a steady stream of refused requests is exactly what draws
+        rate-limit attention. 26 banned accounts would otherwise contribute
+        312 doomed calls an hour.
         """
         async def one(alias: str) -> None:
             try:
@@ -218,7 +232,8 @@ class AppState:
                 logger.debug("profile refresh failed: account=%s %s", alias, exc)
 
         aliases = [alias for alias in self.store.aliases()
-                   if not self.account_disabled(alias)]
+                   if not self.account_disabled(alias)
+                   and not self.account_suspended(alias)]
         if aliases:
             await asyncio.gather(*(one(alias) for alias in aliases))
 
@@ -249,15 +264,19 @@ class AppState:
         return time.time() - checked_epoch >= PROFILE_REFRESH_SECONDS
 
     def start_limits_refresh(self) -> None:
-        """Keep the cached windows warm: both schedule modes read them to keep
-        exhausted windows out of automatic selection, and the fable window has
-        no response header that could refresh it between probes."""
+        """Run the manual/on-demand refresh worker.
+
+        It sleeps until something asks for a sweep — the panel's refresh, a
+        settings change — and then makes one pass. There is deliberately no
+        interval: an idle relay must not talk to the upstream at all.
+        """
         if self._limits_task is not None:
             return
         wake = self._limits_wake = asyncio.Event()
 
         async def loop() -> None:
             while True:
+                await wake.wait()
                 # Clear before sweeping so a kick that lands mid-sweep still
                 # triggers a fresh pass instead of being swallowed.
                 wake.clear()
@@ -267,18 +286,45 @@ class AppState:
                     raise
                 except Exception as exc:  # noqa: BLE001 - the loop must outlive a bad sweep
                     logger.warning("limits refresh sweep failed: %s", exc)
-                try:
-                    await asyncio.wait_for(wake.wait(), LIMITS_REFRESH_SECONDS)
-                except TimeoutError:
-                    pass
 
         self._limits_task = asyncio.create_task(loop())
 
     def kick_limits_refresh(self) -> None:
-        """Sweep now instead of waiting out the interval (e.g. right after
-        reset-first is switched on, when the cached windows may be days old)."""
+        """Ask for one sweep now. This is the only thing that starts one."""
         if self._limits_wake is not None:
             self._limits_wake.set()
+
+    def _limits_stale(self, alias: str) -> bool:
+        """Whether this account's cached windows are older than the TTL."""
+        fetched = (self._windows_envelope(alias) or {}).get("fetched_epoch")
+        try:
+            return time.time() - float(fetched) >= LIMITS_TTL_SECONDS
+        except (TypeError, ValueError):
+            return True  # never probed, or unreadable: read it once
+
+    async def refresh_limits_if_stale(self, alias: str, *,
+                                      force: bool = False) -> None:
+        """Read one account's windows, at most once per TTL.
+
+        Called for the account a request just elected, so the numbers backing
+        the next selection are current without anything polling. ``force`` is
+        for a 429: the refusal proves the cache was wrong, and the fresh
+        `reset_at` is what makes the cooldown match the real window.
+
+        Failure is deliberately silent. The cached numbers stay, and the
+        upstream refusal plus failover remains the authority on whether a
+        request can be served — a probe that cannot run must not fail the
+        request that triggered it.
+        """
+        if self.account_suspended(alias) or self.account_disabled(alias):
+            return
+        if not force and not self._limits_stale(alias):
+            return
+        try:
+            await self.with_proxy(
+                alias, lambda url: self.accounts.fetch_limits(alias, proxy_url=url))
+        except Exception as exc:  # noqa: BLE001 - never fail the caller's request
+            logger.info("limits refresh failed: account=%s %s", alias, exc)
 
     async def stop_limits_refresh(self) -> None:
         task, self._limits_task = self._limits_task, None
@@ -325,6 +371,15 @@ class AppState:
             return {}
         return {str(window.get("name")): window for window in windows
                 if isinstance(window, dict)}
+
+    def _windows_envelope(self, alias: str) -> dict[str, Any]:
+        """The whole cached /v1/limits payload, for its `fetched_epoch`."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except (RelayError, json.JSONDecodeError):
+            return {}
+        limits = metadata.get("limits")
+        return limits if isinstance(limits, dict) else {}
 
     @staticmethod
     def _window_utilization(window: Optional[dict[str, Any]]) -> Optional[float]:
@@ -466,6 +521,17 @@ class AppState:
         health = metadata.get("health")
         return health if isinstance(health, dict) else {}
 
+    def account_suspended(self, alias: str) -> bool:
+        """The upstream suspended this account outright ("contact support").
+
+        Distinct from ``account_unhealthy``: that covers refusals which clear
+        on their own or on the next success, while this one only support lifts.
+        Nothing may contact the upstream on its behalf until then — not the
+        limits sweep, not the model catalog — because every such call is a
+        certain refusal.
+        """
+        return self.account_health(alias).get("state") == HEALTH_SUSPENDED
+
     def account_unhealthy(self, alias: str) -> bool:
         """True while a recorded refusal still keeps the account out of
         automatic selection.
@@ -580,8 +646,13 @@ class AppState:
         Same as ``_selectable`` minus the health verdict: a 401/503 refusal
         stops model traffic, but the account can still answer the model
         catalog, and a parked account must not take the panel down with it.
+
+        A suspended account is the exception: the upstream refuses everything
+        from it, catalog reads included, so electing it here just spends a
+        certain refusal.
         """
         return (not self.account_disabled(alias)
+                and not self.account_suspended(alias)
                 and self.exhausted_cooldown(alias, model) <= 0.0)
 
     def _explicit_account(self, requested: str) -> str:
@@ -1032,9 +1103,9 @@ class AppState:
         if remaining > 0:
             # A known deadline is used in full. Capping it meant a 7-day window
             # was re-probed every hour for days, spending one refusal per
-            # account each time; the limits sweep already re-reads the window
-            # every LIMITS_REFRESH_SECONDS, so an early reset is noticed from
-            # the cache instead.
+            # account each time; an elected account re-reads its window once
+            # per LIMITS_TTL_SECONDS, so an early reset is noticed there
+            # instead.
             return max(SHARED_QUOTA_COOLDOWN, remaining)
         return MAX_QUOTA_COOLDOWN
 
@@ -1239,7 +1310,16 @@ class AppState:
         """Route an account and run the request, failing over to another account
         when the upstream refuses the chosen one with credit_exhausted_shared or
         parks it with a 401/503. An explicitly requested account is never
-        substituted."""
+        substituted.
+
+        Windows are refreshed *after* the call, for the one account that served
+        it (or after a quota refusal, where the refusal proves the cache was
+        wrong and the fresh `reset_at` is what makes the cooldown match the
+        real window). Never before: a probe in front of the caller's request
+        would both delay it and pre-empt the proxy rotation `run` relies on.
+        This is the only thing that reads /v1/limits on the request path, and
+        it reads one account, so nothing polls.
+        """
         requested = (requested or "").strip()
         tried: set[str] = set()
         last: Optional[RelayError] = None
@@ -1255,12 +1335,19 @@ class AppState:
             try:
                 result = account, await run(account)
             except RelayError as exc:
+                if self._is_credit_exhausted(exc):
+                    await self.refresh_limits_if_stale(account, force=True)
                 if not self.note_account_unserviceable(account, exc) or requested:
                     raise
                 tried.add(account)
                 last = exc
                 continue
             self.note_account_healthy(account)
+            # Refresh after the fact, never before: the windows this spend
+            # lands on are now stale, and reading them here keeps the next
+            # election accurate without putting a probe in front of the
+            # caller's request. A failure here cannot affect the result.
+            await self.refresh_limits_if_stale(account)
             return result
 
     @classmethod

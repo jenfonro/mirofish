@@ -12,6 +12,7 @@ import time
 import pytest
 
 from mirofish.api.state import (DEFAULT_SCHEDULE_MAX_UTILIZATION,
+                                LIMITS_TTL_SECONDS,
                                 MAX_QUOTA_COOLDOWN,
                                 SCHEDULE_BALANCED, SCHEDULE_FABLE_FIRST,
                                 SCHEDULE_RESET_FIRST,
@@ -756,29 +757,116 @@ async def test_the_sweep_refreshes_missing_or_dated_profiles(state, monkeypatch)
     assert calls.count("fresh") == 2  # a dated profile is re-read too
 
 
-async def test_the_sweep_runs_in_every_mode(state, monkeypatch):
-    """Both modes read the cached windows to keep exhausted accounts out of
-    selection, and the fable window has no response header to refresh it, so
-    the sweep can no longer wait for reset-first to be switched on."""
+async def test_nothing_sweeps_until_something_asks(state, monkeypatch):
+    """An idle relay must make no upstream calls at all.
+
+    A 5-minute sweep across every account was ~16k probes a day with nobody
+    using the relay — pointless, and the kind of steady refused traffic that
+    earns a rate-limit suspension. The worker now sleeps until asked.
+    """
     sweeps = []
 
     async def fake_refresh():
         sweeps.append(time.time())
 
     monkeypatch.setattr(state, "refresh_all_limits", fake_refresh)
-    state.start_limits_refresh()  # app startup, still in balanced mode
+    state.start_limits_refresh()  # app startup
+    await asyncio.sleep(0.05)
+    assert sweeps == [], "startup swept the pool without being asked"
+
+    # A deliberate request — the panel's refresh, a settings change — sweeps.
+    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.kick_limits_refresh()
     for _ in range(200):
         if sweeps:
             break
         await asyncio.sleep(0.01)
-    assert sweeps, "the startup sweep did not run in balanced mode"
-
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
-    state.kick_limits_refresh()
-    before = len(sweeps)
-    for _ in range(200):
-        if len(sweeps) > before:
-            break
-        await asyncio.sleep(0.01)
-    assert len(sweeps) > before, "the kick did not trigger a fresh sweep"
+    assert sweeps, "the kick did not trigger a sweep"
     await state.stop_limits_refresh()
+
+
+def _limits(alias_windows, fetched_epoch):
+    return {"limits": {"windows": alias_windows, "fetched_epoch": fetched_epoch}}
+
+
+async def test_a_fresh_cache_is_not_re_read(state):
+    """Within the TTL there is nothing to learn, so nothing is asked."""
+    add_account(state, "work")
+    state.store.merge_metadata("work", _limits(
+        [_window("7d", 0.1, 24 * 7)], time.time()))
+    calls = []
+
+    async def fake_fetch(alias, proxy_url=None):
+        calls.append(alias)
+
+    state.accounts.fetch_limits = fake_fetch
+
+    await state.refresh_limits_if_stale("work")
+
+    assert calls == []
+
+
+async def test_a_stale_cache_is_re_read_once(state):
+    add_account(state, "work")
+    state.store.merge_metadata("work", _limits(
+        [_window("7d", 0.1, 24 * 7)], time.time() - LIMITS_TTL_SECONDS - 1))
+    calls = []
+
+    async def fake_fetch(alias, proxy_url=None):
+        calls.append(alias)
+
+    state.accounts.fetch_limits = fake_fetch
+
+    await state.refresh_limits_if_stale("work")
+
+    assert calls == ["work"]
+
+
+async def test_a_quota_refusal_forces_a_re_read(state):
+    """The refusal proves the cache was wrong, whatever its age: the fresh
+    reset_at is what makes the cooldown match the real window."""
+    add_account(state, "work")
+    state.store.merge_metadata("work", _limits(
+        [_window("7d", 0.1, 24 * 7)], time.time()))
+    calls = []
+
+    async def fake_fetch(alias, proxy_url=None):
+        calls.append(alias)
+
+    state.accounts.fetch_limits = fake_fetch
+
+    await state.refresh_limits_if_stale("work", force=True)
+
+    assert calls == ["work"]
+
+
+async def test_a_suspended_account_is_never_probed(state):
+    """Every call on a banned account is a certain refusal, and a stream of
+    refusals is what earns the ban in the first place."""
+    add_account(state, "work")
+    state.store.mark_account_error(
+        "work", 403, "this account is suspended; contact support",
+        "upstream_403", state="suspended")
+    calls = []
+
+    async def fake_fetch(alias, proxy_url=None):
+        calls.append(alias)
+
+    state.accounts.fetch_limits = fake_fetch
+
+    await state.refresh_limits_if_stale("work", force=True)
+    await state.refresh_all_limits()
+
+    assert calls == []
+
+
+async def test_a_failed_refresh_never_breaks_the_request(state):
+    """A probe that cannot run must not fail the request that triggered it."""
+    add_account(state, "work")
+
+    async def boom(alias, proxy_url=None):
+        raise RelayError("upstream down", 502)
+
+    state.accounts.fetch_limits = boom
+
+    await state.refresh_limits_if_stale("work", force=True)  # must not raise
