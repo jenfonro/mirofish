@@ -66,19 +66,24 @@ function pick(id: string): void {
 </template>
 
 <style scoped>
-.picker { position: relative; }
 .picker-value {
   display: flex; width: 100%; align-items: center; justify-content: space-between;
   gap: 8px; text-align: left;
 }
 .caret { color: var(--muted); flex: none; }
 .panel {
-  position: absolute; z-index: 60; left: 0; right: 0; top: calc(100% + 4px);
+  /* Laid out in the flow rather than floated above it: the dialogs that host
+     this picker scroll their own content, and a positioned panel was clipped
+     by that scroll box. Taking up space instead means the list is always
+     fully reachable, and the dialog scrolls to it when it does not fit. */
+  margin-top: 4px;
   background: var(--surface); color: var(--ink); border: 1px solid var(--border);
-  border-radius: 8px; padding: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+  border-radius: 8px; padding: 8px;
 }
 .search { margin: 0 0 6px; }
-.panel ul { list-style: none; margin: 0; padding: 0; max-height: 260px; overflow-y: auto; }
+/* Capped so a pool of dozens scrolls within the picker instead of pushing the
+   dialog's buttons out of reach. */
+.panel ul { list-style: none; margin: 0; padding: 0; max-height: 200px; overflow-y: auto; }
 .panel li {
   display: flex; align-items: center; gap: 6px; padding: 7px 8px;
   border-radius: 6px; cursor: pointer; font-size: 13px;

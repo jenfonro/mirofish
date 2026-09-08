@@ -378,10 +378,6 @@ async function removeAccount(alias: string) {
 
         <label>代理</label>
         <ProxyPicker v-model="editProxy" :nodes="store.proxies?.nodes ?? []" />
-        <p class="muted">
-          绑定后该账号只走这个出口。节点故障时请求会失败，而不会改走别的节点——
-          悄悄换出口会让这个账号的上游 IP 变化。
-        </p>
 
         <div class="row modal-actions">
           <button class="ghost" :disabled="busy === editing.alias"

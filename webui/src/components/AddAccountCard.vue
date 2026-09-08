@@ -84,10 +84,6 @@ async function verify() {
     <ProxyPicker v-if="stage === 'start'" v-model="proxyId"
                  :nodes="store.proxies?.nodes ?? []" />
     <p v-else class="muted">登录进行中，代理已固定。</p>
-    <p v-if="stage === 'start'" class="muted">
-      默认无代理。登录会通过所选出口进行，账号随后也固定走它——
-      上游是否服务某个区域取决于账号本身，所以登录和后续请求应当来自同一出口。
-    </p>
     <template v-if="stage === 'verify'">
       <label>6 位验证码</label>
       <input v-model="code" maxlength="6" inputmode="numeric" placeholder="123456"
