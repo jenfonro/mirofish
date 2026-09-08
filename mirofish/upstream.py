@@ -25,7 +25,7 @@ from typing import Any, Mapping, Optional, Sequence
 import httpx
 
 from .config import Settings
-from .device import DeviceSigner, uses_v2
+from .device import DEVICE_KEY_KIND, DeviceSigner, uses_v2
 from .errors import RelayError
 from .seal import DEFAULT_SEAL_PUBLIC_KEY, seal_header_pairs
 from .store import Store
@@ -962,7 +962,8 @@ class Upstream:
         # ``__cf_bm``).  One jar per (account, exit) mirrors one desktop
         # install per account; Node's fetch on the Claude path keeps none.
         self._cookie_jars: dict[tuple[str, str], httpx.Cookies] = {}
-        self._device_signer: DeviceSigner | None = None
+        # One signer per account alias; "" is the shared control-plane slot.
+        self._device_signers: dict[str, DeviceSigner] = {}
         # Monotonic per-alias epoch. In-flight ticket/refresh work may finish
         # after a re-login or deletion; only results from the current epoch may
         # write account-bound caches or credentials.
@@ -1104,23 +1105,49 @@ class Upstream:
         return lock
 
     def _signer(self, alias: str = "") -> DeviceSigner:
-        """Return the installation signer; ``alias`` is only a migration hint."""
-        if self._device_signer is None:
-            legacy = (alias,) if alias else ()
-            self._device_signer = DeviceSigner(
-                self.store, self.settings.mirasim_client_version, legacy)
+        """Return this account's device signer.
+
+        One identity per account, not per installation: a single device driving
+        every account is exactly the handle that relates them to each other
+        upstream. An empty alias keeps the shared slot, for control-plane paths
+        with no account of their own.
+        """
+        signer = self._device_signers.get(alias)
+        if signer is None:
+            signer = self._device_signers[alias] = DeviceSigner(
+                self.store, self.settings.mirasim_client_version,
+                legacy_aliases=(alias,) if alias else (), alias=alias)
         else:
             # Settings are mutable in the test harness and in long-lived
             # deployments that rotate the upstream client profile without
-            # restarting the process.  The signer is installation-wide, but
-            # its version marker is per active protocol profile.
-            self._device_signer.set_client_version(
-                self.settings.mirasim_client_version)
-        return self._device_signer
+            # restarting the process.  The identity is per account, but the
+            # version marker follows the active protocol profile.
+            signer.set_client_version(self.settings.mirasim_client_version)
+        return signer
 
     def ensure_device_identity(self, legacy_alias: str = "") -> str:
         """Persist/migrate the installation key before account data is removed."""
         return self._signer(legacy_alias).device_id
+
+    def rotate_device_identity(self, alias: str) -> str:
+        """Give this account a brand-new device identity.
+
+        Used on login, where a new identity is what the upstream would expect
+        anyway, and where an account inheriting the old shared key finally gets
+        one of its own.
+        """
+        return self._signer(alias).rotate()
+
+    def drop_device_identity(self, alias: str) -> None:
+        """Forget an account's device identity when the account is removed."""
+        self._device_signers.pop(alias, None)
+        if not alias:
+            return
+        try:
+            self.store.vault.delete(alias, DEVICE_KEY_KIND)
+        except RelayError:
+            # Never stored one, or already gone.
+            pass
 
     def _advance_credentials(self, alias: str, *, clear_device: bool) -> None:
         self._credential_generations[alias] = (

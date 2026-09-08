@@ -15,7 +15,6 @@ import time
 from typing import Any, Optional
 
 from .config import Settings
-from .device import DEVICE_KEY_KIND
 from .errors import RelayError
 from .store import Store, utc_now
 from .upstream import Upstream
@@ -288,16 +287,16 @@ class AccountService:
         different_account = bool(
             previous_email and previous_email.casefold() != email.casefold())
         self.store.save(alias, email, access, renewal, metadata, proxy_id=proxy_id)
+        # A login is the one moment a new device identity is expected: the
+        # account is being set up as if on a fresh installation. Rotating here
+        # is also how an account leaves a shared identity behind — accounts
+        # that signed in before per-account keys existed all carry the same
+        # one, which is precisely what lets the upstream relate them.
+        self.upstream.rotate_device_identity(alias)
         if different_account:
-            # Upgrade old per-account keys into the installation slot before
-            # cleaning up the legacy secret. Re-login rotates authorization and
-            # tickets, never the official installation-wide Ed25519 identity.
-            self.upstream.ensure_device_identity(alias)
-            self.store.vault.delete(alias, DEVICE_KEY_KIND)
             self.upstream.forget_account(alias)
         else:
-            # A normal re-login keeps the stable device identity, but tickets
-            # issued for the previous credentials must never be reused.
+            # Tickets issued for the previous credentials must never be reused.
             self.upstream.credentials_changed(alias)
 
         try:

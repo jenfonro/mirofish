@@ -32,7 +32,18 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - SQLite stores metadata, non-secret settings (`settings` table, e.g. the schedule mode), and the usage log only.
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
-- Model relay calls use one installation-wide Ed25519 device identity (not one per alias), per-exit
+- Model relay calls use one Ed25519 device identity **per account** (`DeviceSigner(alias=...)`,
+  keyed in the vault under the alias). The official desktop keeps one key per installation,
+  and mirroring that literally is wrong here: a desktop serves one signed-in account while
+  this relay serves dozens, so an installation-wide key told the upstream that a single
+  device drove every one of them — the most direct handle for relating them to each other.
+  26 accounts were suspended within ten seconds of each other while the real upstream call
+  rate was at a low (11/min), which is what a shared identifier looks like from the other
+  side, not what rate limiting looks like. An existing account inherits the old shared key
+  (`INSTALLATION_KEY_ALIAS`) rather than rotating, since a pool of accounts that all changed
+  device on the same day is its own signal; `rotate_device_identity` on login is how an
+  account leaves the shared identity behind, and deletion drops the key so a reused alias
+  cannot inherit it. Alongside it: per-exit
   `/v1/device/session` tickets, and `mrs-sig-v2` signatures over a canonical record (method,
   pathname, timestamp, nonce, device id, client version, and SHA-256 digests of the bearer
   credential, the canonicalized relay metadata, and the exact request body — secrets never enter

@@ -62,10 +62,11 @@ def _mock_device_session(ticket: str = "device-ticket"):
         return_value=httpx.Response(200, json={"ticket": ticket, "expiresIn": 900}))
 
 
-def _verify_signature(state, request: httpx.Request, path: str) -> None:
+def _verify_signature(state, request: httpx.Request, path: str,
+                      alias: str = "work") -> None:
     """The mrs-sig-v2 record binds the bearer the request carries, the
     relay metadata (sealed or clear) and the exact body to this pathname."""
-    verify_signature(state, request, path)
+    verify_signature(state, request, path, alias=alias)
 
 
 #: Field order inside a sealed model envelope: the desktop assigns these onto
@@ -494,7 +495,16 @@ async def test_an_accounts_machine_is_the_same_on_every_request(state):
 
 
 @respx.mock
-async def test_installation_fingerprint_fields_stay_shared(state):
+async def test_the_client_profile_is_shared_but_the_device_is_not(state):
+    """Build and locale describe the client; the device identifies the account.
+
+    Sharing a device id across accounts is the most direct way to relate them
+    to each other upstream — 26 accounts were suspended within ten seconds
+    while the request rate was at a low, which is what a shared identifier
+    looks like from the other side, not what rate limiting looks like. Each
+    account therefore signs as its own installation, while everything that
+    genuinely describes the client build stays identical.
+    """
     _mock_device_session()
 
     first = await _messages_request(state, "work")
@@ -505,8 +515,8 @@ async def test_installation_fingerprint_fields_stay_shared(state):
         assert first.headers[header] == second.headers[header]
     first_fields, second_fields = relay_metadata(first), relay_metadata(second)
     assert first_fields["x-mirasim-locale"] == second_fields["x-mirasim-locale"]
-    assert first_fields["x-mirasim-device"] == second_fields["x-mirasim-device"]
     assert first_fields["x-mirasim-locale"] == state.settings.mirasim_locale
+    assert first_fields["x-mirasim-device"] != second_fields["x-mirasim-device"]
 
 
 @respx.mock
@@ -643,4 +653,4 @@ async def test_codex_relay_request_matches_the_official_capture(state):
     assert "caller-jar" not in cookie
     assert "codex-caller-secret" not in second.headers.values()
     assert second.content == body
-    _verify_signature(state, second, "/v1/responses")
+    _verify_signature(state, second, "/v1/responses", alias=alias)

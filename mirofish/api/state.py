@@ -1153,7 +1153,9 @@ class AppState:
         # Validate before mutating runtime state, preserving the existing 404
         # behavior for an unknown alias.
         self.store.row(alias)
-        self.upstream.ensure_device_identity(alias)
+        # The device key belongs to this account alone, so it goes with it: a
+        # later account reusing the alias must not inherit its identity.
+        self.upstream.drop_device_identity(alias)
         self.upstream.forget_account(alias)
         self.reset_account_runtime(alias)
         self.pending_logins.pop(alias, None)

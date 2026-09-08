@@ -895,8 +895,14 @@ def _seed_account_runtime(state, alias: str) -> None:
 
 
 @respx.mock
-async def test_relogin_same_email_keeps_device_and_clears_old_runtime(
+async def test_relogin_rotates_the_device_and_clears_old_runtime(
         client, state, auth_headers):
+    """A login is the one moment a new device identity is expected.
+
+    It is also the only way an account leaves a shared identity behind: every
+    account that signed in before per-account keys existed carries the same
+    one, and that is what lets the upstream relate them to each other.
+    """
     add_account(state, "work", "x@example.com")
     signer = state.upstream._signer("work")
     device_id = signer.device_id
@@ -915,8 +921,7 @@ async def test_relogin_same_email_keeps_device_and_clears_old_runtime(
 
     assert response.status_code == 200
     assert state.store.credentials("work") == ("new-access", "new-refresh")
-    assert state.upstream._signer("work") is signer
-    assert state.upstream._signer("work").device_id == device_id
+    assert state.upstream._signer("work").device_id != device_id
     assert key not in state.upstream._ticket_cache
     assert key not in state.upstream._device_sessions
     assert "work" not in state.model_cache
@@ -927,8 +932,9 @@ async def test_relogin_same_email_keeps_device_and_clears_old_runtime(
 
 
 @respx.mock
-async def test_relogin_different_email_keeps_installation_identity(
+async def test_relogin_under_a_different_email_gets_a_new_device(
         client, state, auth_headers):
+    """A different upstream account in the same slot is a different device."""
     add_account(state, "work", "old@example.com")
     signer = state.upstream._signer("work")
     old_device_id = signer.device_id
@@ -945,12 +951,11 @@ async def test_relogin_different_email_keeps_installation_identity(
 
     assert response.status_code == 200
     assert state.store.row("work")["email"] == "new@example.com"
-    assert state.upstream._signer("work") is signer
     assert key not in state.upstream._ticket_cache
     assert key not in state.upstream._device_sessions
-    with pytest.raises(RelayError):
-        state.store.vault.get("work", DEVICE_KEY_KIND)
-    assert state.upstream._signer("work").device_id == old_device_id
+    assert state.upstream._signer("work").device_id != old_device_id
+    # The new identity is persisted under the account's own slot.
+    assert state.store.vault.get("work", DEVICE_KEY_KIND)
 
 
 async def test_delete_account(client, state, auth_headers):
@@ -971,7 +976,9 @@ async def test_delete_account(client, state, auth_headers):
 
     assert response.status_code == 200
     assert state.store.aliases() == []
-    assert state.upstream._signer("work").device_id == old_device_id
+    # The device key belonged to this account alone, so it went with it: a
+    # later account reusing the alias must not inherit its identity.
+    assert state.upstream._signer("work").device_id != old_device_id
     assert key not in state.upstream._ticket_cache
     assert key not in state.upstream._device_sessions
     assert "work" not in state.model_cache
@@ -983,10 +990,10 @@ async def test_delete_account(client, state, auth_headers):
     # remove_account delegates slot ownership to ProxyPool exactly once.
     assert released == ["work"]
 
-    # Account deletion removes authorization only. The official device key is
-    # installation-global and therefore survives alias reuse.
+    # An alias reused by a new account starts on its own identity rather than
+    # inheriting the deleted account's, which would relate the two upstream.
     add_account(state, "work")
-    assert state.upstream._signer("work").device_id == old_device_id
+    assert state.upstream._signer("work").device_id != old_device_id
 
 
 async def test_usage_endpoint_validation(client, auth_headers):

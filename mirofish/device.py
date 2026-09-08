@@ -1,11 +1,18 @@
-"""Mirasim relay installation identity and request signatures.
+"""Mirasim relay device identity and request signatures.
 
 The model relay accepts an account bearer token for control-plane calls, but
 model traffic normally uses a short-lived device ticket and an Ed25519
-signature over the exact request body.  The official desktop keeps one device
-key per installation, not one per signed-in account.  This module mirrors that
-boundary and migrates one legacy per-account key when upgrading an existing
-relay installation.
+signature over the exact request body.
+
+The key is **per account**.  The official desktop keeps one key per
+installation, and mirroring that literally is wrong here: one desktop serves
+one signed-in account, whereas this relay serves dozens, so an
+installation-wide key tells the upstream that a single device is driving every
+one of them.  That is the most direct handle for relating accounts to each
+other — 26 accounts were suspended within ten seconds of each other while the
+request rate was at a low, which is what a shared identifier looks like from
+the other side, not what rate limiting looks like.  One key per account makes
+each look like its own installation, as it would if each ran its own desktop.
 """
 
 from __future__ import annotations
@@ -26,7 +33,10 @@ from .errors import RelayError
 from .store import Store
 
 DEVICE_KEY_KIND = "device_private_key"
-DEVICE_KEY_ALIAS = "mirasim-installation"
+# Where the pre-isolation installation-wide key lives. Read only, to keep one
+# account on its established identity rather than rotating every account at
+# once (see ``DeviceSigner``).
+INSTALLATION_KEY_ALIAS = "mirasim-installation"
 
 # 0.0.272 introduced the relay's versioned signing envelope.  Keep the old
 # name exported as well: installations pinned to an older relay build can
@@ -139,24 +149,36 @@ def signing_record(
 
 
 class DeviceSigner:
-    """Load or create the installation's persistent Ed25519 identity."""
+    """Load or create one account's persistent Ed25519 device identity.
+
+    ``alias`` is the account this identity belongs to. An empty alias keeps the
+    old installation-wide slot, which is what control-plane paths that are not
+    tied to an account still use.
+    """
 
     def __init__(self, store: Store, client_version: str,
-                 legacy_aliases: Sequence[str] = ()) -> None:
+                 legacy_aliases: Sequence[str] = (),
+                 alias: str = "") -> None:
         self.store = store
         self.client_version = client_version
         self.legacy_aliases = tuple(dict.fromkeys(legacy_aliases))
+        self.alias = alias
         self._private_key: Ed25519PrivateKey | None = None
         self._device_id: str | None = None
         self._public_key: str | None = None
         self._lock = threading.RLock()
 
+    @property
+    def key_alias(self) -> str:
+        """Vault slot holding this signer's key."""
+        return self.alias or INSTALLATION_KEY_ALIAS
+
     def set_client_version(self, client_version: str) -> None:
         """Update the protocol marker used by subsequently signed requests.
 
-        The Ed25519 identity remains installation-wide; only the advertised
-        client build changes when an operator switches between a legacy relay
-        profile and the current one.
+        The Ed25519 identity is unaffected; only the advertised client build
+        changes when an operator switches between a legacy relay profile and
+        the current one.
         """
         with self._lock:
             self.client_version = client_version
@@ -181,12 +203,20 @@ class DeviceSigner:
             raise RelayError("stored Mirasim device key is not Ed25519", 500)
         return key
 
-    def _legacy_key(self) -> tuple[str, Ed25519PrivateKey] | None:
-        """Find a valid old per-account key to preserve the existing device id."""
-        aliases = tuple(dict.fromkeys((*self.legacy_aliases, *self.store.aliases())))
-        for alias in aliases:
+    def _inherited_key(self) -> tuple[str, Ed25519PrivateKey] | None:
+        """The key this account should keep using, if it already has an identity.
+
+        An existing account inherits the installation-wide key it has been
+        signing with all along. Rotating it would present the upstream with an
+        account that suddenly moved to a new device, which is its own kind of
+        suspicious; a fresh account simply gets a fresh key. Only the accounts
+        an operator re-logs in get a new identity, deliberately.
+        """
+        candidates = [INSTALLATION_KEY_ALIAS] if self.alias else []
+        candidates += list(dict.fromkeys(self.legacy_aliases))
+        for slot in candidates:
             try:
-                pem = self.store.vault.get(alias, DEVICE_KEY_KIND)
+                pem = self.store.vault.get(slot, DEVICE_KEY_KIND)
             except RelayError as exc:
                 if self._is_missing(exc):
                     continue
@@ -194,9 +224,7 @@ class DeviceSigner:
             try:
                 return pem, self._decode_private_key(pem)
             except RelayError:
-                # One damaged legacy account must not prevent migration from a
-                # second valid account.  The global slot, once written, remains
-                # fail-closed and is never silently replaced.
+                # A damaged slot must not block creating a working identity.
                 continue
         return None
 
@@ -205,12 +233,12 @@ class DeviceSigner:
             if self._private_key is not None:
                 return self._private_key
             try:
-                pem = self.store.vault.get(DEVICE_KEY_ALIAS, DEVICE_KEY_KIND)
+                pem = self.store.vault.get(self.key_alias, DEVICE_KEY_KIND)
                 key = self._decode_private_key(pem)
             except RelayError as exc:
                 if not self._is_missing(exc):
                     raise
-                migrated = self._legacy_key()
+                migrated = self._inherited_key()
                 if migrated is None:
                     key = Ed25519PrivateKey.generate()
                     pem = key.private_bytes(
@@ -220,9 +248,29 @@ class DeviceSigner:
                     ).decode("ascii")
                 else:
                     pem, key = migrated
-                self.store.vault.put(DEVICE_KEY_ALIAS, DEVICE_KEY_KIND, pem)
+                self.store.vault.put(self.key_alias, DEVICE_KEY_KIND, pem)
             self._private_key = key
             return key
+
+    def rotate(self) -> str:
+        """Replace this account's identity with a fresh one.
+
+        Called when an account is logged in again, which is the moment a new
+        device identity is expected: the account is being set up as if on a new
+        installation. Returns the new device id.
+        """
+        with self._lock:
+            key = Ed25519PrivateKey.generate()
+            pem = key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            ).decode("ascii")
+            self.store.vault.put(self.key_alias, DEVICE_KEY_KIND, pem)
+            self._private_key = key
+            self._device_id = None
+            self._public_key = None
+            return self.device_id
 
     @property
     def device_id(self) -> str:
