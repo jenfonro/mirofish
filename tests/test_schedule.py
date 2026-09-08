@@ -511,6 +511,58 @@ def test_an_unscoped_429_still_cools_the_whole_account(state):
     assert state.exhausted_cooldown("work", "claude-fable-5") > 0
 
 
+def test_the_claude_window_holds_back_every_claude_model(state):
+    """7d_claude sits between the shared 7d window and the per-family ones.
+
+    A fable request spends 7d, 7d_claude and 7d_fable at once, and opus spends
+    7d and 7d_claude, so exhausting it refuses both — while the gpt-*/kimi-*
+    ids served over Codex never touch it and must keep working.
+    """
+    add_account(state, "work")
+
+    state.note_account_unserviceable("work", exhausted_refusal(
+        "credit_exhausted_7d_claude"))
+
+    assert state.exhausted_cooldown("work", "claude-opus-5") > 0
+    assert state.exhausted_cooldown("work", "claude-fable-5-1") > 0
+    assert state.exhausted_cooldown("work", "claude-haiku-4-5") > 0
+    assert state.exhausted_cooldown("work", "gpt-5.6-terra") == 0
+    assert state.exhausted_cooldown("work", "kimi-k3") == 0
+
+
+def test_a_spent_fable_window_leaves_the_claude_window_alone(state):
+    """The narrower family must not hold back the wider one."""
+    add_account(state, "work")
+
+    state.note_account_unserviceable("work", fable_exhausted())
+
+    assert state.exhausted_cooldown("work", "claude-fable-5") > 0
+    assert state.exhausted_cooldown("work", "claude-opus-5") == 0
+
+
+@pytest.mark.parametrize("spent,blocked,free", [
+    ("7d_claude", "claude-opus-5", "gpt-5.6-terra"),
+    ("7d_fable", "claude-fable-5", "claude-opus-5"),
+    ("5h", "claude-opus-5", None),
+    ("7d", "gpt-5.6-terra", None),
+])
+def test_scheduling_skips_an_account_whose_relevant_window_is_spent(
+        state, spent, blocked, free):
+    """Any one of the windows a request spends being full is enough to skip the
+    account — and only for the models that spend it."""
+    add_account(state, "spent")
+    windows = [_window(name, 0.02, 24 * 7)
+               for name in ("5h", "7d", "7d_claude", "7d_fable")]
+    for entry in windows:
+        if entry["name"] == spent:
+            entry["used"] = entry["budget"]
+    state.store.merge_metadata("spent", {"limits": {"windows": windows}})
+
+    assert not state._quota_ok("spent", blocked)
+    if free:
+        assert state._quota_ok("spent", free)
+
+
 def test_a_pool_wide_fable_refusal_answers_429_without_calling_upstream(state):
     """Once every account's fable allowance is spent, the relay answers itself.
 

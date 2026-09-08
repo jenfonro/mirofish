@@ -124,11 +124,12 @@ def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
 # (the same windows the official usage widget reads). 7d_fable is the fable
 # model's own weekly window; reset-first scheduling weighs it for fable
 # requests, and accounts without one simply never report it.
-LIMIT_WINDOW_ORDER = ["5h", "7d", "7d_fable", "30d"]
+LIMIT_WINDOW_ORDER = ["5h", "7d", "7d_claude", "7d_fable", "30d"]
 LIMIT_WINDOW_LABEL = {"5h": "5 小时窗口", "7d": "7 天窗口",
+                      "7d_claude": "7 天 Claude 窗口",
                       "7d_fable": "7 天 Fable 窗口", "30d": "30 天窗口"}
-LIMIT_WINDOW_LEN = {"5h": 18000, "7d": 604800, "7d_fable": 604800,
-                    "30d": 2592000}
+LIMIT_WINDOW_LEN = {"5h": 18000, "7d": 604800, "7d_claude": 604800,
+                    "7d_fable": 604800, "30d": 2592000}
 # The upstream meters every fable model against one shared 7d_fable window and
 # reports a single number. These are the ids whose spend lands in it, split out
 # locally from the usage log so the panel can show which one consumed it.

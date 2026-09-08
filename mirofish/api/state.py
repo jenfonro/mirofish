@@ -101,6 +101,12 @@ SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
 DEFAULT_SCHEDULE_MAX_UTILIZATION = 0.98
 # The model whose spend is metered against its own weekly window as well.
 FABLE_WINDOW = "7d_fable"
+# The weekly window every Claude model draws on, fable included. It sits
+# between the shared 7d window and the per-family ones: a fable request spends
+# 7d, 7d_claude and 7d_fable at once, while opus/sonnet/haiku spend 7d and
+# 7d_claude. Any one of them being full refuses the request, so all of them
+# have to be weighed.
+CLAUDE_WINDOW = "7d_claude"
 # The burst window every request draws on, whatever the model. It is the one
 # that fills first — the weekly windows have days of room while this one is
 # already spent — so leaving it out of the load calculation means scheduling
@@ -375,23 +381,47 @@ class AppState:
     def _is_fable_model(model: Optional[str]) -> bool:
         return bool(model) and "fable" in model.lower()
 
+    @staticmethod
+    def _is_claude_model(model: Optional[str]) -> bool:
+        """Whether this model's spend lands in the 7d_claude window.
+
+        The pool also serves gpt-*/kimi-* through the Codex path, which the
+        Claude weekly window says nothing about. An unknown model is treated as
+        Claude: the Anthropic endpoints are what this window governs, and
+        over-weighing an unrecognized id only makes selection more cautious,
+        whereas under-weighing it routes a request that cannot succeed.
+        """
+        if not model:
+            return True
+        lowered = model.lower()
+        return not (lowered.startswith("gpt-") or lowered.startswith("kimi-"))
+
     def _load(self, alias: str, model: Optional[str]) -> float:
         """How full this account is for the requested model.
 
-        Every request draws on the 5h burst window and the 7d window; a fable
-        request additionally draws on the model's own weekly window. The spend
-        lands on all of them, so the tightest one decides: an account whose
-        burst window is spent cannot serve the request no matter how much
-        weekly credit it still has.
+        Every request draws on the 5h burst window and the shared 7d window.
+        A Claude model additionally draws on 7d_claude, and a fable model on
+        7d_fable on top of that. The spend lands on all of them at once, so the
+        tightest one decides: an account whose burst window is spent cannot
+        serve the request no matter how much weekly credit it still has, and a
+        fable request needs headroom in all four.
         """
         windows = self._windows(alias)
-        names = [BURST_WINDOW, "7d"]
-        if self._is_fable_model(model):
-            names.append(FABLE_WINDOW)
+        names = self._relevant_windows(model)
         loads = [value for value in
                  (self._window_utilization(windows.get(name)) for name in names)
                  if value is not None]
         return max(loads) if loads else 0.0
+
+    def _relevant_windows(self, model: Optional[str]) -> list[str]:
+        """Every usage window a request for ``model`` spends, tightest family
+        first so a refusal names the most specific one."""
+        names = [BURST_WINDOW, "7d"]
+        if self._is_claude_model(model):
+            names.append(CLAUDE_WINDOW)
+            if self._is_fable_model(model):
+                names.append(FABLE_WINDOW)
+        return names
 
     def _quota_ok(self, alias: str, model: Optional[str] = None) -> bool:
         """Below the exhaustion mark on every window this model draws on.
@@ -524,13 +554,13 @@ class AppState:
         """Whether a request for ``model`` spends this usage window.
 
         The empty window is a refusal that named none, so it counts against
-        everything; the fable window only against fable models.
+        everything. A family window only counts against the models that draw
+        on it: 7d_fable against fable models, 7d_claude against every Claude
+        model, neither against the gpt-*/kimi-* ids served over Codex.
         """
         if not window:
             return True
-        if window == FABLE_WINDOW:
-            return self._is_fable_model(model)
-        return True
+        return window in self._relevant_windows(model)
 
     def _selectable(self, alias: str, model: Optional[str] = None) -> bool:
         """Eligible for automatic selection: not switched off in the panel and
@@ -661,9 +691,7 @@ class AppState:
         """The window that is spent on the most accounts, which is the one a
         caller has to wait on."""
         counts: dict[str, int] = {}
-        names = [BURST_WINDOW, "7d"]
-        if self._is_fable_model(model):
-            names.append(FABLE_WINDOW)
+        names = self._relevant_windows(model)
         for alias in aliases:
             windows = self._windows(alias)
             for name in names:
@@ -671,8 +699,11 @@ class AppState:
                 if value is not None and value >= QUOTA_EXHAUSTED:
                     counts[name] = counts.get(name, 0) + 1
         if not counts:
-            return FABLE_WINDOW if self._is_fable_model(model) else "7d"
-        return max(counts, key=lambda name: (counts[name], name))
+            return names[-1]
+        # Break a tie towards the most specific family: with 7d and 7d_fable
+        # equally spent, the fable allowance is the one the caller has to wait
+        # on, and it is the one that frees up other models by resetting.
+        return max(counts, key=lambda name: (counts[name], names.index(name)))
 
     def _window_reset_in(self, alias: str, window: str) -> float:
         reset_at = (self._windows(alias).get(window) or {}).get("reset_at")
