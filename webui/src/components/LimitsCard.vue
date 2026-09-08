@@ -81,7 +81,8 @@ async function reload() {
       <p v-if="!view.ok" class="muted err">{{ view.error || "上游拒绝了额度查询" }}</p>
       <p v-else-if="!view.windows.length" class="muted">该账号无窗口数据。</p>
 
-      <div v-else class="windows">
+      <div v-else class="windows"
+           :style="{ '--cols': view.windows.length }">
         <div v-for="w in view.windows" :key="w.name" class="win">
           <div class="win-top">
             <span class="win-label">{{ w.label }}</span>
@@ -139,9 +140,14 @@ async function reload() {
 
 .windows {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  /* One row per account, whatever the upstream reports. A fixed three-column
+     grid wrapped the fourth window (7d_claude arrived later) onto a line of
+     its own with most of it blank, and hard-coding four would do the same on
+     the next addition. */
+  grid-template-columns: repeat(var(--cols, 3), minmax(0, 1fr));
   gap: 14px;
 }
+@media (max-width: 1100px) { .windows { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
 @media (max-width: 620px) { .windows { grid-template-columns: 1fr; } }
 
 .win-top { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 6px; }

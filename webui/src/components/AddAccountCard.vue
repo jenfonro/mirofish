@@ -56,7 +56,7 @@ async function verify() {
   <section class="card">
     <h2>添加账号</h2>
     <p class="muted">邮箱验证码登录；凭证只写入本机加密存储。</p>
-    <label>别名（用于 X-Mirofish-Account）</label>
+    <label>账号名称（用于 X-Mirofish-Account）</label>
     <input v-model="alias" placeholder="work" :disabled="stage === 'verify'" />
     <label>邮箱</label>
     <input v-model="email" type="email" placeholder="you@example.com"

@@ -199,7 +199,7 @@ async function removeAccount(alias: string) {
       <table>
         <thead>
           <tr>
-            <th>启用</th><th>状态</th><th>别名</th><th>邮箱</th><th>套餐</th><th>到期</th><th>代理节点</th>
+            <th>启用</th><th>状态</th><th>账号名称</th><th>套餐</th><th>到期</th><th>代理节点</th>
             <th>7 天配额</th><th class="num">活跃会话</th><th class="num">最近用量</th><th></th>
           </tr>
         </thead>
@@ -223,10 +223,11 @@ async function removeAccount(alias: string) {
                 {{ healthLabel(account) }}
               </span>
             </td>
-            <td class="mono">{{ account.alias }}</td>
-            <td>
-              {{ account.email }}
-              <div v-if="account.profile?.name" class="muted">{{ account.profile.name }}</div>
+            <td class="identity">
+              <div class="mono">{{ account.alias }}</div>
+              <div class="muted">{{ account.email }}</div>
+              <div v-if="account.profile?.name && account.profile.name !== account.alias"
+                   class="muted">{{ account.profile.name }}</div>
             </td>
             <td>
               <span class="badge" :class="planClass(account.plan)"
@@ -312,6 +313,10 @@ async function removeAccount(alias: string) {
 .scroll-x { overflow-x: auto; }
 tr.off td:not(:first-child) { opacity: 0.55; }
 tr.unhealthy td:nth-child(2) { color: var(--critical); }
+/* Alias over email in one cell: they identify the same account, so a separate
+   column only widened the table. */
+.identity { line-height: 1.35; }
+.identity .muted { font-size: 12px; }
 .badge.plan-free { color: var(--muted); }
 .badge.plan-pro {
   color: var(--accent);
