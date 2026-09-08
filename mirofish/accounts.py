@@ -230,7 +230,7 @@ class AccountService:
             else:
                 status, _, data = await self.upstream.json(
                     "GET", self.settings.relay_base, "/me/tenant",
-                    access=access, proxy_url=proxy_url)
+                    access=access, proxy_url=proxy_url, alias=alias)
         except RelayError as exc:
             if exc.status in self._OPTIONAL_TENANT_STATUSES:
                 return exc.status, {}
@@ -247,7 +247,7 @@ class AccountService:
         email = email_value(email)
         status, _, sent = await self.upstream.json(
             "POST", self.settings.auth_base, "/auth/code", {"email": email},
-            proxy_url=proxy_url)
+            proxy_url=proxy_url, alias=alias)
         if status < 200 or status >= 300 or not isinstance(sent, dict) \
                 or sent.get("sent") is not True:
             raise RelayError("verification code was not accepted", status, sent)
@@ -260,7 +260,7 @@ class AccountService:
         code = code_value(code)
         status, _, auth = await self.upstream.json(
             "POST", self.settings.auth_base, "/auth/verify",
-            {"email": email, "code": code}, proxy_url=proxy_url)
+            {"email": email, "code": code}, proxy_url=proxy_url, alias=alias)
         if status < 200 or status >= 300 or not isinstance(auth, dict):
             raise RelayError("login failed", status, auth)
         access = auth.get("access_token")
@@ -302,10 +302,10 @@ class AccountService:
         try:
             s1, _, me = await self.upstream.json(
                 "GET", self.settings.auth_base, "/auth/me",
-                access=access, proxy_url=proxy_url)
+                access=access, proxy_url=proxy_url, alias=alias)
             s2, _, referral = await self.upstream.json(
                 "GET", self.settings.auth_base, "/auth/referral",
-                access=access, proxy_url=proxy_url)
+                access=access, proxy_url=proxy_url, alias=alias)
             s3, tenant = await self._optional_tenant(
                 alias, access, proxy_url, authenticated=False)
         except RelayError as exc:

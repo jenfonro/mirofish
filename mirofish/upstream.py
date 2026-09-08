@@ -945,7 +945,9 @@ class Upstream:
     def __init__(self, settings: Settings, store: Store) -> None:
         self.settings = settings
         self.store = store
-        self._clients: dict[tuple[str, str], httpx.AsyncClient] = {}
+        # (transport, route identity, account alias) -> pool. The alias keeps
+        # each account on its own connections; see ``client``.
+        self._clients: dict[tuple[str, str, str], httpx.AsyncClient] = {}
         self._clients_lock = asyncio.Lock()
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._ticket_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -990,9 +992,17 @@ class Upstream:
             return "", ""
         return str(proxy_url), str(getattr(proxy_url, "route_identity", ""))
 
-    async def client(self, proxy_url: Optional[str]) -> httpx.AsyncClient:
+    async def client(self, proxy_url: Optional[str],
+                     alias: str = "") -> httpx.AsyncClient:
+        """The connection pool this account uses for this exit.
+
+        Keyed by account as well as exit, so two accounts never share a TLS
+        connection. Each account is meant to look like its own client
+        installation, and interleaving several accounts' bearers over one
+        connection is the opposite of that — a real installation opens its own.
+        """
         transport_url, route_identity = self._proxy_route(proxy_url)
-        key = (transport_url, route_identity)
+        key = (transport_url, route_identity, alias)
         async with self._clients_lock:
             client = self._clients.get(key)
             if client is None:
@@ -1018,7 +1028,8 @@ class Upstream:
             self, method: str, url: str,
             headers: Sequence[tuple[str, str]], body: bytes = b"",
             proxy_url: Optional[str] = None, *, stream: bool = False,
-            timeout: Optional[httpx.Timeout] = None) -> httpx.Response:
+            timeout: Optional[httpx.Timeout] = None,
+            alias: str = "") -> httpx.Response:
         """Send one explicitly profiled request without AsyncClient defaults.
 
         Callers own the entire header list, including Host, Connection, and
@@ -1038,7 +1049,7 @@ class Upstream:
             headers=headers,
             extensions={"timeout": timeout.as_dict()} if timeout else {},
         )
-        client = await self.client(proxy_url)
+        client = await self.client(proxy_url, alias)
         return await client.send(request, stream=stream)
 
     # --- generic JSON calls -------------------------------------------------
@@ -1046,7 +1057,8 @@ class Upstream:
     async def json(self, method: str, base: str, path: str,
                    payload: Optional[dict[str, Any]] = None,
                    access: Optional[str] = None,
-                   proxy_url: Optional[str] = None) -> tuple[int, dict[str, str], Any]:
+                   proxy_url: Optional[str] = None,
+                   alias: str = "") -> tuple[int, dict[str, str], Any]:
         body = _json_bytes(payload)
         url = base.rstrip("/") + path
         headers: list[tuple[str, str]] = []
@@ -1069,7 +1081,7 @@ class Upstream:
         headers.extend(_wire_tail(url, body))
         try:
             response = await self.send_explicit(
-                method, url, headers, body, proxy_url)
+                method, url, headers, body, proxy_url, alias=alias)
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
                              {"proxy_network": bool(proxy_url),
@@ -1290,7 +1302,8 @@ class Upstream:
             generation = self._credential_generations.get(alias, 0)
             status, _, data = await self.json(
                 "POST", self.settings.auth_base, "/auth/refresh",
-                {"refresh_token": refresh_token}, proxy_url=proxy_url)
+                {"refresh_token": refresh_token}, proxy_url=proxy_url,
+                alias=alias)
             if status < 200 or status >= 300 or not isinstance(data, dict):
                 raise RelayError("account refresh failed", 401, data)
             access = data.get("access_token")
@@ -1318,11 +1331,13 @@ class Upstream:
         """JSON call with the account's token, refreshing once on 401."""
         access, _ = self.store.credentials(alias)
         status, headers, data = await self.json(method, base, path, payload,
-                                                access=access, proxy_url=proxy_url)
+                                                access=access, proxy_url=proxy_url,
+                                                alias=alias)
         if status == 401:
             access = await self.refresh_access(alias, access, proxy_url)
             status, headers, data = await self.json(method, base, path, payload,
-                                                    access=access, proxy_url=proxy_url)
+                                                    access=access, proxy_url=proxy_url,
+                                                    alias=alias)
         return status, headers, data
 
     async def limits(
@@ -1382,7 +1397,7 @@ class Upstream:
         try:
             response = await self.send_explicit(
                 "POST", url, headers, body, proxy_url,
-                timeout=httpx.Timeout(TICKET_MINT_TIMEOUT_SECONDS))
+                timeout=httpx.Timeout(TICKET_MINT_TIMEOUT_SECONDS), alias=alias)
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
                              {"proxy_network": bool(proxy_url),
@@ -1627,7 +1642,7 @@ class Upstream:
                 )
             response = await self.send_explicit(
                 method, url, headers, body, proxy_url,
-                stream=stream, timeout=timeout)
+                stream=stream, timeout=timeout, alias=alias)
             response.extensions["mirofish_device_ticket"] = (
                 credential.value if credential.kind == "ticket" else "")
             response.extensions["mirofish_relay_credential"] = credential.value

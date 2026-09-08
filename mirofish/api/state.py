@@ -1354,7 +1354,7 @@ class AppState:
 
     @classmethod
     def relay_session_id(cls, claude_session: str, session_hint: str,
-                         payload: Any) -> str:
+                         payload: Any, account: str = "") -> str:
         """Stable, non-secret session id for the upstream relay metadata.
 
         Preserve Claude Code's own printable session id when available. Other
@@ -1371,6 +1371,12 @@ class AppState:
         *is* a UUID.  Anything else is hashed like any other hint: it still
         keys the same conversation to the same account, without letting a local
         caller put an arbitrary label in an upstream header.
+
+        ``account`` is mixed into the hash so the same text on two accounts
+        does not produce the same upstream session id. Each account is meant to
+        look like its own client installation, and a session id shared between
+        two of them says otherwise — the derivation is content-based, so two
+        accounts answering the same prompt collided exactly.
         """
         direct = (claude_session or "").strip()
         if _is_uuid(direct):
@@ -1378,7 +1384,8 @@ class AppState:
         key = direct or (session_hint or "").strip() \
             or cls._session_key_from_payload(payload)
         if key:
-            digest = hashlib.sha256(key.encode("utf-8")).digest()[:16]
+            digest = hashlib.sha256(
+                ("%s\x00%s" % (account, key)).encode("utf-8")).digest()[:16]
             return str(uuid.UUID(bytes=digest, version=4))
         return str(uuid.uuid4())
 

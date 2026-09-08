@@ -212,14 +212,15 @@ async def messages(request: Request) -> Any:
     payload["model"] = validated_model
     session_hint = request.headers.get("X-Mirofish-Session", "")
     requested = request.headers.get("X-Mirofish-Account", "")
-    relay_session = state.relay_session_id(
-        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
+    claude_session = request.headers.get("X-Claude-Code-Session-Id", "")
     beta = _beta_enabled(request)
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
 
     if not payload.get("stream"):
         async def run(account: str):
             generation = state.store.account_generation(account)
+            relay_session = state.relay_session_id(
+                claude_session, session_hint, payload, account)
             result = await state.with_proxy(
                 account,
                 lambda proxy_url: state.upstream.messages(
@@ -235,6 +236,8 @@ async def messages(request: Request) -> Any:
         return JSONResponse(result, headers=outgoing)
 
     async def run_stream(account: str):
+        relay_session = state.relay_session_id(
+            claude_session, session_hint, payload, account)
         return await state.open_messages_stream(
             account, payload, request_headers=request.headers,
             session_id=relay_session, beta=beta, raw_body=raw_body)
@@ -305,7 +308,8 @@ async def count_tokens(request: Request) -> Any:
     account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
                                   session_hint, payload)
     relay_session = state.relay_session_id(
-        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
+        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint,
+        payload, account)
     outgoing = {"X-Mirofish-Account": account}
     try:
         async def op(proxy_url):

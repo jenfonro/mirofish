@@ -34,13 +34,14 @@ async def chat_completions(request: Request) -> Any:
     if not payload.get("model"):
         payload["model"] = state.settings.default_model
     payload["model"] = model_value(str(payload["model"]))
-    relay_session = state.relay_session_id("", session_hint, payload)
     anthropic_payload = openai_to_anthropic(payload)
     model = str(payload.get("model"))
 
     if not payload.get("stream"):
         async def run(account: str):
             generation = state.store.account_generation(account)
+            relay_session = state.relay_session_id(
+                "", session_hint, payload, account)
             result = await state.with_proxy(
                 account,
                 lambda proxy_url: state.upstream.messages(
@@ -57,6 +58,8 @@ async def chat_completions(request: Request) -> Any:
     anthropic_payload["stream"] = True
 
     async def run_stream(account: str):
+        relay_session = state.relay_session_id(
+            "", session_hint, payload, account)
         return await state.open_messages_stream(
             account, anthropic_payload, session_id=relay_session)
     account, (response, stack) = await state.with_account_failover(
