@@ -1,41 +1,41 @@
-"""Sticky account-to-node proxy pool.
+"""Sticky account-to-node proxy pool over a manually curated node list.
 
-Modes:
-- "mihomo": nodes come from the sidecar's selector group; traffic exits via
-  per-account slot listeners (see mihomo.SlotManager).
-- "direct": the relay fetches and parses the subscription itself and dials
-  HTTP(S)/SOCKS5 nodes directly.
-- disabled: no proxy configured; requests go out directly.
+Nodes are added by an operator (one at a time or pasted in bulk) rather than
+pulled from a subscription, and the relay dials them directly. There is no
+sidecar: an earlier version drove a Mihomo instance through its controller API
+and routed each account through a per-account listener, which meant a node
+list that changed under us, a second process to keep alive, and a whole
+protocol to speak. Dialing HTTP(S)/SOCKS5 ourselves gives the same per-account
+isolation — each account is pinned to its own node — with none of that.
 
-Each account stays pinned to one node and rotates after a proxy network failure
-or an upstream refusal tied to that exit's network region.
+Each account stays pinned to one node and rotates after a proxy network
+failure or an upstream refusal tied to that exit's network region.
 """
 
 from __future__ import annotations
 
 import asyncio
-import datetime
 import hashlib
 import sqlite3
 import time
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Optional
 
-import httpx
-
-from ..config import Settings
 from ..errors import RelayError
+from ..config import Settings
 from ..store import Store
-from ..validate import alias_value, node_exclude_pattern, proxy_subscription_value
-from .mihomo import MihomoClient, SlotManager
-from .parse import parse_proxy_subscription, proxy_from_uri, proxy_identity, proxy_url
-
+from ..validate import alias_value
+from .parse import proxy_identity, proxy_url
 
 # How long an account remembers "this exit's region is refused for me". Whether
 # a region is served depends on the account's upstream tier (plus accounts keep
 # working through exits that shared-tier accounts are refused from), so the
 # memory is per account and must never count against the node globally.
 REGION_REFUSAL_TTL = 1800.0
+# Where a node test dials. Plain HTTP with an empty 204 body: no TLS handshake
+# to confuse a proxy failure with a certificate one, and nothing to download.
+TEST_URL = "http://www.gstatic.com/generate_204"
+TEST_TIMEOUT = 10.0
 
 
 class ProxyPool:
@@ -43,217 +43,102 @@ class ProxyPool:
         self.store = store
         self.settings = settings
         self.lock = asyncio.Lock()
-        self.mihomo_proxy = proxy_from_uri(settings.mihomo_proxy) if settings.mihomo_proxy else None
-        if bool(settings.mihomo_controller) != bool(settings.mihomo_proxy):
-            raise RelayError("configure both MIROFISH_MIHOMO_CONTROLLER and MIROFISH_MIHOMO_PROXY", 500)
-        if settings.mihomo_proxy and not self.mihomo_proxy:
-            raise RelayError("MIROFISH_MIHOMO_PROXY must be an http(s) or socks5 URL", 500)
-        self.mihomo: Optional[MihomoClient] = None
-        self.slots: Optional[SlotManager] = None
-        if self.uses_mihomo:
-            self.mihomo = MihomoClient(settings.mihomo_controller,
-                                       settings.mihomo_controller_timeout)
-            self.slots = SlotManager(self.mihomo, proxy_url(self.mihomo_proxy),
-                                     settings.mihomo_slots, settings.mihomo_slot_base_port,
-                                     settings.mihomo_selector)
-        self.node_exclude = node_exclude_pattern(settings.proxy_node_exclude)
-        self.subscription_url = store.proxy_subscription_url()
         self.configs = store.proxy_configs()
-        self.last_refresh = 0.0
-        self.last_attempt = 0.0
-        self.last_error = ""
-        self.skipped_nodes = 0
         # alias -> node_id -> expiry epoch of a per-account region refusal.
         self._region_refused: dict[str, dict[str, float]] = {}
 
     @property
-    def uses_mihomo(self) -> bool:
-        return bool(self.settings.mihomo_controller and self.mihomo_proxy)
-
-    @property
     def configured(self) -> bool:
-        return bool(self.subscription_url) or self.uses_mihomo
+        return bool(self.configs)
 
     async def aclose(self) -> None:
-        if self.mihomo:
-            await self.mihomo.aclose()
+        return None
 
-    # --- refresh ------------------------------------------------------------
+    # --- node management ------------------------------------------------------
 
-    def _sync_url(self) -> str:
-        url = self.store.proxy_subscription_url()
-        if url != self.subscription_url:
-            self.subscription_url = url
-            self.last_refresh = 0.0
-            self.last_attempt = 0.0
-            self.last_error = ""
-            self.configs = self.store.proxy_configs()
-        return url
+    def add(self, config: dict[str, Any]) -> dict[str, Any]:
+        """Add one node, or update it when the same endpoint already exists.
 
-    def _store_nodes(self, configs: dict[str, dict[str, Any]], skipped: int) -> None:
-        # Keep only the current set plus nodes an account is still pinned to
-        # (the pin resolves on its next rotate). Without the prune, every
-        # provider rename and subscription switch left its whole node set
-        # behind in SQLite and the encrypted config vault forever.
-        referenced = self.store.account_proxy_ids()
-        merged = {proxy_id: config for proxy_id, config in self.configs.items()
-                  if proxy_id in referenced}
-        merged.update(configs)
+        Identity is the endpoint (scheme/host/port/credentials), not the name,
+        so re-adding a node an operator already has renames it instead of
+        silently pooling two identical exits.
+        """
+        proxy_id = proxy_identity(config)
+        merged = dict(self.configs)
+        merged[proxy_id] = {**config, "id": proxy_id}
         self.store.save_proxy_configs(merged)
-        self.store.deactivate_proxies()
-        for proxy_id, config in configs.items():
-            self.store.upsert_proxy(proxy_id, config, active=True)
+        self.store.upsert_proxy(proxy_id, merged[proxy_id], active=True)
+        self.configs = merged
+        return merged[proxy_id]
+
+    def update(self, proxy_id: str, changes: dict[str, Any]) -> dict[str, Any]:
+        """Edit a node in place, keeping its id when the endpoint is unchanged."""
+        current = self.configs.get(str(proxy_id))
+        if not isinstance(current, dict):
+            raise RelayError("unknown proxy node: " + str(proxy_id), 404)
+        updated = {**current, **changes}
+        new_id = proxy_identity(updated)
+        merged = dict(self.configs)
+        if new_id != str(proxy_id):
+            # The endpoint moved, so the identity moved with it. Accounts
+            # pinned to the old id are released rather than silently following
+            # the edit to a different server.
+            merged.pop(str(proxy_id), None)
+            self.store.prune_proxies(keep=set(merged) | {new_id})
+            for alias in self.store.aliases():
+                if str(self.store.row(alias)["proxy_id"] or "") == str(proxy_id):
+                    self.store.set_account_proxy(alias, None)
+        merged[new_id] = {**updated, "id": new_id}
+        self.store.save_proxy_configs(merged)
+        self.store.upsert_proxy(new_id, merged[new_id], active=True)
+        self.configs = merged
+        return merged[new_id]
+
+    def remove(self, proxy_id: str) -> None:
+        """Delete a node and release every account pinned to it."""
+        proxy_id = str(proxy_id)
+        if proxy_id not in self.configs:
+            raise RelayError("unknown proxy node: " + proxy_id, 404)
+        merged = {key: value for key, value in self.configs.items() if key != proxy_id}
+        for alias in self.store.aliases():
+            if str(self.store.row(alias)["proxy_id"] or "") == proxy_id:
+                self.store.set_account_proxy(alias, None)
+        self.store.save_proxy_configs(merged)
         self.store.prune_proxies(keep=set(merged))
         self.configs = merged
-        self.skipped_nodes = skipped
-        self.last_refresh = time.time()
-        self.last_error = ""
+        for entries in self._region_refused.values():
+            entries.pop(proxy_id, None)
 
-    async def _fetch_subscription(self, url: str) -> bytes:
-        limits = self.settings
+    async def test(self, proxy_id: str) -> dict[str, Any]:
+        """Dial TEST_URL through one node and record the verdict.
+
+        A success clears the node's failure count, which is what puts a node
+        an operator has fixed back into rotation; a failure records the reason
+        so the panel can show it.
+        """
+        import httpx
+
+        config = self.by_id(proxy_id)
+        if config is None:
+            raise RelayError("unknown proxy node: " + str(proxy_id), 404)
+        started = time.monotonic()
         try:
-            async with httpx.AsyncClient(trust_env=False,
-                                         timeout=min(limits.timeout, limits.proxy_fetch_timeout),
-                                         follow_redirects=True) as client:
-                async with client.stream("GET", url, headers={
-                    "Accept": "application/yaml, text/yaml, text/plain, application/json, */*",
-                    "User-Agent": limits.proxy_subscription_user_agent,
-                }) as response:
-                    if response.status_code >= 400:
-                        raise RelayError("proxy subscription request failed", 502,
-                                         {"status": response.status_code})
-                    body = bytearray()
-                    async for chunk in response.aiter_bytes():
-                        body.extend(chunk)
-                        if len(body) > limits.proxy_fetch_max_bytes:
-                            raise RelayError("proxy subscription is too large", 413)
-                    return bytes(body)
+            async with httpx.AsyncClient(proxy=proxy_url(config), trust_env=False,
+                                         timeout=TEST_TIMEOUT,
+                                         follow_redirects=False) as client:
+                response = await client.get(TEST_URL)
         except httpx.HTTPError as exc:
-            raise RelayError("proxy subscription network error", 502,
-                             {"reason": str(exc)[:200]}) from exc
-
-    def _configs_from_names(self, names: list[str]) -> dict[str, dict[str, Any]]:
-        assert self.mihomo_proxy is not None
-        system = {"DIRECT", "REJECT", "REJECT-DROP", "PASS", "COMPATIBLE", "GLOBAL"}
-        configs: dict[str, dict[str, Any]] = {}
-        for raw_name in names:
-            name = raw_name.strip()
-            if not name or name in system or name == self.settings.mihomo_selector \
-                    or name.startswith("MirofishSlot"):
-                continue
-            # Belt and braces next to the provider exclude-filter: also covers
-            # a sidecar still running a config generated before the filter.
-            if self.node_exclude and self.node_exclude.search(name):
-                continue
-            config = {**self.mihomo_proxy, "name": name, "mihomo_node": name}
-            proxy_id = proxy_identity(config)
-            configs[proxy_id] = {**config, "id": proxy_id}
-        return configs
-
-    async def _refresh_mihomo(self, force: bool) -> dict[str, Any]:
-        assert self.mihomo is not None and self.mihomo_proxy is not None
-        now = time.time()
-        if not force and now - self.last_refresh < self.settings.proxy_refresh_seconds:
-            return self.public_summary()
-        self.last_attempt = now
-        try:
-            if force:
-                await self.mihomo.refresh_provider(self.settings.mihomo_provider)
-            names = await self.mihomo.group_nodes(self.settings.mihomo_selector)
-            configs = self._configs_from_names(names)
-            if not configs:
-                raise RelayError("Mihomo has not loaded any subscription nodes", 502)
-            self._store_nodes(configs, skipped=0)
-            return self.public_summary()
-        except RelayError as exc:
-            self.last_error = str(exc)
-            if force or not self.store.proxy_rows(active_only=True):
-                raise
-            return self.public_summary()
-
-    async def resync_mihomo_nodes(self) -> None:
-        """Replace the active node set from the live selector group.
-
-        The sidecar's provider auto-updates on its own schedule and renames
-        every node, which orphans the stored active set (and all sticky
-        assignments) until the next scheduled refresh. Called when Mihomo
-        rejects a node name the store still lists as active, so recovery does
-        not have to wait out the refresh interval."""
-        assert self.mihomo is not None
-        async with self.lock:
-            names = await self.mihomo.group_nodes(self.settings.mihomo_selector)
-            configs = self._configs_from_names(names)
-            if configs:
-                self._store_nodes(configs, skipped=0)
-
-    async def refresh(self, force: bool = False) -> dict[str, Any]:
-        async with self.lock:
-            if self.uses_mihomo:
-                return await self._refresh_mihomo(force)
-            url = self._sync_url()
-            if not url:
-                self.last_refresh = time.time()
-                self.last_error = ""
-                return self.public_summary()
-            now = time.time()
-            if not force and now - self.last_refresh < self.settings.proxy_refresh_seconds:
-                return self.public_summary()
-            self.last_attempt = now
-            try:
-                raw = await self._fetch_subscription(url)
-                nodes, skipped = parse_proxy_subscription(raw)
-                if self.node_exclude:
-                    kept = [item for item in nodes
-                            if not self.node_exclude.search(str(item.get("name", "")))]
-                    skipped += len(nodes) - len(kept)
-                    nodes = kept
-                configs = {proxy_identity(item): {**item, "id": proxy_identity(item)}
-                           for item in nodes}
-                if not configs:
-                    raise RelayError("proxy subscription contains no supported nodes", 502,
-                                     {"skipped": skipped})
-                self._store_nodes(configs, skipped)
-                return self.public_summary()
-            except RelayError as exc:
-                self.last_error = str(exc)
-                if force or not self.store.proxy_rows(active_only=True):
-                    raise
-                return self.public_summary()
-
-    async def refresh_if_needed(self) -> None:
-        if not self.configured and not self._sync_url():
-            return
-        now = time.time()
-        if now - self.last_refresh < self.settings.proxy_refresh_seconds:
-            return
-        if self.last_error and now - self.last_attempt < self.settings.proxy_refresh_seconds \
-                and self.store.proxy_rows(active_only=True):
-            return
-        try:
-            await self.refresh(force=False)
-        except RelayError:
-            # Keep serving with the previously stored nodes; the next request
-            # retries after the refresh interval.
-            pass
-
-    async def set_subscription(self, value: str) -> dict[str, Any]:
-        if self.uses_mihomo:
-            raise RelayError("Mihomo mode reads the subscription from .env; "
-                             "change it and recreate the containers", 400)
-        value = value.strip()
-        if value:
-            value = proxy_subscription_value(value)
-        self.store.set_proxy_subscription_url(value)
-        async with self.lock:
-            self.subscription_url = value
-            self.last_refresh = 0.0
-            self.last_attempt = 0.0
-            self.last_error = ""
-            if not value:
-                self.store.deactivate_proxies()
-                for alias in self.store.aliases():
-                    self.store.set_account_proxy(alias, None)
-        return await self.refresh(force=True)
+            reason = (str(exc) or type(exc).__name__)[:200]
+            self.store.mark_proxy_failure(str(proxy_id), reason)
+            return {"id": str(proxy_id), "ok": False, "error": reason}
+        latency = round((time.monotonic() - started) * 1000)
+        if response.status_code != 204:
+            reason = "unexpected status %d" % response.status_code
+            self.store.mark_proxy_failure(str(proxy_id), reason)
+            return {"id": str(proxy_id), "ok": False, "error": reason,
+                    "latency_ms": latency}
+        self.store.mark_proxy_success(str(proxy_id))
+        return {"id": str(proxy_id), "ok": True, "latency_ms": latency}
 
     # --- sticky selection -----------------------------------------------------
 
@@ -277,20 +162,15 @@ class ProxyPool:
     def clear_region_refusals(self, alias: str) -> None:
         """Forget exit-region refusals attached to an account identity.
 
-        Login attempts use this without releasing the account's Mihomo slot:
-        the prospective credentials must get a fresh region probe, while an
-        already-running request under the old credentials must not have its
-        slot reassigned underneath it.
+        A login uses this so prospective credentials get a fresh region probe
+        instead of inheriting the previous identity's refusals.
         """
         alias = alias_value(alias)
         self._region_refused.pop(alias, None)
 
     def forget_account(self, alias: str) -> None:
         """Drop all proxy-pool state owned by an account that was removed."""
-        alias = alias_value(alias)
-        self.clear_region_refusals(alias)
-        if self.slots is not None:
-            self.slots.release(alias)
+        self.clear_region_refusals(alias_value(alias))
 
     def _select(self, alias: str, exclude: Optional[str] = None) -> dict[str, Any]:
         refused = self._refused_ids(alias)
@@ -303,11 +183,11 @@ class ProxyPool:
         if not rows:
             available_ids = {str(row["proxy_id"]) for row in available}
             # A previous request may already have swept every usable exit for
-            # this account (for example, the dashboard's /api/limits fetch).
-            # Preserve the account-scoped marker so the next model request can
-            # cool this account and fail over without another upstream call.
-            # Do not attach it when the pool is genuinely empty/dead, or when
-            # `exclude` removed a node after a network failure.
+            # this account. Preserve the account-scoped marker so the next
+            # model request can cool this account and fail over without
+            # another upstream call. Do not attach it when the pool is
+            # genuinely empty/dead, or when `exclude` removed a node after a
+            # network failure.
             if exclude is None and available_ids and available_ids <= refused:
                 raise RelayError("the upstream refuses every available exit region "
                                  "for this account; retry later", 503,
@@ -323,11 +203,9 @@ class ProxyPool:
 
     async def pending_proxy(self, alias: str) -> Optional[dict[str, Any]]:
         """Pick (without persisting) the node a not-yet-saved account would use."""
-        alias = alias_value(alias)
-        await self.refresh_if_needed()
         if not self.configured:
             return None
-        return self._select(alias)
+        return self._select(alias_value(alias))
 
     def by_id(self, proxy_id: Any) -> Optional[dict[str, Any]]:
         if not proxy_id:
@@ -337,7 +215,6 @@ class ProxyPool:
 
     async def for_account(self, alias: str) -> Optional[dict[str, Any]]:
         alias = alias_value(alias)
-        await self.refresh_if_needed()
         if not self.configured:
             return None
         row = self.store.row(alias)
@@ -407,23 +284,6 @@ class ProxyPool:
         if proxy is None:
             yield None
             return
-        if self.uses_mihomo and self.slots is not None:
-            node = str(proxy.get("mihomo_node", "")).strip()
-            if not node:
-                raise RelayError("Mihomo proxy node name is missing", 500)
-            try:
-                async with self.slots.route(alias_value(alias), node) as url:
-                    yield url
-            except RelayError as exc:
-                if isinstance(exc.data, dict) and exc.data.get("unknown_node"):
-                    # The provider renamed its nodes; resync the store and
-                    # surface a rotatable proxy failure so the caller's retry
-                    # re-pins this account to a live node immediately.
-                    await self.resync_mihomo_nodes()
-                    raise RelayError("proxy node no longer exists after provider update",
-                                     502, {"proxy_network": True}) from exc
-                raise
-            return
         yield proxy_url(proxy)
 
     # --- reporting -----------------------------------------------------------
@@ -449,22 +309,33 @@ class ProxyPool:
                 "last_error": proxy_row["last_error"] if proxy_row else None}
 
     def public_summary(self) -> dict[str, Any]:
+        """The pool as the panel renders it: one row per node.
+
+        Credentials are included because the panel edits them; they never
+        leave the authenticated admin API, and they live in the encrypted
+        config vault rather than SQLite.
+        """
         rows = self.store.proxy_rows()
         counts = self.store.proxy_assignment_counts()
+        nodes = []
+        for row in rows:
+            proxy_id = str(row["proxy_id"])
+            config = self.configs.get(proxy_id, {})
+            nodes.append({
+                "id": proxy_id,
+                "name": str(config.get("name") or row["name"] or ""),
+                "scheme": str(config.get("scheme", row["scheme"])),
+                "host": str(config.get("host", row["host"])),
+                "port": int(config.get("port", row["port"])),
+                "username": str(config.get("username", "")),
+                "password": str(config.get("password", "")),
+                "active": bool(row["active"]) and int(row["failure_count"]) == 0,
+                "assigned": counts.get(proxy_id, 0),
+                "failure_count": int(row["failure_count"]),
+                "last_error": row["last_error"],
+                "last_checked": row["last_checked"],
+            })
         return {"configured": self.configured,
-                "backend": "mihomo" if self.uses_mihomo else "direct",
-                "active": sum(bool(row["active"]) and int(row["failure_count"]) == 0
-                              for row in rows),
-                "total": len(rows), "assigned": sum(counts.values()),
-                "last_refresh": datetime.datetime.fromtimestamp(
-                    self.last_refresh, datetime.timezone.utc).isoformat()
-                    if self.last_refresh else None,
-                "last_error": self.last_error or None,
-                "skipped_nodes": self.skipped_nodes,
-                "nodes": [{"id": str(row["proxy_id"]), "name": str(row["name"]),
-                           "scheme": str(row["scheme"]), "host": str(row["host"]),
-                           "port": int(row["port"]),
-                           "active": bool(row["active"]) and int(row["failure_count"]) == 0,
-                           "assigned": counts.get(str(row["proxy_id"]), 0),
-                           "failure_count": int(row["failure_count"]),
-                           "last_error": row["last_error"]} for row in rows]}
+                "active": sum(node["active"] for node in nodes),
+                "total": len(nodes), "assigned": sum(counts.values()),
+                "nodes": nodes}

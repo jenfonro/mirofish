@@ -1,51 +1,114 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { api } from "../api";
-import { loadAccounts, loadProxies, store, toast } from "../store";
+import { loadProxies, store, toast } from "../store";
+import type { ProxyNode } from "../types";
 
-const subscription = ref("");
-const busy = ref(false);
+const busy = ref("");
 const collapsed = ref(false);
+const showPasswords = ref(false);
 
-const isMihomo = computed(() => store.proxies?.backend === "mihomo");
+// One dialog for both add and edit: the fields are identical, and "editing"
+// is just starting from an existing node.
+const form = ref<null | {
+  id: string;
+  mode: "single" | "bulk";
+  name: string;
+  scheme: string;
+  host: string;
+  port: string;
+  username: string;
+  password: string;
+  bulk: string;
+}>(null);
 
-function formatTime(value: string | null): string {
-  if (!value) return "从未";
-  try {
-    return new Date(value).toLocaleString();
-  } catch {
-    return value;
-  }
+const nodes = computed<ProxyNode[]>(() => store.proxies?.nodes ?? []);
+
+function openAdd(): void {
+  form.value = {
+    id: "", mode: "single", name: "", scheme: "socks5", host: "",
+    port: "", username: "", password: "", bulk: "",
+  };
 }
 
-async function saveSubscription() {
-  busy.value = true;
+function openEdit(node: ProxyNode): void {
+  form.value = {
+    id: node.id, mode: "single", name: node.name, scheme: node.scheme,
+    host: node.host, port: String(node.port), username: node.username ?? "",
+    password: node.password ?? "", bulk: "",
+  };
+}
+
+async function save(): Promise<void> {
+  const f = form.value;
+  if (!f) return;
+  busy.value = "form";
   try {
-    store.proxies = await api("/api/proxies/subscription", {
-      method: "POST",
-      body: JSON.stringify({ url: subscription.value.trim() }),
+    if (f.mode === "bulk") {
+      const result = await api<{ added: number; failed: string[] }>(
+        "/api/proxies/import",
+        { method: "POST", body: JSON.stringify({ text: f.bulk }) });
+      await loadProxies();
+      form.value = null;
+      toast(result.failed.length
+        ? `已导入 ${result.added} 个，${result.failed.length} 行无法解析`
+        : `已导入 ${result.added} 个节点`,
+        result.failed.length ? "info" : "ok");
+      return;
+    }
+    const body = JSON.stringify({
+      name: f.name.trim(), scheme: f.scheme, host: f.host.trim(),
+      port: Number(f.port), username: f.username, password: f.password,
     });
-    subscription.value = "";
-    toast("订阅已保存并刷新", "ok");
-    await loadAccounts();
+    if (f.id) {
+      await api(`/api/proxies/${f.id}`, { method: "PATCH", body });
+    } else {
+      await api("/api/proxies", { method: "POST", body });
+    }
+    await loadProxies();
+    form.value = null;
+    toast(f.id ? "节点已保存" : "节点已添加", "ok");
   } catch (error: any) {
-    toast(`保存订阅失败：${error.message}`, "error");
+    toast(`保存失败：${error.message}`, "error");
   } finally {
-    busy.value = false;
+    busy.value = "";
   }
 }
 
-async function refresh() {
-  busy.value = true;
+async function test(node: ProxyNode): Promise<void> {
+  busy.value = node.id;
   try {
-    store.proxies = await api("/api/proxies/refresh", { method: "POST" });
-    toast("代理池已刷新", "ok");
-    await loadAccounts();
+    const result = await api<{ ok: boolean; latency_ms?: number; error?: string }>(
+      `/api/proxies/${node.id}/test`, { method: "POST" });
+    await loadProxies();
+    toast(result.ok
+      ? `${node.name} 可用（${result.latency_ms} ms）`
+      : `${node.name} 不可用：${result.error}`,
+      result.ok ? "ok" : "error");
   } catch (error: any) {
-    toast(`刷新代理池失败：${error.message}`, "error");
+    toast(`测试失败：${error.message}`, "error");
   } finally {
-    busy.value = false;
+    busy.value = "";
   }
+}
+
+async function remove(node: ProxyNode): Promise<void> {
+  if (!confirm(`删除节点 ${node.name}？绑定它的账号会重新分配。`)) return;
+  busy.value = node.id;
+  try {
+    await api(`/api/proxies/${node.id}`, { method: "DELETE" });
+    await loadProxies();
+    toast(`已删除 ${node.name}`, "ok");
+  } catch (error: any) {
+    toast(`删除失败：${error.message}`, "error");
+  } finally {
+    busy.value = "";
+  }
+}
+
+function mask(value: string): string {
+  if (!value) return "—";
+  return showPasswords.value ? value : "•".repeat(Math.min(8, value.length));
 }
 </script>
 
@@ -53,9 +116,6 @@ async function refresh() {
   <section class="card" :class="{ collapsed }">
     <h2>
       代理池
-      <span v-if="store.proxies" class="badge">
-        {{ isMihomo ? "Mihomo 后端" : "直连后端" }}
-      </span>
       <span v-if="store.proxies?.configured" class="badge">
         <span class="dot" :class="store.proxies.active ? 'ok' : 'bad'"></span>
         可用 {{ store.proxies.active }} / {{ store.proxies.total }}
@@ -64,8 +124,8 @@ async function refresh() {
         已绑定 {{ store.proxies.assigned }} 账号
       </span>
       <span class="spacer"></span>
-      <button class="ghost small" :disabled="busy || !store.proxies?.configured"
-              @click="refresh">刷新池</button>
+      <button class="ghost small" :disabled="!!busy" @click="openAdd">添加代理</button>
+      <button class="ghost small" :disabled="!!busy" @click="loadProxies">刷新池</button>
       <button class="ghost small" type="button"
               :aria-expanded="!collapsed" aria-controls="proxy-card-body"
               @click="collapsed = !collapsed">
@@ -74,70 +134,138 @@ async function refresh() {
     </h2>
 
     <div id="proxy-card-body" v-show="!collapsed">
-      <p v-if="store.proxies?.last_error" class="error-line">
-        上次刷新出错：{{ store.proxies.last_error }}
-      </p>
       <p class="muted" style="margin-top: 0">
         每个账号固定绑定一个节点；节点网络失败或上游拒绝该账号的出口区域时自动轮换。
-        上次刷新：{{ formatTime(store.proxies?.last_refresh ?? null) }}
-        <template v-if="store.proxies?.skipped_nodes">
-          · 跳过 {{ store.proxies.skipped_nodes }} 个不支持的节点
-        </template>
+        节点由你手动维护，relay 不会去拉订阅，也不会自己探测。
       </p>
 
-      <template v-if="isMihomo">
-        <p class="muted">
-          Mihomo 模式的订阅来自 .env（SS/VMess/VLESS/Trojan 等协议由容器内置的 Mihomo 引擎处理）。
-          修改订阅或节点排除规则后重新 <code>docker compose up -d --force-recreate</code> 即可。
-        </p>
-      </template>
-      <template v-else>
-        <div class="row">
-          <div class="grow">
-            <label>订阅链接（只写入本机加密存储，不会回显）</label>
-            <input v-model="subscription" type="url" placeholder="https://…/sub?token=…" />
-          </div>
-          <button :disabled="busy || !subscription.trim()" @click="saveSubscription">
-            保存并刷新
-          </button>
-        </div>
-        <p class="muted">直连模式支持 HTTP(S) / SOCKS5 节点；其他协议请使用 Docker 的 Mihomo 模式。</p>
-      </template>
+      <p v-if="!nodes.length" class="muted">
+        还没有节点。点「添加代理」单条录入，或批量粘贴 <code>socks5://user:pass@host:port</code> 这类链接。
+      </p>
 
-      <div v-if="store.proxies?.nodes?.length" class="scroll-x" style="margin-top: 10px">
+      <div v-else class="scroll-x">
         <table>
           <thead>
             <tr>
-              <th>节点</th><th>入口</th><th class="num">绑定账号</th>
-              <th class="num">连续失败</th><th>状态</th>
+              <th>状态</th><th>名称 / 主机</th><th class="num">端口</th>
+              <th>用户</th>
+              <th>
+                密码
+                <button class="ghost small" type="button"
+                        @click="showPasswords = !showPasswords">
+                  {{ showPasswords ? "隐藏" : "显示" }}
+                </button>
+              </th>
+              <th class="num">绑定</th><th></th>
             </tr>
           </thead>
           <tbody>
-            <tr v-for="node in store.proxies.nodes" :key="node.id">
-              <td>{{ node.name }}</td>
-              <td class="mono muted">{{ node.scheme }}://{{ node.host }}:{{ node.port }}</td>
-              <td class="num">{{ (node as any).assigned ?? 0 }}</td>
-              <td class="num">{{ node.failure_count ?? 0 }}</td>
+            <tr v-for="node in nodes" :key="node.id">
               <td>
-                <span class="badge">
+                <span class="badge" :title="node.last_error || '可用'">
                   <span class="dot" :class="node.active ? 'ok' : 'bad'"></span>
                   {{ node.active ? "可用" : "不可用" }}
                 </span>
-                <div v-if="node.last_error" class="muted">{{ node.last_error }}</div>
+              </td>
+              <td class="identity">
+                <div>{{ node.name }}</div>
+                <div class="muted mono">{{ node.scheme }}://{{ node.host }}</div>
+              </td>
+              <td class="num mono">{{ node.port }}</td>
+              <td class="mono">{{ node.username || "—" }}</td>
+              <td class="mono">{{ mask(node.password ?? "") }}</td>
+              <td class="num">{{ node.assigned }}</td>
+              <td class="actions">
+                <button class="ghost small" :disabled="busy === node.id"
+                        @click="test(node)">测试</button>
+                <button class="ghost small" :disabled="!!busy"
+                        @click="openEdit(node)">修改</button>
+                <button class="danger small" :disabled="busy === node.id"
+                        @click="remove(node)">删除</button>
               </td>
             </tr>
           </tbody>
         </table>
       </div>
-      <p v-else-if="!store.proxies?.configured" class="muted">
-        未配置代理；所有账号直连上游。
-      </p>
+    </div>
+
+    <div v-if="form" class="modal-back" @click.self="form = null">
+      <div class="modal">
+        <h3>{{ form.id ? "修改代理" : "添加代理" }}</h3>
+
+        <div v-if="!form.id" class="row tabs">
+          <button class="ghost small" :class="{ picked: form.mode === 'single' }"
+                  @click="form.mode = 'single'">单条录入</button>
+          <button class="ghost small" :class="{ picked: form.mode === 'bulk' }"
+                  @click="form.mode = 'bulk'">批量导入</button>
+        </div>
+
+        <template v-if="form.mode === 'single'">
+          <label>名称</label>
+          <input v-model="form.name" placeholder="便于识别的名称，留空则用主机名" />
+
+          <label>协议</label>
+          <select v-model="form.scheme">
+            <option value="socks5">SOCKS5</option>
+            <option value="http">HTTP</option>
+            <option value="https">HTTPS</option>
+          </select>
+
+          <label>服务器</label>
+          <div class="row">
+            <input v-model="form.host" class="grow" placeholder="主机或 IP" />
+            <input v-model="form.port" class="port" placeholder="端口" inputmode="numeric" />
+          </div>
+
+          <label>认证</label>
+          <div class="row">
+            <input v-model="form.username" class="grow" placeholder="用户名" autocomplete="off" />
+            <input v-model="form.password" class="grow" placeholder="密码"
+                   type="password" autocomplete="off" />
+          </div>
+        </template>
+
+        <template v-else>
+          <label>代理列表（每行一条，名称留空）</label>
+          <textarea v-model="form.bulk" rows="8" spellcheck="false"
+                    placeholder="socks5://user:pass@198.51.100.24:1080&#10;203.0.113.77:8080"></textarea>
+          <p class="muted">
+            支持 <code>socks5://</code>、<code>http://</code>、<code>https://</code>，
+            以及不带协议的 <code>host:port</code>（按 SOCKS5 处理）。
+            以 <code>#</code> 开头的行会被忽略；解析不了的行会单独报出来，不影响其余。
+          </p>
+        </template>
+
+        <div class="row modal-actions">
+          <span class="spacer"></span>
+          <button class="ghost" :disabled="busy === 'form'" @click="form = null">取消</button>
+          <button :disabled="busy === 'form'
+                    || (form.mode === 'single' ? !form.host.trim() || !form.port : !form.bulk.trim())"
+                  @click="save">确定</button>
+        </div>
+      </div>
     </div>
   </section>
 </template>
 
 <style scoped>
-.card.collapsed > h2 { margin-bottom: 0; }
 .scroll-x { overflow-x: auto; }
-.error-line { color: var(--critical); font-size: 13px; }
+.identity { line-height: 1.35; }
+.identity .muted { font-size: 12px; }
+.actions { white-space: nowrap; }
+.modal-back {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal {
+  background: var(--bg-1, #fff); color: inherit; padding: 18px 20px;
+  border-radius: 10px; width: min(560px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px); overflow-y: auto;
+  border: 1px solid var(--line);
+}
+.modal h3 { margin: 0 0 12px; font-size: 15px; }
+.modal label { margin-top: 10px; }
+.modal .port { width: 96px; flex: none; }
+.tabs .picked { border-color: var(--accent); color: var(--accent); }
+.modal-actions { margin-top: 16px; }
 </style>

@@ -32,4 +32,3 @@ captures/
 .claude/
 
 # Mounted proxy subscription inputs often contain node credentials.
-/deploy/mirofish-relay/mihomo-input/

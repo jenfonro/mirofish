@@ -1407,10 +1407,25 @@ class AppState:
 
     async def with_pending_proxy(
             self, alias: str, op: Callable[[Optional[str]], Awaitable[Any]],
-            attempts: int = 3) -> tuple[Optional[dict[str, Any]], Any]:
+            attempts: int = 3,
+            pinned: Optional[dict[str, Any]] = None,
+            direct: bool = False) -> tuple[Optional[dict[str, Any]], Any]:
         """Run a pre-login operation, failing over to another node when the
         picked one cannot reach the upstream (network error or a non-API
-        response such as an HTML block page). Returns (proxy, result)."""
+        response such as an HTML block page). Returns (proxy, result).
+
+        ``pinned`` is an exit the operator chose, and ``direct`` is them
+        choosing none. Either is used as given and never rotated away from:
+        the choice is the point, and quietly logging in through a different
+        exit would bind the account to a region they did not pick.
+        """
+        if direct:
+            return None, await op(None)
+        if pinned is not None:
+            alias = alias_value(alias)
+            self.pool.clear_region_refusals(alias)
+            async with self.pool.route(alias, pinned) as proxy_url:
+                return pinned, await op(proxy_url)
         # Region serviceability is account-tier dependent. A deliberate new
         # login may replace the identity behind this alias, so it must not be
         # blocked by the previous identity's refusal history. Clear once before
@@ -1448,9 +1463,8 @@ class AppState:
     ) -> tuple[httpx.Response, AsyncExitStack]:
         """Open a streaming upstream call inside its proxy route context.
 
-        The returned AsyncExitStack keeps the route (and, for shared mihomo
-        slots, its lock) plus the HTTP response open; the caller closes it
-        when the stream finishes.
+        The returned AsyncExitStack keeps the proxy route and the HTTP
+        response open; the caller closes it when the stream finishes.
         """
         proxy = await self.pool.for_account(alias)
         network_failures = 0

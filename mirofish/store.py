@@ -13,7 +13,7 @@ import threading
 from typing import Any, Optional, Sequence
 
 from .errors import RelayError
-from .validate import alias_value, proxy_subscription_value
+from .validate import alias_value
 from .vault import CredentialStore
 
 PROXY_POOL_ALIAS = "proxy_pool"
@@ -312,25 +312,6 @@ class Store:
             if "missing" in str(exc).lower():
                 return ""
             raise
-
-    def proxy_subscription_url(self) -> str:
-        file_path = os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_URL_FILE", "").strip()
-        if file_path:
-            try:
-                return proxy_subscription_value(
-                    pathlib.Path(file_path).read_text(encoding="utf-8"))
-            except OSError as exc:
-                raise RelayError("could not read proxy subscription URL file", 500) from exc
-        env_value = os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_URL", "").strip()
-        if env_value:
-            return proxy_subscription_value(env_value)
-        return self._optional_secret(PROXY_POOL_ALIAS, "subscription_url").strip()
-
-    def set_proxy_subscription_url(self, value: str) -> None:
-        if value.strip():
-            self.vault.put(PROXY_POOL_ALIAS, "subscription_url", proxy_subscription_value(value))
-        else:
-            self.vault.delete(PROXY_POOL_ALIAS, "subscription_url")
 
     # --- non-secret settings -------------------------------------------------
 

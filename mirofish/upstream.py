@@ -945,9 +945,9 @@ class Upstream:
     def __init__(self, settings: Settings, store: Store) -> None:
         self.settings = settings
         self.store = store
-        # (transport, route identity, account alias) -> pool. The alias keeps
-        # each account on its own connections; see ``client``.
-        self._clients: dict[tuple[str, str, str], httpx.AsyncClient] = {}
+        # (proxy url, account alias) -> pool. The alias keeps each account on
+        # its own connections; see ``client``.
+        self._clients: dict[tuple[str, str], httpx.AsyncClient] = {}
         self._clients_lock = asyncio.Lock()
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._ticket_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -979,18 +979,15 @@ class Upstream:
             await client.aclose()
 
     @staticmethod
-    def _proxy_route(proxy_url: Optional[str]) -> tuple[str, str]:
-        """Return the transport URL and its logical route identity.
+    def _proxy_route(proxy_url: Optional[str]) -> str:
+        """The transport URL, which is also its route identity.
 
-        Mihomo switches several nodes behind one stable listener URL.  A
-        keep-alive CONNECT tunnel was therefore previously reused after a node
-        rotation, leaving retries on the refused old exit.  ``RoutedProxyURL``
-        supplies the selector/node identity without changing the URL httpx
-        receives; ordinary direct proxy strings retain the legacy URL key.
+        A node's URL now names exactly one exit. This used to need a second
+        identity because a Mihomo listener multiplexed several nodes behind one
+        URL, so a keep-alive tunnel could survive a rotation and keep retrying
+        the refused exit.
         """
-        if not proxy_url:
-            return "", ""
-        return str(proxy_url), str(getattr(proxy_url, "route_identity", ""))
+        return str(proxy_url) if proxy_url else ""
 
     async def client(self, proxy_url: Optional[str],
                      alias: str = "") -> httpx.AsyncClient:
@@ -1001,8 +998,8 @@ class Upstream:
         installation, and interleaving several accounts' bearers over one
         connection is the opposite of that — a real installation opens its own.
         """
-        transport_url, route_identity = self._proxy_route(proxy_url)
-        key = (transport_url, route_identity, alias)
+        transport_url = self._proxy_route(proxy_url)
+        key = (transport_url, alias)
         async with self._clients_lock:
             client = self._clients.get(key)
             if client is None:
@@ -1106,8 +1103,7 @@ class Upstream:
         return lock
 
     def _ticket_key(self, alias: str, proxy_url: Optional[str]) -> tuple[str, str]:
-        transport_url, route_identity = self._proxy_route(proxy_url)
-        return alias, route_identity or transport_url
+        return alias, self._proxy_route(proxy_url)
 
     def _ticket_lock(self, alias: str, proxy_url: Optional[str]) -> asyncio.Lock:
         key = self._ticket_key(alias, proxy_url)

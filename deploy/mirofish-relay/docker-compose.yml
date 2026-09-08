@@ -4,7 +4,7 @@ services:
       context: ../..
       dockerfile: deploy/mirofish-relay/Dockerfile
     container_name: mirofish-relay
-    # Docker's init (tini) as PID 1 reaps the mihomo + relay child processes.
+    # Docker's init (tini) as PID 1 reaps the relay process cleanly.
     init: true
     ports:
       # Public exposure requested. Anyone who can reach this port needs the
@@ -31,27 +31,10 @@ services:
       MIROFISH_MAX_KEEPALIVE_CONNECTIONS: ${MIROFISH_MAX_KEEPALIVE_CONNECTIONS:-20}
       MIROFISH_STREAM_READ_TIMEOUT: ${MIROFISH_STREAM_READ_TIMEOUT:-600}
       MIROFISH_MAX_BODY_BYTES: ${MIROFISH_MAX_BODY_BYTES:-8388608}
-      # 代理订阅：远程 URL 或挂载到 /input 的本地文件，二选一；留空则纯直连（不启动 mihomo）。
-      MIROFISH_PROXY_SUBSCRIPTION_URL: ${MIROFISH_PROXY_SUBSCRIPTION_URL:-}
-      MIROFISH_PROXY_SUBSCRIPTION_FILE: ${MIROFISH_PROXY_SUBSCRIPTION_FILE:-}
-      MIROFISH_PROXY_REFRESH_SECONDS: ${MIROFISH_PROXY_REFRESH_SECONDS:-600}
-      MIROFISH_PROXY_FETCH_TIMEOUT: ${MIROFISH_PROXY_FETCH_TIMEOUT:-10}
-      MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT: ${MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT:-mihomo/1.19.0}
+      # 节点连续失败多少次后离开轮换。节点由面板手动维护，没有订阅可刷。
       MIROFISH_PROXY_FAILURE_THRESHOLD: ${MIROFISH_PROXY_FAILURE_THRESHOLD:-2}
-      # 可选：按名称排除节点（正则，如 香港|HK|🇭🇰）；命中的节点完全不进入池。
-      MIROFISH_PROXY_NODE_EXCLUDE: ${MIROFISH_PROXY_NODE_EXCLUDE:-}
-      # Controller/proxy endpoints are wired to loopback by the entrypoint; the
-      # engine now lives in this same container.
-      MIROFISH_MIHOMO_CONTROLLER_TIMEOUT: ${MIROFISH_MIHOMO_CONTROLLER_TIMEOUT:-5}
-      MIROFISH_MIHOMO_SELECTOR: ${MIROFISH_MIHOMO_SELECTOR:-MirofishPool}
-      MIROFISH_MIHOMO_PROVIDER: ${MIROFISH_MIHOMO_PROVIDER:-mirofish}
-      # 每个账号独立出口的槽位数量与起始端口（并发能力）。
-      MIROFISH_MIHOMO_SLOTS: ${MIROFISH_MIHOMO_SLOTS:-8}
-      MIROFISH_MIHOMO_SLOT_BASE_PORT: ${MIROFISH_MIHOMO_SLOT_BASE_PORT:-7891}
     volumes:
       - mirofish-data:/data
-      # Optional static subscription source (MIROFISH_PROXY_SUBSCRIPTION_FILE=/input/...).
-      - ./mihomo-input:/input:ro
     restart: unless-stopped
 
 volumes:

@@ -8,7 +8,6 @@ import httpx
 import respx
 
 from mirofish.errors import RelayError
-from mirofish.proxy.mihomo import RoutedProxyURL
 from mirofish.upstream import LIMITS_PATH, MESSAGES_PATH, _DeviceTicket
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 from tests.mirasim_protocol import relay_metadata
@@ -240,25 +239,29 @@ async def test_401_retry_keeps_the_session_but_renews_the_call(state):
     assert first.content == second.content
 
 
-async def test_route_identity_scopes_session_and_401_invalidation(
+async def test_each_exit_gets_its_own_ticket_and_invalidation(
         state, monkeypatch):
+    """A ticket is minted per (account, exit) and invalidated the same way.
+
+    A 401 on one exit must not drop the ticket the account is using on
+    another: they are separate device sessions upstream, and re-minting the
+    healthy one costs a round trip for nothing.
+    """
     add_account(state, "work")
-    route_a = RoutedProxyURL("http://mihomo:7891", "route-a")
-    route_b = RoutedProxyURL("http://mihomo:7891", "route-b")
+    route_a = "socks5://node-a.example.com:1080"
+    route_b = "socks5://node-b.example.com:1080"
     minted: list[str] = []
 
     async def mint(_alias, _access, proxy_url=None):
-        minted.append(proxy_url.route_identity)
-        return _DeviceTicket(
-            "ticket-" + proxy_url.route_identity + f"-{len(minted)}",
-            time.monotonic() + 900.0,
-        )
+        minted.append(str(proxy_url))
+        return _DeviceTicket("ticket-%d" % len(minted), time.monotonic() + 900.0)
 
     monkeypatch.setattr(state.upstream, "_mint_device_ticket", mint)
     ticket_a = await state.upstream._device_ticket("work", route_a)
     ticket_b = await state.upstream._device_ticket("work", route_b)
     key_a = state.upstream._ticket_key("work", route_a)
     key_b = state.upstream._ticket_key("work", route_b)
+    assert key_a != key_b
 
     state.upstream._invalidate_route_ticket("work", route_a, ticket_a)
 
@@ -269,4 +272,4 @@ async def test_route_identity_scopes_session_and_401_invalidation(
     replacement_a = await state.upstream._device_ticket("work", route_a)
     assert replacement_a != ticket_a
     assert await state.upstream._device_ticket("work", route_b) == ticket_b
-    assert minted == ["route-a", "route-b", "route-a"]
+    assert minted == [route_a, route_b, route_a]

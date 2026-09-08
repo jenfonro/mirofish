@@ -1,7 +1,7 @@
 """CLI: account management, sidecar config generation, and the relay server.
 
 Subcommands match the legacy single-file relay so existing docs and muscle
-memory keep working: add / list / status / models / remove / mihomo-config /
+memory keep working: add / list / status / models / remove /
 serve.
 """
 
@@ -21,7 +21,6 @@ from .api import create_app
 from .api.state import AppState
 from .config import DEFAULT_DATA_DIR, Settings
 from .errors import RelayError
-from .mihomo_config import write_mihomo_config
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -46,8 +45,6 @@ def make_parser() -> argparse.ArgumentParser:
                         help="--scan 时最多探测的候选模型数（默认全部）")
     remove = commands.add_parser("remove", help="删除本地账号及凭证")
     remove.add_argument("alias")
-    mihomo = commands.add_parser("mihomo-config", help="生成 Docker Mihomo sidecar 配置")
-    mihomo.add_argument("--output", type=pathlib.Path, required=True)
     serve = commands.add_parser("serve", help="启动仅监听 localhost 的中转")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
@@ -112,10 +109,6 @@ def main() -> int:
         settings = Settings.from_env()
         settings.data_dir = args.data_dir
         settings.timeout = args.timeout
-        if args.command == "mihomo-config":
-            write_mihomo_config(args.output, settings)
-            print("已生成 Mihomo 配置：" + str(args.output))
-            return 0
         if args.command == "serve" and args.default_account:
             settings.default_account = args.default_account
         state = AppState(settings,

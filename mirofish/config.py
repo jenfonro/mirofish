@@ -90,22 +90,11 @@ class Settings:
     default_account: str = ""
     session_ttl: float = 1800.0
 
-    proxy_refresh_seconds: float = 600.0
-    proxy_fetch_timeout: float = 10.0
-    proxy_fetch_max_bytes: int = 8 * 1024 * 1024
-    proxy_subscription_user_agent: str = "mihomo/1.19.0"
+    # Consecutive failures before a node leaves the rotation. Nodes are added
+    # by an operator now, so there is no subscription to refetch and no
+    # sidecar to reconcile with: a node is what the operator entered until
+    # they change it.
     proxy_failure_threshold: int = 2
-    # Regex over node names; matches are dropped from the pool entirely
-    # (Mihomo provider exclude-filter + direct-mode parse filter).
-    proxy_node_exclude: str = ""
-
-    mihomo_controller: str = ""
-    mihomo_proxy: str = ""
-    mihomo_selector: str = "MirofishPool"
-    mihomo_provider: str = "mirofish"
-    mihomo_controller_timeout: float = 5.0
-    mihomo_slots: int = 8
-    mihomo_slot_base_port: int = 7891
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -162,23 +151,8 @@ class Settings:
                 "MIROFISH_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=1),
             max_body_bytes=_env_int(
                 "MIROFISH_MAX_BODY_BYTES", 8 * 1024 * 1024, minimum=1024),
-            proxy_refresh_seconds=_env_float("MIROFISH_PROXY_REFRESH_SECONDS", 600.0, minimum=30.0),
-            proxy_fetch_timeout=_env_float("MIROFISH_PROXY_FETCH_TIMEOUT", 10.0, minimum=3.0),
-            proxy_subscription_user_agent=(
-                os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT", "mihomo/1.19.0").strip()
-                or "mihomo/1.19.0"),
             proxy_failure_threshold=_env_int("MIROFISH_PROXY_FAILURE_THRESHOLD", 2, minimum=1),
-            proxy_node_exclude=os.environ.get("MIROFISH_PROXY_NODE_EXCLUDE", "").strip(),
-            mihomo_controller=os.environ.get("MIROFISH_MIHOMO_CONTROLLER", "").rstrip("/"),
-            mihomo_proxy=os.environ.get("MIROFISH_MIHOMO_PROXY", "").strip(),
-            mihomo_selector=os.environ.get("MIROFISH_MIHOMO_SELECTOR", "MirofishPool").strip() or "MirofishPool",
-            mihomo_provider=os.environ.get("MIROFISH_MIHOMO_PROVIDER", "mirofish").strip() or "mirofish",
-            mihomo_slots=_env_int("MIROFISH_MIHOMO_SLOTS", 8, minimum=1),
-            mihomo_slot_base_port=_env_int("MIROFISH_MIHOMO_SLOT_BASE_PORT", 7891, minimum=1025),
         )
-        settings.mihomo_controller_timeout = max(
-            1.0, min(settings.proxy_fetch_timeout,
-                     _env_float("MIROFISH_MIHOMO_CONTROLLER_TIMEOUT", 5.0)))
         settings.max_keepalive_connections = min(
             settings.max_keepalive_connections, settings.max_connections)
         return settings

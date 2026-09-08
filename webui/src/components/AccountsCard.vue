@@ -2,10 +2,46 @@
 import { ref } from "vue";
 import { api } from "../api";
 import { compact } from "../limits";
-import { loadAccounts, store, toast } from "../store";
+import { loadAccounts, loadProxies, store, toast } from "../store";
 import type { Account } from "../types";
+import ProxyPicker from "./ProxyPicker.vue";
 
 const busy = ref<string>("");
+// The edit dialog holds everything about one account that is worth changing
+// or reading in one place; the table row stays a summary.
+const editing = ref<Account | null>(null);
+const editProxy = ref("");
+
+async function openEdit(account: Account) {
+  editing.value = account;
+  editProxy.value = account.proxy?.id ?? "";
+  if (!store.proxies) {
+    try {
+      await loadProxies();
+    } catch (error: any) {
+      toast(`读取代理池失败：${error.message}`, "error");
+    }
+  }
+}
+
+async function saveProxy() {
+  const account = editing.value;
+  if (!account) return;
+  busy.value = account.alias;
+  try {
+    await api(`/api/accounts/${account.alias}/proxy`, {
+      method: "POST",
+      body: JSON.stringify({ proxy_id: editProxy.value }),
+    });
+    await loadAccounts();
+    editing.value = store.accounts.find((item) => item.alias === account.alias) ?? null;
+    toast(`已更新 ${account.alias} 的代理`, "ok");
+  } catch (error: any) {
+    toast(`更新代理失败：${error.message}`, "error");
+  } finally {
+    busy.value = "";
+  }
+}
 
 function utilization(account: Account): number | null {
   const raw = account.quota?.["7d_utilization"];
@@ -35,6 +71,16 @@ function planExpiry(account: Account): Expiry | null {
     date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
     days: Math.ceil((epoch * 1000 - Date.now()) / 86_400_000),
   };
+}
+
+/** The dialog has room for the exact moment, unlike the table's date-only cell. */
+function expiryFull(account: Account): string {
+  const epoch = account.profile?.plan_expires_epoch;
+  if (!epoch || !Number.isFinite(epoch)) return "";
+  const d = new Date(epoch * 1000);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+    + ` ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
 
 function expiryColor(days: number): string {
@@ -79,6 +125,9 @@ async function refreshProfile(alias: string) {
   try {
     await api(`/accounts/${alias}/status`);
     await loadAccounts();
+    if (editing.value?.alias === alias) {
+      editing.value = store.accounts.find((item) => item.alias === alias) ?? null;
+    }
     toast(`已刷新 ${alias} 的资料`, "ok");
   } catch (error: any) {
     toast(`刷新 ${alias} 资料失败：${error.message}`, "error");
@@ -92,6 +141,9 @@ async function refreshLimits(alias: string) {
   try {
     await api(`/accounts/${alias}/limits`);
     await loadAccounts();
+    if (editing.value?.alias === alias) {
+      editing.value = store.accounts.find((item) => item.alias === alias) ?? null;
+    }
     toast(`已刷新 ${alias} 的额度`, "ok");
   } catch (error: any) {
     toast(`刷新 ${alias} 额度失败：${error.message}`, "error");
@@ -293,23 +345,82 @@ async function removeAccount(alias: string) {
               出 {{ account.last_usage?.output_tokens ?? "–" }}
             </td>
             <td class="actions">
-              <button class="ghost small" :disabled="busy === account.alias"
-                      title="读取 /v1/limits 刷新用量窗口；不产生模型调用"
-                      @click="refreshLimits(account.alias)">额度</button>
-              <button class="ghost small" :disabled="busy === account.alias"
-                      title="读取 mirasim 账号资料（套餐、到期、持有人）；不产生模型调用"
-                      @click="refreshProfile(account.alias)">资料</button>
+              <button class="ghost small" :disabled="!!busy"
+                      @click="openEdit(account)">修改</button>
               <button class="danger small" @click="removeAccount(account.alias)">删除</button>
             </td>
           </tr>
         </tbody>
       </table>
     </div>
+
+    <div v-if="editing" class="modal-back" @click.self="editing = null">
+      <div class="modal">
+        <h3>{{ editing.alias }}</h3>
+        <p class="muted mono">{{ editing.email }}</p>
+
+        <dl class="facts">
+          <dt>套餐</dt>
+          <dd>{{ editing.plan || "未知" }}</dd>
+          <dt>到期</dt>
+          <dd v-if="planExpiry(editing)">
+            <span class="mono">{{ expiryFull(editing) }}</span>
+            <span class="muted">
+              （{{ planExpiry(editing)!.days < 0 ? "已到期"
+                  : planExpiry(editing)!.days === 0 ? "今天"
+                  : `剩 ${planExpiry(editing)!.days} 天` }}）
+            </span>
+          </dd>
+          <dd v-else>—</dd>
+          <dt>状态</dt>
+          <dd :title="healthTitle(editing)">{{ healthLabel(editing) }}</dd>
+        </dl>
+
+        <label>代理</label>
+        <ProxyPicker v-model="editProxy" :nodes="store.proxies?.nodes ?? []" />
+        <p class="muted">
+          绑定后该账号固定走这个出口；节点故障或上游拒绝其出口区域时才会自动轮换。
+        </p>
+
+        <div class="row modal-actions">
+          <button class="ghost" :disabled="busy === editing.alias"
+                  title="读取 mirasim 账号资料（套餐、到期、持有人）；不产生模型调用"
+                  @click="refreshProfile(editing.alias)">刷新资料</button>
+          <button class="ghost" :disabled="busy === editing.alias"
+                  title="读取 /v1/limits 刷新用量窗口；不产生模型调用"
+                  @click="refreshLimits(editing.alias)">刷新额度</button>
+          <span class="spacer"></span>
+          <button class="ghost" @click="editing = null">关闭</button>
+          <button :disabled="busy === editing.alias
+                    || editProxy === (editing.proxy?.id ?? '')"
+                  @click="saveProxy">保存代理</button>
+        </div>
+      </div>
+    </div>
   </section>
 </template>
 
 <style scoped>
 .scroll-x { overflow-x: auto; }
+.modal-back {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, 0.45);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+.modal {
+  background: var(--bg-1, #fff); color: inherit; padding: 18px 20px;
+  border-radius: 10px; width: min(520px, calc(100vw - 32px));
+  max-height: calc(100vh - 64px); overflow-y: auto; border: 1px solid var(--line);
+}
+.modal h3 { margin: 0; font-size: 15px; }
+.modal > .muted { margin: 2px 0 12px; font-size: 12px; }
+.modal label { margin-top: 12px; }
+.facts {
+  display: grid; grid-template-columns: auto 1fr; gap: 4px 12px;
+  margin: 0; font-size: 13px;
+}
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; }
+.modal-actions { margin-top: 16px; }
 tr.off td:not(:first-child) { opacity: 0.55; }
 tr.unhealthy td:nth-child(2) { color: var(--critical); }
 /* Alias over email in one cell: they identify the same account, so a separate

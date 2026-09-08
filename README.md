@@ -1,10 +1,10 @@
 # Mirofish Relay
 
 Mirofish Relay 是一个面向本地或自托管环境的多账号中转服务，提供 Anthropic 与 OpenAI
-兼容接口、账号管理、会话亲和路由、Mihomo 代理池，以及内置的中文 WebUI。
+兼容接口、账号管理、会话亲和路由、手动维护的代理池，以及内置的中文 WebUI。
 
 > 本项目不是 Mirofish 官方项目。请遵守上游服务条款，仅管理你有权使用的账号与代理，
-> 不要公开分享账号凭证、代理订阅、主密钥或本地代理密钥。
+> 不要公开分享账号凭证、代理地址、主密钥或本地代理密钥。
 
 ## 主要功能
 
@@ -14,10 +14,10 @@ Mirofish Relay 是一个面向本地或自托管环境的多账号中转服务�
 - Codex Responses 透明代理：`/v1/responses` 与 `/backend-api/codex/responses`。
 - `/v1/messages/count_tokens` token 计数接口。
 - 会话亲和与配额感知路由，让同一对话持续使用同一账号。
-- Mihomo 代理池：账号固定节点、失败自动轮换、多槽位并发出口。
+- 代理池：面板录入 SOCKS5 / HTTP / HTTPS 节点，账号固定出口、失败自动轮换。
 - 加密凭证存储：容器内使用 scrypt + AES-256-GCM。
 - 中文 WebUI：账号、额度、用量、代理池与模型调用测试。
-- 单容器 Docker 部署，Relay 与 Mihomo 一起运行。
+- 单容器 Docker 部署，容器内只有 relay 一个进程。
 
 ## 工作方式
 
@@ -33,7 +33,7 @@ Anthropic / OpenAI / Codex 客户端
        └── 固定代理节点与失败轮换
                     │
                     ▼
-               Mihomo 代理池
+          代理池（SOCKS5 / HTTP(S)）
                     │
                     ▼
                Mirofish 上游
@@ -61,13 +61,7 @@ MIROFISH_MASTER_KEY=请替换为随机且足够长的主密钥
 openssl rand -base64 32
 ```
 
-如需使用代理池，再填写 Mihomo 订阅地址：
-
-```dotenv
-MIROFISH_PROXY_SUBSCRIPTION_URL=https://example.com/sub?token=...
-```
-
-不配置订阅时，服务会以直连模式运行。
+代理节点不在配置文件里：服务启动后在 WebUI 的代理池里录入即可，没有节点时全部账号直连。
 
 ### 2. 启动服务
 
@@ -93,7 +87,7 @@ docker compose exec mirofish cat /data/proxy.key
 
 在 WebUI 输入密钥后，即可添加账号、查看额度、管理代理池并测试模型调用。
 
-更完整的 Docker、静态订阅、升级和故障排查说明见
+更完整的 Docker、代理池、升级和故障排查说明见
 [部署文档](deploy/mirofish-relay/README.md)。
 
 ## API 调用
@@ -249,10 +243,7 @@ ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是
 | `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.272` | relay 客户端版本标识 |
 | `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY` | 内置 32 字节公钥 | `x-mirasim-enc` 的 X25519 接收公钥 |
 | `MIROFISH_MIRASIM_SEAL_METADATA` | `1` | 是否封装模型请求的 relay 元数据 |
-| `MIROFISH_PROXY_SUBSCRIPTION_URL` | 空 | Mihomo 代理订阅地址 |
-| `MIROFISH_PROXY_REFRESH_SECONDS` | `600` | 代理池刷新间隔 |
 | `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点停用前的连续失败次数 |
-| `MIROFISH_MIHOMO_SLOTS` | `8` | 独立代理出口槽位数量 |
 | `MIROFISH_SESSION_TTL` | `1800` | 会话亲和有效期，单位为秒 |
 | `MIROFISH_KEEPALIVE_EXPIRY` | `75` | 上游 HTTP/1.1 空闲连接保留秒数 |
 | `MIROFISH_MAX_CONNECTIONS` | `100` | 上游连接池总连接上限 |
@@ -313,12 +304,11 @@ Docker 数据默认保存在 `mirofish-data` 数据卷：
   不额外落盘。
 - `/data/accounts.sqlite3`：账号元数据、代理绑定和用量日志。
 - `/data/proxy.key`：调用本地 API 所需的代理密钥。
-- `/data/mihomo/`：Mihomo 配置与 provider 缓存。
 
 请注意：
 
 - 丢失 `MIROFISH_MASTER_KEY` 后，已有加密凭证无法恢复。
-- 不要将 `.env`、订阅链接、验证码、token 或代理密钥提交到 Git。
+- 不要将 `.env`、代理地址与凭据、验证码、token 或代理密钥提交到 Git。
 - 默认 Docker 配置监听 `0.0.0.0:8787`。公网部署必须增加 TLS 与额外鉴权，
   或将端口改为只监听 `127.0.0.1`。
 - 账号“资料+额度”使用 `/v1/limits`，不产生模型调用；显式模型扫描仍会发送最小工作请求，

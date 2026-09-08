@@ -3,7 +3,6 @@ import base64
 import json
 import time
 import uuid
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -985,8 +984,6 @@ async def test_delete_account(client, state, auth_headers):
     state.pending_logins["work"] = {
         "email": "work@example.com", "created": time.time(), "proxy_id": None}
     state.pool._region_refused["work"] = {"stale-node": time.time() + 1800}
-    released = []
-    state.pool.slots = SimpleNamespace(release=released.append)
 
     response = await client.request("DELETE", "/api/accounts/work", headers=auth_headers)
 
@@ -1003,8 +1000,8 @@ async def test_delete_account(client, state, auth_headers):
     assert "work" not in state.pending_logins
     assert "work" not in state.pool._region_refused
     assert all(entry["account"] != "work" for entry in state._sessions.values())
-    # remove_account delegates slot ownership to ProxyPool exactly once.
-    assert released == ["work"]
+    # The pool forgets the account's node binding and region refusals.
+    assert state.store.aliases() == []
 
     # An alias reused by a new account starts on its own identity rather than
     # inheriting the deleted account's, which would relate the two upstream.

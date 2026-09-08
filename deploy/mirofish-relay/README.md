@@ -1,20 +1,18 @@
 # Mirofish Relay — Docker + WebUI
 
 容器化运行 `mirofish/` Python 包：多账号管理、邮箱验证码登录、凭证加密持久化、
-按账号固定 Mihomo 节点（多槽位并发出口）、Anthropic-compatible `/v1/messages` 真流式中转、
+按账号固定代理出口、Anthropic-compatible `/v1/messages` 真流式中转、
 OpenAI-compatible `/v1/chat/completions` 翻译（含 tool calls / 图片 / 流式）、Codex Responses
 透明代理，以及内置 Vue 管理 WebUI。
 
-relay 与 Mihomo 代理引擎打包在**同一个容器**里，由入口脚本先生成 Mihomo 配置并启动引擎，
-再启动 relay（未配置订阅时跳过 Mihomo，纯直连）；任一进程退出即整体重启。不再有独立的
-sidecar 与 init 容器。
+容器里只有 relay 一个进程：入口脚本直接 exec 它。代理节点由运营者在面板里录入，relay
+自己拨号，因此没有代理引擎、没有生成的配置、也没有订阅缓存要看活。
 
 ## 快速开始
 
     cd deploy/mirofish-relay
     cp .env.example .env
     # 编辑 .env，设置 MIROFISH_MASTER_KEY（至少 16 字符，可用 openssl rand -base64 32 生成）
-    # 设置 MIROFISH_PROXY_SUBSCRIPTION_URL；不要把带 token 的链接提交到仓库
     docker compose up -d --build
 
 打开管理页面：
@@ -26,7 +24,7 @@ sidecar 与 init 容器。
 
     docker compose exec mirofish cat /data/proxy.key
 
-在 WebUI 中输入密钥后即可：配置代理订阅、添加账号（发送邮箱验证码 → 输入验证码 → 完成登录）、
+在 WebUI 中输入密钥后即可：维护代理池、添加账号（发送邮箱验证码 → 输入验证码 → 完成登录）、
 查看每个账号绑定的节点、套餐资料（套餐层级徽章、到期日与剩余天数、持有人姓名；悬停徽章可见
 用户 ID、租户、邀请升级进度与各窗口预算，数据来自上游 `/auth/me` 与 `/auth/referral`，
 登录与「刷新」时读取，后台扫描每天自动补新）、配额利用率、**用量额度卡片**（来自上游 `/v1/limits` 的
@@ -91,57 +89,54 @@ pathname 签名，保留查询串但签名只包含 pathname。
 
 ## 代理池
 
-容器内置的 Mihomo 引擎负责订阅的下载、解析和建立连接，因此 SS、VMess、VLESS、Trojan、
-Hysteria、TUIC 等 Mihomo 支持的节点都可以使用。配置与 provider 缓存保存在数据卷的
-`/data/mihomo/` 下，relay 通过容器内回环地址 `127.0.0.1:9090`（控制器）/ `127.0.0.1:7890`（代理）
-与引擎通信。
+节点由你在面板里手动维护，relay 直接拨号，不拉订阅、也不自己探测。原先内置了一个 Mihomo
+引擎（订阅下载 + 多槽位监听 + 控制器 API），代价是：节点列表会在脚下被 provider 改名、
+多一个进程要看活、还要说一套控制协议。既然每个账号本来就只固定一个出口，自己拨
+HTTP(S)/SOCKS5 就够了。代价是只支持这两种协议——SS/VMess/VLESS/Trojan 这些需要专门引擎的
+不再支持。
 
-订阅地址由 `.env` 的 `MIROFISH_PROXY_SUBSCRIPTION_URL` 配置；它优先于 WebUI 曾保存的地址。
-服务会定期读取 Mihomo 的节点列表，并把每个账号选中的节点 ID 写入 SQLite，因此同一账号会持续
-使用同一个出口节点。以下情况会触发重新选择；只有传输层节点故障才累计全局失败次数（达到
-`MIROFISH_PROXY_FAILURE_THRESHOLD` 后停用）：
+**添加节点**：代理池卡片的「添加代理」按钮，两种录入方式：
+
+- **单条录入**：名称（可留空，留空则用 `主机:端口`）、协议（SOCKS5 / HTTP / HTTPS）、
+  主机与端口、用户名与密码。
+- **批量导入**：每行一条，支持 `socks5://user:pass@host:port`、`http://…`、`https://…`，
+  以及不带协议的 `host:port`（按 SOCKS5 处理）。`#` 开头的行忽略；解析不了的行会单独列出，
+  不影响其余——一份粘贴过来的列表里夹着一两行杂物是常事，不该因此丢掉其余几十行。
+
+**节点身份是它的端点**（协议/主机/端口/凭据），不是名称。所以改名不会改变节点 ID，绑定它的
+账号不会被悄悄解绑；而重复录入同一个端点是在改名，不会产生两个一样的出口。改主机或端口意味
+着指向了另一台服务器，绑定在上面的账号会被释放重新分配。
+
+**测试**：拨 `http://www.gstatic.com/generate_204`。用纯 HTTP 且响应体为空——不做 TLS 握手，
+避免把证书问题误判成代理故障，也没有流量可下载。返回 204 才算通过，并清除该节点的失败计数
+（这也是把修好的节点放回轮换的方式）；其他状态码说明有东西在中间拦截，按失败记录。
+
+**账号与节点的绑定**：每个账号固定绑定一个节点，节点 ID 写入 SQLite，凭据存在加密配置库里。
+以下情况会重新选择；只有传输层故障才累计全局失败次数（达到 `MIROFISH_PROXY_FAILURE_THRESHOLD`
+后停用）：
 
 - **节点网络失败**：连接超时、拒绝等传输层错误。
-- **上游不服务该账号的当前出口区域**：上游返回 429 `shared_quota_unavailable`（「云端中转未在
-  当前网络区域提供服务」）。可用性取决于账号套餐与出口的组合；服务按账号暂记该节点并尝试其他
-  出口，不会把节点全局停用。该账号被所有可用出口拒绝后会进入冷却，并自动换用其他账号。
+- **上游不服务该账号的当前出口区域**：上游返回 429 `shared_quota_unavailable`。可用性取决于
+  账号套餐与出口的组合，所以只按账号记住这个节点并尝试其他出口，不会把节点全局停用。该账号
+  被所有可用出口拒绝后会进入冷却，并自动换用其他账号。
 - **共享额度耗尽不是节点故障**：429 `credit_exhausted_shared` 表示该账号当前不能使用上游共享
-  额度。服务不会徒劳地轮换或停用代理节点；自动路由会冷却该账号并换用其他账号，显式指定账号
-  时则原样返回错误。需要等待额度恢复或按上游提示接入可用的自有账号。
-- **节点在订阅更新后消失**：Mihomo 的 provider 自动更新会重命名全部节点，此时切换选择器会被
-  控制器以 400 拒绝。服务会立即重新同步节点列表并重新绑定，不必等到下一次定时刷新。
+  额度。不会徒劳地轮换或停用节点；自动路由会冷却该账号并换用其他账号，显式指定账号时原样
+  返回错误。
 
-### 多槽位并发出口
-
-入口脚本为 Mihomo 生成 `MIROFISH_MIHOMO_SLOTS`（默认 8）个独立的槽位监听端口
-（从 `MIROFISH_MIHOMO_SLOT_BASE_PORT`，默认 7891 起），每个槽位有自己的选择器组。
-relay 把每个账号固定到一个槽位，不同账号的上游请求经由各自槽位并发出站，
-互不阻塞（旧版为全局选择器 + 全局锁，所有请求串行）。账号数超过槽位数时，
-共享同一槽位的账号会在切换节点时短暂串行，以保证账号与出口 IP 的对应关系。
-同一槽位切换节点时，relay 会按「槽位 + 节点」隔离 HTTP 连接池与 device ticket，避免复用
-旧节点建立的 HTTPS 隧道，造成看似轮换、实际仍从原出口重试。
-若引擎仍在运行不含槽位组的旧配置，relay 会自动退回单选择器兼容模式，
-重新 `docker compose up -d --build` 后即启用槽位。
-
-订阅请求默认使用 `mihomo/1.19.0` 的 User-Agent；如果你的订阅服务要求特定客户端标识，
-可在 `.env` 设置 `MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT` 后重建容器。
-
-如果服务器无法访问订阅站，可改用静态文件：在能够下载订阅的机器保存原始订阅内容，上传到
-`deploy/mirofish-relay/mihomo-input/subscription.yaml`，然后在 `.env` 清空
-`MIROFISH_PROXY_SUBSCRIPTION_URL` 并设置 `MIROFISH_PROXY_SUBSCRIPTION_FILE=/input/subscription.yaml`。
-入口脚本会把它复制到 Mihomo 允许读取的 `/data/mihomo/` 下。该文件含节点凭据，应设置为仅自己
-可读且不要提交到版本库；静态文件模式需要手动更新该文件后重启容器。
+**在账号侧绑定**：账号表的「修改」里可以选代理（可搜索，有名称显示名称、没有则显示完整连接
+地址）。添加账号时也能先选好出口，默认无代理——上游是否服务某个区域取决于账号本身，所以
+登录和后续请求应当来自同一出口。
 
 相关接口：
 
-    GET  /proxies                    # 立即返回缓存状态，不拉取网络
-    POST /api/proxies/subscription   # {"url":"https://..."}，保存并刷新（仅直连模式）
-    POST /api/proxies/refresh        # 请求 Mihomo 主动更新订阅并读取节点，失败会返回 502/503
+    GET    /proxies                   # 池状态与节点列表（含凭据，仅认证后可读）
+    POST   /api/proxies                # 单条添加
+    POST   /api/proxies/import         # {"text":"每行一条"}，逐行解析并报告失败行
+    PATCH  /api/proxies/{id}           # 修改
+    DELETE /api/proxies/{id}           # 删除，并释放绑定它的账号
+    POST   /api/proxies/{id}/test      # 测试，成功则恢复该节点
+    POST   /api/accounts/{alias}/proxy # {"proxy_id":"…"}，空字符串表示取消绑定
 
-如果该接口返回 `503 Mihomo controller request timed out`，说明 relay 到容器内 Mihomo
-引擎的控制端口 `127.0.0.1:9090` 无响应；执行 `docker compose logs mirofish` 检查订阅下载和
-配置错误（Mihomo 与 relay 的日志都汇入同一容器 stdout）。`MIROFISH_MIHOMO_CONTROLLER_TIMEOUT`
-默认 5 秒，可在 `.env` 中按需调整。
 
 ## API
 
@@ -262,17 +257,6 @@ relay 自己也会返回 503（`device_session_required`、代理池没有可用
 
 `/v1/models` 不受影响：它是零成本的目录读取，即使所有账号都被停调也照常返回——恰恰在账号
 大面积异常时最需要它（要在测试台挑模型去重试）。
-
-**按名称排除节点**：设置 `MIROFISH_PROXY_NODE_EXCLUDE`（正则，如 `香港|HK|🇭🇰`）后，
-命中的节点在 Mihomo provider（`exclude-filter`）和中转节点列表两层都被排除，完全不
-参与分配。正则同时交给 Python 和 Mihomo（Go RE2）使用，请保持简单的字面量/或写法。
-修改后需重建容器。
-
-**订阅 DNS 直通**：生成 Mihomo 配置时会抓取订阅并把其中的顶层 `dns:` 段原样并入——
-部分机场的节点入口域名只有订阅指定的私有 DNS（`nameserver-policy`）能解析出真实地址，
-公共 DNS 返回占位 IP（如 `127.127.127.x`），没有这段配置节点会全部拨号失败。订阅没有
-`dns:` 段或启动时抓取失败则不写入，行为与旧版一致。更换订阅后需要重建容器让新的 DNS
-生效。
 
 **区域拒绝按账号记忆**：`shared_quota_unavailable`（区域不服务）取决于账号的上游套餐——
 plus 账号能用的节点，共享额度账号可能整池被拒。因此区域拒绝只记在「账号 × 节点」维度

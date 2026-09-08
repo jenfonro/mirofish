@@ -107,23 +107,34 @@ export interface LimitsSummary {
   accounts: AccountLimitsResult[];
 }
 
+/** 一个手动维护的代理节点。凭据只在已认证的管理接口里流转。 */
+export interface ProxyNode {
+  id: string;
+  name: string;
+  scheme: string;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  active: boolean;
+  assigned: number;
+  failure_count: number;
+  last_error: string | null;
+  last_checked: string | null;
+}
+
 export interface ProxySummary {
   configured: boolean;
-  backend: "mihomo" | "direct";
   active: number;
   total: number;
   assigned: number;
-  last_refresh: string | null;
-  last_error: string | null;
-  skipped_nodes: number;
-  nodes: ProxyInfo[] & { assigned?: number }[];
+  nodes: ProxyNode[];
 }
 
 export interface Health {
   ok: boolean;
   accounts: number;
   version: string;
-  proxy_backend: string;
   default_account: string | null;
 }
 

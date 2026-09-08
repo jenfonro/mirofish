@@ -15,7 +15,7 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   - `mirofish/seal.py`: `mrs-seal-v1` envelope (`x-mirasim-enc`) for the relay's own request metadata.
   - `mirofish/wire.py`: makes h11 write request headers in profile order (`Host`/`Connection` last,
     as the official clients do) instead of hoisting `Host` to the first line.
-  - `mirofish/proxy/`: subscription parsing (PyYAML), Mihomo controller client + slot manager, sticky pool.
+  - `mirofish/proxy/`: endpoint parsing for pasted proxy URIs, sticky account-to-node pool.
   - `mirofish/vault/`: credential backends (macOS Keychain; AES-256-GCM file vault with legacy v1 migration).
   - `mirofish/store.py`: SQLite metadata + usage log.
   - `mirofish/translate.py`: OpenAI ⇄ Anthropic translation incl. incremental stream translation.
@@ -24,7 +24,7 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - `tests/`: pytest suite (respx-mocked upstream; no live calls). `tests/mirasim_protocol.py` is the
   shared unseal/verify helper; `tests/fixtures/request_profiles/` holds redacted golden request profiles.
 - `tools/request_profile.py`: mitmproxy addon + validator that turns captures into those golden fixtures.
-- `deploy/mirofish-relay/`: multi-stage Dockerfile (bundles the Mihomo binary), single-service docker-compose, `docker-entrypoint.sh` (starts Mihomo then the relay in one container), `.env.example`, deployment README.
+- `deploy/mirofish-relay/`: multi-stage Dockerfile, single-service docker-compose, `docker-entrypoint.sh` (execs the relay), `.env.example`, deployment README.
 
 ## Architecture
 
@@ -82,19 +82,33 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   deliberately left alone. `tests/test_tls_profile.py` measures the hello on loopback so a
   dependency bump cannot change it silently.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
-- Docker runs a single container: `docker-entrypoint.sh` generates the Mihomo config and starts the bundled Mihomo engine (skipped when no subscription is set), then starts the relay; the relay reaches the engine over loopback (`127.0.0.1:9090`/`7890`). If either process exits the container restarts. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Configs without slots fall back to the legacy single-selector mode automatically. Mihomo config + provider cache live under `/data/mihomo/`.
+- Docker runs a single container: `docker-entrypoint.sh` execs the relay, nothing else. It used to also generate a Mihomo config, start the bundled engine, and tear both down together; proxy nodes are entered by an operator and dialled directly now, so there is no second process, no generated config, and no provider cache.
 - Each account binds persistently to one proxy node, rotating on proxy network failure, on an
   upstream 429 `shared_quota_unavailable` (the exit's region is not served to THIS account —
   whether a region is served depends on the account's upstream tier, so the refusal is
   remembered per (account, node) for `REGION_REFUSAL_TTL` (1800s) and never counts against the
   node's global health), and when a provider auto-update renames nodes so the stored assignment
-  no longer exists (Mihomo answers 400; the pool resyncs immediately instead of waiting for
+  no longer exists (the pool releases accounts pinned to it instead of waiting for
   the refresh interval). Once every exit has region-refused an account, the error is marked
   `region_refused_everywhere` and handled like `credit_exhausted_shared`: account cooldown +
   failover, never further proxy rotation. Do not rotate on account/shared-quota errors such as
-  `credit_exhausted_shared`; those are not exit properties. Mihomo nodes behind the same slot URL
-  must carry distinct route identities into the upstream connection/ticket caches; otherwise an
-  existing HTTPS CONNECT tunnel can keep retries on the old exit after the selector changes.
+  `credit_exhausted_shared`; those are not exit properties. Nodes
+  each have their own URL, which is also their identity in the upstream connection and ticket
+  caches. This used to need a separate route identity because a Mihomo listener multiplexed
+  several nodes behind one URL, so an existing HTTPS CONNECT tunnel could keep retries on the
+  old exit after the selector changed.
+- Proxy nodes are curated by an operator, not fetched: `POST /api/proxies` adds one,
+  `POST /api/proxies/import` takes pasted lines (`socks5://user:pass@host:port`, or a bare
+  `host:port` treated as SOCKS5) and reports per-line failures instead of losing the batch,
+  `PATCH`/`DELETE /api/proxies/{id}` edit and remove, and `POST /api/proxies/{id}/test` dials
+  `http://www.gstatic.com/generate_204` — plain HTTP with an empty body, so no TLS handshake
+  can be mistaken for a proxy failure, and a 204 clears the node's failure count. A node's
+  identity is its endpoint (`proxy_identity`), deliberately not its name: accounts are pinned
+  by id, so a rename must not re-identify the node, while re-entering an endpoint renames it
+  rather than pooling a duplicate. Editing host/port moves the entry to a different server and
+  releases the accounts pinned to it. `POST /api/accounts/{alias}/proxy` pins one account (an
+  empty id releases it), and a login may pin up front so the account is created behind the exit
+  it will keep using — the login is what binds the upstream identity to a region.
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
 - Missing OpenAI-compatible model ids use `MIROFISH_DEFAULT_MODEL` (currently
   `gpt-5.6-luna`). The legacy `claude-haiku-4-5-20251001` id is normalized to
@@ -217,7 +231,7 @@ docker compose logs -f mirofish-relay
 - Keep SQLite limited to metadata, non-secret settings, and usage logs. Credentials belong in Keychain or the encrypted file vault.
 - Status probes use zero-cost `/v1/limits`; treat explicit model scans as billable upstream
   requests and document that behavior.
-- Proxy subscription URLs and node credentials must not enter source control; SQLite stores only proxy metadata and account-to-node IDs. Docker writes Mihomo's runtime config and provider cache under `/data/mihomo/` on the data volume.
+- Proxy node credentials must not enter source control: they live in the encrypted config vault, and SQLite stores only node metadata plus account-to-node IDs.
 - Preserve the explicit-account, default-account, then round-robin selection order.
 - `proxy_identity()` hashing must stay byte-compatible with stored assignments; changing it orphans existing account-to-node bindings.
 - When changing API behavior, update the WebUI (`webui/`) and `deploy/mirofish-relay/README.md` together.

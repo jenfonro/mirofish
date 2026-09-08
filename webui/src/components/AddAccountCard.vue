@@ -1,20 +1,38 @@
 <script setup lang="ts">
-import { ref } from "vue";
+import { onMounted, ref } from "vue";
 import { api } from "../api";
-import { loadAccounts, toast } from "../store";
+import { loadAccounts, loadProxies, store, toast } from "../store";
+import ProxyPicker from "./ProxyPicker.vue";
 
 const alias = ref("");
 const email = ref("");
 const code = ref("");
+// Chosen before the login round trip, so the account is created behind the
+// exit it will keep using: the login itself is what binds the upstream
+// identity to a region.
+const proxyId = ref("");
 const stage = ref<"start" | "verify">("start");
 const busy = ref(false);
+
+onMounted(async () => {
+  if (store.proxies) return;
+  try {
+    await loadProxies();
+  } catch {
+    // The pool is optional; a login without one simply goes out directly.
+  }
+});
 
 async function sendCode() {
   busy.value = true;
   try {
     await api("/api/login/start", {
       method: "POST",
-      body: JSON.stringify({ alias: alias.value.trim(), email: email.value.trim() }),
+      body: JSON.stringify({
+        alias: alias.value.trim(),
+        email: email.value.trim(),
+        proxy_id: proxyId.value,
+      }),
     });
     stage.value = "verify";
     toast("验证码已发送，请查收邮箱", "ok");
@@ -42,6 +60,7 @@ async function verify() {
       toast(`登录成功：${result.alias}（${result.plan || "未知套餐"}）`, "ok");
     }
     alias.value = email.value = code.value = "";
+    proxyId.value = "";
     stage.value = "start";
     await loadAccounts();
   } catch (error: any) {
@@ -61,6 +80,14 @@ async function verify() {
     <label>邮箱</label>
     <input v-model="email" type="email" placeholder="you@example.com"
            :disabled="stage === 'verify'" />
+    <label>代理</label>
+    <ProxyPicker v-if="stage === 'start'" v-model="proxyId"
+                 :nodes="store.proxies?.nodes ?? []" />
+    <p v-else class="muted">登录进行中，代理已固定。</p>
+    <p v-if="stage === 'start'" class="muted">
+      默认无代理。登录会通过所选出口进行，账号随后也固定走它——
+      上游是否服务某个区域取决于账号本身，所以登录和后续请求应当来自同一出口。
+    </p>
     <template v-if="stage === 'verify'">
       <label>6 位验证码</label>
       <input v-model="code" maxlength="6" inputmode="numeric" placeholder="123456"
