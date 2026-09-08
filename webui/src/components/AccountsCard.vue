@@ -124,14 +124,18 @@ async function refreshProfile(alias: string) {
   busy.value = alias;
   try {
     await api(`/accounts/${alias}/status`);
-    await loadAccounts();
-    if (editing.value?.alias === alias) {
-      editing.value = store.accounts.find((item) => item.alias === alias) ?? null;
-    }
     toast(`已刷新 ${alias} 的资料`, "ok");
   } catch (error: any) {
     toast(`刷新 ${alias} 资料失败：${error.message}`, "error");
   } finally {
+    // Reload on failure too, and that is the point: the refusal is what the
+    // relay just recorded against the account (a 403 suspension parks it), so
+    // skipping the reload left the row reading 正常 while the state had in
+    // fact changed — the operator saw the error and a healthy row at once.
+    await loadAccounts();
+    if (editing.value?.alias === alias) {
+      editing.value = store.accounts.find((item) => item.alias === alias) ?? null;
+    }
     busy.value = "";
   }
 }
@@ -140,14 +144,14 @@ async function refreshLimits(alias: string) {
   busy.value = alias;
   try {
     await api(`/accounts/${alias}/limits`);
-    await loadAccounts();
-    if (editing.value?.alias === alias) {
-      editing.value = store.accounts.find((item) => item.alias === alias) ?? null;
-    }
     toast(`已刷新 ${alias} 的额度`, "ok");
   } catch (error: any) {
     toast(`刷新 ${alias} 额度失败：${error.message}`, "error");
   } finally {
+    await loadAccounts();
+    if (editing.value?.alias === alias) {
+      editing.value = store.accounts.find((item) => item.alias === alias) ?? null;
+    }
     busy.value = "";
   }
 }

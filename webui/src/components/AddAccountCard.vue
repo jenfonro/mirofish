@@ -62,10 +62,12 @@ async function verify() {
     alias.value = email.value = code.value = "";
     proxyId.value = "";
     stage.value = "start";
-    await loadAccounts();
   } catch (error: any) {
     toast(`登录失败：${error.message}`, "error");
   } finally {
+    // Also on failure: the credentials are saved before the profile is read,
+    // so a refused profile still leaves a new (parked) account in the list.
+    await loadAccounts();
     busy.value = false;
   }
 }
