@@ -6,6 +6,18 @@ services:
     container_name: mirofish-relay
     # Docker's init (tini) as PID 1 reaps the relay process cleanly.
     init: true
+    # Ship logs to the host journal instead of the container's own json-file.
+    # The default driver writes inside the container directory, so every
+    # `docker compose up -d` that recreates the container destroys the log with
+    # it — and an upstream verdict like "temporarily suspended ... access
+    # resumes at <ISO>" is only ever stated once, in that log. The journal
+    # outlives the container, is already rotated by systemd (the json-file
+    # default is not: container logs here had grown to ~99 MB), and is
+    # greppable per unit via CONTAINER_NAME.
+    logging:
+      driver: journald
+      options:
+        tag: mirofish-relay
     ports:
       # Public exposure requested. Anyone who can reach this port needs the
       # local proxy key; put TLS + extra auth in front for production.
