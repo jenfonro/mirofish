@@ -83,6 +83,11 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   dependency bump cannot change it silently.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
 - Docker runs a single container: `docker-entrypoint.sh` execs the relay, nothing else. It used to also generate a Mihomo config, start the bundled engine, and tear both down together; proxy nodes are entered by an operator and dialled directly now, so there is no second process, no generated config, and no provider cache.
+- Logs go to **journald**, not the default `json-file`: that driver stores them inside the
+  container directory, so recreating the container deletes them, and it does not rotate. An
+  upstream bench is stated exactly once ("temporarily suspended ... access resumes at <ISO>"),
+  so losing it on a rebuild loses the only record of when the account comes back.
+  `docker logs` still works; `journalctl CONTAINER_NAME=mirofish-relay` survives rebuilds.
 - Each account binds to one proxy node and **keeps it**. A node is chosen once, when the
   account has none (fewest assignments first), and nothing moves it afterwards: a request goes
   out through the account's own exit or it fails. There is no rotation on network failure, no

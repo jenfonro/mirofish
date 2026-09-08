@@ -24,6 +24,20 @@ OpenAI-compatible `/v1/chat/completions` 翻译（含 tool calls / 图片 / 流�
 
     docker compose exec mirofish cat /data/proxy.key
 
+## 日志
+
+日志走 **journald**，因此**重建容器不会丢**：
+
+    docker logs mirofish-relay                          # 照常可用
+    journalctl CONTAINER_NAME=mirofish-relay -f         # 跨容器重建仍可查
+    journalctl CONTAINER_NAME=mirofish-relay --since "2 hour ago" \
+      | grep "access resumes at"                        # 找上游给的解封时刻
+
+默认的 `json-file` 驱动把日志写在容器目录里，`docker compose up -d` 一旦重建容器就随之删除，
+而且不做轮转。这曾真的丢过信息：上游封停只说一次「temporarily suspended after repeated
+upstream rate-limit refusals; access resumes at &lt;ISO&gt;」，重建后那些时刻只能从别的服务
+日志里侧面找回。journald 由 systemd 统一轮转，不会把磁盘填满。
+
 在 WebUI 中输入密钥后即可：维护代理池、添加账号（发送邮箱验证码 → 输入验证码 → 完成登录）、
 查看每个账号绑定的节点、套餐资料（套餐层级徽章、到期日与剩余天数、持有人姓名；悬停徽章可见
 用户 ID、租户、邀请升级进度与各窗口预算，数据来自上游 `/auth/me` 与 `/auth/referral`，
