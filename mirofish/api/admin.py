@@ -10,7 +10,7 @@ from fastapi import APIRouter, Depends, Request
 from .. import __version__
 from ..accounts import public_status
 from ..errors import RelayError
-from ..proxy import proxy_from_uri
+from ..proxy import DIRECT, proxy_from_uri
 from ..validate import alias_value, email_value, proxy_node_value
 from .deps import get_state, read_json_body, require_auth
 
@@ -144,7 +144,9 @@ async def set_account_proxy(alias: str, request: Request) -> dict[str, Any]:
     proxy_id = str(payload.get("proxy_id") or "").strip()
     if proxy_id and state.pool.by_id(proxy_id) is None:
         raise RelayError("unknown proxy node: " + proxy_id, 404)
-    state.store.set_account_proxy(alias, proxy_id or None)
+    # An empty id is "no proxy", stored as `DIRECT` rather than NULL: NULL reads
+    # as "never assigned" and the next request would hand the account an exit.
+    state.store.set_account_proxy(alias, proxy_id or DIRECT)
     state.drop_account_sessions(alias)
     return {"alias": alias, "proxy": state.pool.account_public(alias)}
 
@@ -178,8 +180,12 @@ async def login_start(request: Request) -> dict[str, Any]:
     proxy, _ = await state.with_pending_proxy(
         alias, lambda url: state.accounts.start_login(alias, email, proxy_url=url),
         pinned=pinned, direct=direct)
-    state.put_pending_login(alias, email,
-                            proxy.get("id") if isinstance(proxy, dict) else None)
+    # `DIRECT` when the operator explicitly chose no exit: `finish_login` has to
+    # tell that apart from "no choice made", or the save falls back to whatever
+    # binding the alias had before.
+    state.put_pending_login(
+        alias, email,
+        proxy.get("id") if isinstance(proxy, dict) else (DIRECT if direct else None))
     return {"sent": True, "alias": alias}
 
 
@@ -189,12 +195,14 @@ async def login_finish(request: Request) -> dict[str, Any]:
     payload = await read_json_body(request)
     alias = alias_value(str(payload.get("alias", "")))
     pending = state.take_pending_login(alias)
-    proxy = state.pool.by_id(pending.get("proxy_id"))
+    requested = str(pending.get("proxy_id") or "")
+    proxy = state.pool.by_id(requested) if requested != DIRECT else None
     result = await state.with_fixed_proxy(
         alias, proxy,
         lambda url: state.accounts.finish_login(
             alias, pending["email"], str(payload.get("code", "")), proxy_url=url,
-            proxy_id=str(proxy["id"]) if proxy and proxy.get("id") else None))
+            proxy_id=(str(proxy["id"]) if proxy and proxy.get("id")
+                      else (DIRECT if requested == DIRECT else None))))
     state.reset_account_runtime(alias)
     state.pending_logins.pop(alias, None)
     return result

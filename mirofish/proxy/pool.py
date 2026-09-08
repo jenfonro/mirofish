@@ -33,6 +33,11 @@ from .parse import proxy_identity, proxy_url
 # to confuse a proxy failure with a certificate one, and nothing to download.
 TEST_URL = "http://www.gstatic.com/generate_204"
 TEST_TIMEOUT = 10.0
+# Stored in `accounts.proxy_id` when an operator picked "no proxy". A NULL there
+# means "never assigned", which is what makes the account eligible for a node;
+# without a distinct marker the two are indistinguishable and a deliberate
+# direct account gets silently handed an exit on its next request.
+DIRECT = "direct"
 
 
 class ProxyPool:
@@ -174,6 +179,10 @@ class ProxyPool:
             return None
         row = self.store.row(alias)
         current_id = str(row["proxy_id"] or "")
+        if current_id == DIRECT:
+            # An operator chose no proxy. Assigning one here would override
+            # that choice behind their back.
+            return None
         if current_id:
             # The binding is honoured even when the node is failing or
             # deactivated. Handing back a different exit here is the silent
@@ -207,7 +216,8 @@ class ProxyPool:
     def account_public(self, alias: str) -> Optional[dict[str, Any]]:
         row = self.store.row(alias)
         proxy_id = str(row["proxy_id"] or "")
-        if not proxy_id:
+        # `DIRECT` is a deliberate "no exit", not a node to look up.
+        if not proxy_id or proxy_id == DIRECT:
             return None
         proxy_row = next((item for item in self.store.proxy_rows()
                           if str(item["proxy_id"]) == proxy_id), None)

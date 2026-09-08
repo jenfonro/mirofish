@@ -341,13 +341,6 @@ class Store:
     def save_proxy_configs(self, configs: dict[str, dict[str, Any]]) -> None:
         self.vault.put(PROXY_POOL_ALIAS, "configs", json.dumps(configs, ensure_ascii=False))
 
-    def account_proxy_ids(self) -> set[str]:
-        """Proxy ids some account is currently pinned to."""
-        with self.db_lock:
-            rows = self.db.execute(
-                "SELECT DISTINCT proxy_id FROM accounts WHERE proxy_id IS NOT NULL").fetchall()
-        return {str(row[0]) for row in rows}
-
     def prune_proxies(self, keep: set[str]) -> int:
         """Delete proxy rows outside `keep`. Provider auto-updates rename every
         node and subscription switches replace the set wholesale, so rows that
@@ -414,7 +407,10 @@ class Store:
     def proxy_assignment_counts(self) -> dict[str, int]:
         with self.db_lock:
             rows = self.db.execute(
-                "SELECT proxy_id,COUNT(*) AS count FROM accounts WHERE proxy_id IS NOT NULL GROUP BY proxy_id")
+                # 'direct' is proxy.pool.DIRECT: an account deliberately left
+                # unproxied. Spelled out because store must not import proxy.
+                "SELECT proxy_id,COUNT(*) AS count FROM accounts "
+                "WHERE proxy_id IS NOT NULL AND proxy_id<>'direct' GROUP BY proxy_id")
             return {str(row[0]): int(row[1]) for row in rows}
 
     # --- usage log ----------------------------------------------------------

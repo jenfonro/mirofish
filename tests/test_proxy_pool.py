@@ -197,6 +197,29 @@ def test_an_empty_pool_routes_directly(state):
     assert state.pool.configured is False
 
 
+async def test_choosing_no_proxy_is_not_an_unassigned_account(client, state, auth_headers):
+    """"No proxy" must survive the next request.
+
+    Both states used to be a NULL `proxy_id`, so an account an operator had
+    deliberately set to direct was indistinguishable from one that had never
+    been assigned — and the next request handed it an exit, changing its
+    upstream IP behind the operator's back.
+    """
+    seed(state)
+    add_account(state, "acct")
+    assert state.pool.for_account("acct") is not None      # auto-assigned once
+
+    response = await client.post("/api/accounts/acct/proxy", headers=auth_headers,
+                                 json={"proxy_id": ""})
+    assert response.status_code == 200
+    assert response.json()["proxy"] is None
+
+    assert state.pool.for_account("acct") is None          # stays direct
+    assert state.pool.account_public("acct") is None
+    # The marker is not a node, so it must not count towards node load.
+    assert sum(state.store.proxy_assignment_counts().values()) == 0
+
+
 async def test_the_admin_api_adds_edits_and_deletes(client, state, auth_headers):
     added = await client.post("/api/proxies", headers=auth_headers, json={
         "scheme": "socks5", "host": "a.example.com", "port": 1080})

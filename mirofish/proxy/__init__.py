@@ -1,4 +1,4 @@
 from .parse import proxy_from_uri, proxy_identity, proxy_url
-from .pool import ProxyPool
+from .pool import DIRECT, ProxyPool
 
-__all__ = ["ProxyPool", "proxy_from_uri", "proxy_identity", "proxy_url"]
+__all__ = ["DIRECT", "ProxyPool", "proxy_from_uri", "proxy_identity", "proxy_url"]

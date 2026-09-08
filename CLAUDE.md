@@ -113,7 +113,9 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   by id, so a rename must not re-identify the node, while re-entering an endpoint renames it
   rather than pooling a duplicate. Editing host/port moves the entry to a different server and
   releases the accounts pinned to it. `POST /api/accounts/{alias}/proxy` pins one account (an
-  empty id releases it), and a login may pin up front so the account is created behind the exit
+  empty id means "no proxy", stored as the `DIRECT` sentinel rather than NULL — NULL reads as
+  "never assigned", so a deliberately direct account used to be handed an exit on its next
+  request), and a login may pin up front so the account is created behind the exit
   it will keep using — the login is what binds the upstream identity to a region.
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
 - Missing OpenAI-compatible model ids use `MIROFISH_DEFAULT_MODEL` (currently

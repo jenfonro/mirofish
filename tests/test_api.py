@@ -915,6 +915,38 @@ def _seed_account_runtime(state, alias: str) -> None:
 
 
 @respx.mock
+async def test_logging_in_with_no_proxy_stays_unproxied(client, state, auth_headers):
+    """Choosing no exit at login has to outlive the login.
+
+    The save keeps an existing binding when the caller passes no proxy
+    (COALESCE), which is right for a re-login — but it also meant an explicit
+    "no proxy" was discarded, and the account's first request then picked an
+    exit for it.
+    """
+    from mirofish.proxy.parse import proxy_identity
+
+    config = {"name": "node-a", "scheme": "http", "host": "a.example",
+              "port": 8080, "username": "", "password": ""}
+    node_id = proxy_identity(config)
+    state.pool.configs[node_id] = {**config, "id": node_id}
+    state.store.upsert_proxy(node_id, config)
+    _mock_login("x@example.com")
+    mock_device_session()
+    respx.get(RELAY_BASE + "/v1/limits").mock(
+        return_value=httpx.Response(200, json=LIMITS_RESPONSE))
+
+    await client.post("/api/login/start", headers=auth_headers,
+                      json={"alias": "solo", "email": "x@example.com",
+                            "proxy_id": ""})
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "solo", "code": "123456"})
+
+    assert response.status_code == 200
+    assert state.pool.for_account("solo") is None
+    assert state.pool.account_public("solo") is None
+
+
+@respx.mock
 async def test_login_reads_the_usage_windows_after_the_profile(
         client, state, auth_headers):
     """A login has to leave the account schedulable.
