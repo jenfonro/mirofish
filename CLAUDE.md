@@ -123,11 +123,16 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   whichever account carried the request, so parking on them walks the whole pool out of
   rotation over a shared fault (in production one bad minute benched 81 of 82 accounts for a
   day). They park nothing and start no cooldown; the caller simply retries.
-  403 is likewise narrowed to the suspension envelope (`account_suspended_403`), so the
-  relay's own 403 for a panel-disabled account is not read as an upstream verdict. A
-  suspension states when access returns (`access resumes at <ISO>`) and that deadline is used
-  verbatim — retrying before it is guaranteed to fail — falling back to `HEALTH_RETRY_AFTER`
-  (3600s) only when the stamp cannot be parsed. Leaving these in rotation is what produced
+  403 is likewise narrowed to the suspension envelope (`account_suspension_403`), so the
+  relay's own 403 for a panel-disabled account is not read as an upstream verdict. It returns
+  `(permanent, retry_at)` because the upstream suspends in two incompatible ways: a rate-limit
+  bench states when access returns (`access resumes at <ISO>`) and that deadline is used
+  verbatim — retrying before it is guaranteed to fail — while an outright `this account is
+  suspended; contact support` has no deadline because only support lifts it. The latter is
+  stored as `HEALTH_SUSPENDED` rather than `HEALTH_ERROR` (the panel renders 封停, not 异常)
+  with `retry_at: null`, so no timer puts it back; giving it a fallback window had 46 banned
+  accounts probing the upstream hourly. A successful pinned request still clears it, since an
+  answering upstream means support has acted. Leaving suspensions in rotation is what produced
   1832 refusals across 10 accounts that the panel still called healthy.
   The two parking refusals differ in whether they heal by themselves, so `HEALTH_RETRY_AFTER`
   maps status to a deadline: a 401 gets none (`retry_at: null`) because rejected credentials

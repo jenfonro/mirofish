@@ -111,20 +111,32 @@ function retryLabel(seconds: number): string {
   return cooldownLabel(seconds);
 }
 
-// 状态列：上游 401、403 封停、503 overloaded_error 会把账号标记为异常并停止调度。
+// 状态列：上游 401、403 限流封停、503 overloaded_error 会标记为「异常」并停止调度；
+// 上游直接封号（403 contact support）是「封停」，只能由客服解除，不会自动重试。
 // 其他 503（边缘错误页、relay 自身的 503）是共享故障，不会标记任何账号。
-function healthState(account: Account): "disabled" | "error" | "ok" {
+function healthState(account: Account): "disabled" | "suspended" | "error" | "ok" {
   if (account.disabled) return "disabled";
+  if (account.health?.state === "suspended") return "suspended";
   return account.healthy === false ? "error" : "ok";
 }
 
 function healthLabel(account: Account): string {
   const state = healthState(account);
-  return state === "disabled" ? "已停用" : state === "error" ? "异常" : "正常";
+  if (state === "disabled") return "已停用";
+  if (state === "suspended") return "封停";
+  return state === "error" ? "异常" : "正常";
 }
 
 function healthTitle(account: Account): string {
   if (account.disabled) return "已停用：不参与自动分配，点击开关可启用";
+  if (healthState(account) === "suspended") {
+    const at = account.health?.at
+      ? `（${account.health.at.slice(0, 19).replace("T", " ")} UTC）`
+      : "";
+    // 没有重试期限：只有客服能解除，任何定时重试都只是白撞上游。
+    return `上游已封停该账号${at}：${account.health?.message || "account suspended"}`
+      + "；已永久移出调度，需联系官方客服解除。解除后在测试台指定该账号成功发送一次请求即可恢复";
+  }
   if (account.healthy === false) {
     const code = account.health?.status ? `上游 ${account.health.status}：` : "";
     const reason = account.health?.message || "上游拒绝了这个账号";
@@ -190,7 +202,8 @@ async function removeAccount(alias: string) {
             </td>
             <td>
               <span class="badge" :title="healthTitle(account)">
-                <span class="dot" :class="healthState(account) === 'ok' ? 'ok' : 'bad'"></span>
+                <span class="dot" :class="healthState(account) === 'ok' ? 'ok'
+                  : healthState(account) === 'suspended' ? 'off' : 'bad'"></span>
                 {{ healthLabel(account) }}
               </span>
             </td>

@@ -19,10 +19,11 @@ from ..accounts import AccountService
 from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool
-from ..store import HEALTH_ERROR, Store
+from ..store import (HEALTH_ERROR, HEALTH_PARKED_STATES, HEALTH_SUSPENDED,
+                     Store)
 from ..upstream import (CREDIT_EXHAUSTED_CODE_PREFIX, RESPONSES_PATH,
                         Upstream, account_overloaded_503, account_scoped_429,
-                        account_suspended_403, credit_exhausted_429,
+                        account_suspension_403, credit_exhausted_429,
                         quota_headers)
 from ..validate import alias_value
 from ..vault import make_credential_store
@@ -70,12 +71,11 @@ TRANSIENT_429_COOLDOWN = 60.0
 #
 # Every other 503 is deliberately absent: see ``_is_health_refusal``.
 #
-# 403 `permission_error`: the upstream suspended the account after repeated
-# rate-limit refusals and states when access returns. That deadline is used
-# verbatim; this entry only covers a suspension whose deadline could not be
-# parsed, where an hour is short enough to cost little and long enough to stop
-# the account from absorbing more refusals.
-HEALTH_RETRY_AFTER = {503: 86400.0, 403: 3600.0}
+# 403 is deliberately absent: a rate-limit bench states when access returns and
+# that deadline is used verbatim, while an outright suspension ("contact
+# support") is recorded as HEALTH_SUSPENDED with no deadline at all. Giving it
+# a fallback window is what had 46 banned accounts probing hourly.
+HEALTH_RETRY_AFTER = {503: 86400.0}
 
 # Account scheduling. "balanced" spreads new conversations over the accounts
 # carrying the fewest live sessions. "reset_first" instead prefers the account
@@ -477,8 +477,12 @@ class AppState:
         immediately — that is the panel's playground path.
         """
         health = self.account_health(alias)
-        if health.get("state") != HEALTH_ERROR:
+        state = health.get("state")
+        if state not in HEALTH_PARKED_STATES:
             return False
+        if state == HEALTH_SUSPENDED:
+            # Only support lifts this; no timer may put it back in rotation.
+            return True
         retry_at = health.get("retry_at")
         if retry_at is None:
             # A record written before retry deadlines existed. Treat it by the
@@ -513,7 +517,8 @@ class AppState:
     def health_retry_in(self, alias: str) -> Optional[float]:
         """Seconds until a parked account is retried, or None when never."""
         health = self.account_health(alias)
-        if health.get("state") != HEALTH_ERROR:
+        state = health.get("state")
+        if state not in HEALTH_PARKED_STATES or state == HEALTH_SUSPENDED:
             return None
         retry_at = health.get("retry_at")
         if retry_at is None:
@@ -1145,8 +1150,8 @@ class AppState:
         on the way to the upstream.
 
         401 always is: the credentials or the signed session were rejected.
-        403 is when the upstream suspended the account for repeated rate-limit
-        refusals; every request until its stated deadline is refused.
+        403 is when the upstream suspended the account, either temporarily for
+        repeated rate-limit refusals or outright pending support.
         503 only is when the upstream says ``overloaded_error``. The relay also
         raises 503 for its own reasons (no device ticket, no usable proxy exit)
         and the edge in front of the upstream serves 503 HTML error pages or
@@ -1158,7 +1163,7 @@ class AppState:
         """
         if exc.status == 401:
             return True
-        if account_suspended_403(exc.status, exc.data) is not None:
+        if account_suspension_403(exc.status, exc.data) is not None:
             return True
         return account_overloaded_503(exc.status, exc.data)
 
@@ -1174,34 +1179,51 @@ class AppState:
         if not self._is_health_refusal(exc):
             return False
         message = self._refusal_message(exc)
-        # A suspension states its own deadline, which beats any window we could
-        # pick: retrying before it is guaranteed to fail, and retrying long
-        # after it wastes an account that is already back.
-        suspended_until = account_suspended_403(exc.status, exc.data)
-        if suspended_until:
-            retry_at = suspended_until
-            retry_after = max(0.0, suspended_until - time.time())
+        suspension = account_suspension_403(exc.status, exc.data)
+        state = HEALTH_ERROR
+        if suspension is not None:
+            permanent, resumes_at = suspension
+            if permanent:
+                # "contact support": nothing we do lifts it, so record it as a
+                # suspension with no deadline. Retrying on a guessed window is
+                # what had 46 banned accounts probing the upstream every hour.
+                state, retry_at = HEALTH_SUSPENDED, None
+            else:
+                # A stated deadline beats any window we could pick: retrying
+                # before it is guaranteed to fail, and retrying long after it
+                # wastes an account that is already back.
+                retry_at = resumes_at
         else:
-            retry_after = HEALTH_RETRY_AFTER.get(exc.status)
-            retry_at = time.time() + retry_after if retry_after else None
+            window = HEALTH_RETRY_AFTER.get(exc.status)
+            retry_at = time.time() + window if window else None
         self.drop_account_sessions(alias)
         try:
             self.store.mark_account_error(alias, exc.status, message,
                                           "upstream_%d" % exc.status,
-                                          retry_after=retry_at)
+                                          retry_after=retry_at, state=state)
         except RelayError:
             # The account was deleted mid-request; nothing left to park.
             return True
-        window = ("until it is logged in again" if retry_at is None
-                  else "for %dh" % round(retry_after / 3600.0))
+        if state == HEALTH_SUSPENDED:
+            logger.warning(
+                "account suspended by the upstream and taken out of rotation; "
+                "only support can lift it: account=%s %s", alias, message)
+            return True
+        held = ("until it is logged in again" if retry_at is None
+                else "for %dh" % round(max(0.0, retry_at - time.time()) / 3600.0))
         logger.warning(
             "account parked %s after upstream %s; a successful request from "
             "the playground clears it: account=%s %s",
-            window, exc.status, alias, message)
+            held, exc.status, alias, message)
         return True
 
     def note_account_healthy(self, alias: str) -> None:
-        """Clear a recorded error once the account serves a request again."""
+        """Clear a recorded refusal once the account serves a request again.
+
+        This covers a suspension too: if the upstream is answering, support has
+        evidently lifted it, and a success is stronger evidence than the record.
+        Nothing probes on its own, so this only ever follows a real request.
+        """
         if not self.account_health(alias):
             return
         try:

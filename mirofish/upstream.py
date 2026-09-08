@@ -613,18 +613,23 @@ def credit_exhausted_429(status: int, body: Any) -> bool:
     return str(error.get("type")) == CREDIT_EXHAUSTED_TYPE
 
 
-def account_suspended_403(status: int, body: Any) -> Optional[float]:
-    """Epoch when an upstream-suspended account may serve traffic again.
+def account_suspension_403(status: int, body: Any) -> Optional[tuple[bool, Optional[float]]]:
+    """Classify a 403 the upstream aimed at the account.
 
-    The upstream benches an account after repeated rate-limit refusals and
-    answers 403 ``permission_error`` until a stated deadline. Every request in
-    the meantime is refused, so the account has to leave automatic selection —
-    otherwise scheduling keeps electing it and the caller sees 403s from an
-    account the panel still calls healthy.
+    The upstream suspends an account in two very different ways, and the only
+    thing telling them apart is the message:
 
-    Returns the parsed deadline, ``0.0`` when the refusal is a suspension whose
-    deadline could not be read (park it, but let the shorter default window
-    decide when to retry), or ``None`` when this is some other 403.
+    - *rate-limit bench*: "temporarily suspended after repeated upstream
+      rate-limit refusals; access resumes at <ISO>". It lifts itself at the
+      stated moment.
+    - *account suspension*: "this account is suspended; contact support". No
+      deadline, because nothing but support lifts it. Retrying is pointless and
+      pointlessly conspicuous.
+
+    Returns ``(permanent, retry_at)`` — ``retry_at`` is the stated deadline, or
+    ``None`` when there is nothing to wait for — and ``None`` when the 403 is
+    not an account suspension at all (the relay's own 403 for a panel-disabled
+    account, for instance).
     """
     if status != 403 or not isinstance(body, dict):
         return None
@@ -637,15 +642,17 @@ def account_suspended_403(status: int, body: Any) -> Optional[float]:
         return None
     match = _SUSPENDED_UNTIL.search(message)
     if not match:
-        return 0.0
+        # A suspension with no deadline: permanent until support acts. Guessing
+        # a window here is what made 46 banned accounts retry hourly.
+        return True, None
     stamp = match.group(1).rstrip(".")
     try:
         parsed = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
-        return 0.0
+        return True, None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=datetime.timezone.utc)
-    return parsed.timestamp()
+    return False, parsed.timestamp()
 
 
 def _region_block_error(status: int, body: Any,

@@ -156,22 +156,61 @@ def test_a_suspension_403_parks_the_account_until_its_stated_deadline(state):
     assert state.route_account("work", "", {}) == "work"
 
 
-def test_a_suspension_without_a_readable_deadline_still_parks(state):
-    """A suspension whose deadline cannot be read must not stay in rotation.
+BANNED_403 = {"type": "error", "error": {
+    "type": "permission_error",
+    "message": "this account is suspended; contact support"}}
 
-    Falling back to the status window keeps it out long enough to stop
-    absorbing refusals, without benching it for a day over an unparseable
-    message.
+
+def test_an_outright_suspension_is_its_own_state_and_never_retried(state):
+    """"contact support" is not an error that might clear — it is a verdict.
+
+    Recording it as an ordinary refusal gave it the one-hour fallback window,
+    so 46 banned accounts probed the upstream every hour for a 403 that only
+    support can lift. It gets its own state so the panel can say "封停" rather
+    than "异常", and no deadline at all so no timer puts it back.
     """
     add_account(state, "work")
-    body = {"error": {"type": "permission_error",
-                      "message": "this account is temporarily suspended"}}
+    add_account(state, "spare")
 
-    assert state.note_account_unserviceable("work", refusal(403, body))
+    assert state.note_account_unserviceable("work", refusal(403, BANNED_403))
 
+    health = state.account_health("work")
+    assert health["state"] == "suspended"
+    assert health["status"] == 403
+    assert health["retry_at"] is None
+    assert state.health_retry_in("work") is None
+    # Out of rotation for good; the pinned recovery path still reaches it, so a
+    # lifted suspension can be confirmed from the playground.
     assert state.account_unhealthy("work")
-    assert state.health_retry_in("work") == pytest.approx(
-        HEALTH_RETRY_AFTER[403], abs=30)
+    assert state.route_account("", "", _conv("a window")) == "spare"
+    assert state.route_account("work", "", {}) == "work"
+
+
+async def test_a_suspension_survives_a_restart(state, settings):
+    """A banned account must not rejoin the rotation just because the relay
+    was restarted — the record is the only thing keeping it out."""
+    add_account(state, "work")
+    state.note_account_unserviceable("work", refusal(403, BANNED_403))
+
+    revived = AppState(settings)
+    try:
+        assert revived.account_unhealthy("work")
+        assert revived.health_retry_in("work") is None
+    finally:
+        await revived.aclose()
+
+
+def test_a_lifted_suspension_clears_on_a_successful_request(state):
+    """If the upstream is answering, support has evidently acted; a success is
+    stronger evidence than the record. Nothing probes on its own, so this only
+    ever follows a real request."""
+    add_account(state, "work")
+    state.note_account_unserviceable("work", refusal(403, BANNED_403))
+
+    state.note_account_healthy("work")
+
+    assert not state.account_unhealthy("work")
+    assert state.account_health("work") == {}
 
 
 @pytest.mark.parametrize("body", [

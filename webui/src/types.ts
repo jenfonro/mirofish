@@ -62,7 +62,8 @@ export interface ReferralInfo {
 
 /** Recorded upstream refusal that parks an account (401/503). */
 export interface AccountHealth {
-  state?: string;
+  /** "error" = 上游拒绝，可能自愈；"suspended" = 上游封号，只能客服解除。 */
+  state?: "error" | "suspended" | string;
   status?: number;
   kind?: string;
   message?: string;

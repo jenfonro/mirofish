@@ -20,6 +20,12 @@ PROXY_POOL_ALIAS = "proxy_pool"
 # Health states surfaced in the panel's status column.
 HEALTH_OK = "ok"
 HEALTH_ERROR = "error"
+# The upstream suspended the account outright ("contact support"). Kept apart
+# from HEALTH_ERROR because the two call for different actions: an error may
+# clear on its own or on the next successful request, a suspension only when
+# support lifts it.
+HEALTH_SUSPENDED = "suspended"
+HEALTH_PARKED_STATES = (HEALTH_ERROR, HEALTH_SUSPENDED)
 
 
 def utc_now() -> str:
@@ -249,7 +255,8 @@ class Store:
 
     def mark_account_error(self, alias: str, status: int, message: str,
                            kind: str,
-                           retry_after: Optional[float] = None) -> dict[str, Any]:
+                           retry_after: Optional[float] = None,
+                           state: str = HEALTH_ERROR) -> dict[str, Any]:
         """Record an upstream refusal that makes this account unusable.
 
         Stored in metadata rather than a new column so it travels with the
@@ -258,9 +265,12 @@ class Store:
         ``retry_after`` is the epoch after which automatic selection may try
         the account again; ``None`` means never (the refusal does not heal by
         itself, so only an operator can clear it).
+
+        ``state`` distinguishes a suspension the operator has to resolve from
+        an ordinary refusal, so the panel can say which one it is.
         """
         return self.merge_metadata(alias, {"health": {
-            "state": HEALTH_ERROR,
+            "state": state,
             "status": int(status),
             "kind": kind,
             "message": message[:300],
