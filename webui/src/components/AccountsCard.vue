@@ -140,7 +140,14 @@ function healthLabel(account: Account): string {
   const state = healthState(account);
   if (state === "disabled") return "已停用";
   if (state === "suspended") return "封停";
-  return state === "error" ? "异常" : "正常";
+  if (state !== "error") return "正常";
+  // The reason belongs in the status column, not next to the plan: what is
+  // wrong and what to do about it are the same question.
+  if (account.health?.status === 401) return "需重新登录";
+  if (typeof account.health_retry_in === "number") {
+    return `异常 · 停调 ${retryLabel(account.health_retry_in)}`;
+  }
+  return "异常";
 }
 
 function healthTitle(account: Account): string {
@@ -222,6 +229,14 @@ async function removeAccount(alias: string) {
                   : healthState(account) === 'suspended' ? 'off' : 'bad'"></span>
                 {{ healthLabel(account) }}
               </span>
+              <!-- A cooldown is not an abnormal account: the quota is spent
+                   and returns on its own, so it qualifies the row rather than
+                   replacing its state. -->
+              <span v-if="account.shared_quota_cooldown" class="badge"
+                    :title="'上游额度拒绝了这个账号；自动分配会先避开它，'
+                      + cooldownLabel(account.shared_quota_cooldown) + '后自动重试'">
+                冷却 {{ cooldownLabel(account.shared_quota_cooldown) }}
+              </span>
             </td>
             <td class="identity">
               <div class="mono">{{ account.alias }}</div>
@@ -232,22 +247,6 @@ async function removeAccount(alias: string) {
             <td>
               <span class="badge" :class="planClass(account.plan)"
                     :title="profileTitle(account)">{{ account.plan || "未知" }}</span>
-              <span v-if="account.profile_pending" class="badge"
-                    title="验证码登录已完成；套餐和租户资料可稍后刷新">资料待刷新</span>
-              <span v-if="account.disabled" class="badge">已停用</span>
-              <span v-else-if="account.shared_quota_cooldown" class="badge"
-                    :title="'上游共享额度拒绝了这个账号；自动分配会先避开它，'
-                      + cooldownLabel(account.shared_quota_cooldown) + '后自动重试'">
-                额度冷却 {{ cooldownLabel(account.shared_quota_cooldown) }}
-              </span>
-              <span v-else-if="account.healthy === false" class="badge"
-                    :title="healthTitle(account)">
-                {{ account.health?.status === 401
-                   ? "需重新登录"
-                   : typeof account.health_retry_in === "number"
-                     ? `停调 ${retryLabel(account.health_retry_in)}`
-                     : "已停调" }}
-              </span>
             </td>
             <td>
               <template v-if="planExpiry(account)">
