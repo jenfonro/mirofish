@@ -311,11 +311,18 @@ class AccountService:
             s1, _, me = await self.upstream.json(
                 "GET", self.settings.auth_base, "/auth/me",
                 access=access, proxy_url=proxy_url, alias=alias)
-            s2, _, referral = await self.upstream.json(
-                "GET", self.settings.auth_base, "/auth/referral",
-                access=access, proxy_url=proxy_url, alias=alias)
-            s3, tenant = await self._optional_tenant(
-                alias, access, proxy_url, authenticated=False)
+            # /auth/me answering is what says these credentials are usable at
+            # all. A suspended account is refused here, and the two calls below
+            # would only collect the same refusal twice more.
+            if 200 <= s1 < 300:
+                s2, _, referral = await self.upstream.json(
+                    "GET", self.settings.auth_base, "/auth/referral",
+                    access=access, proxy_url=proxy_url, alias=alias)
+                s3, tenant = await self._optional_tenant(
+                    alias, access, proxy_url, authenticated=False)
+            else:
+                s2, referral = s1, None
+                s3, tenant = s1, None
         except RelayError as exc:
             logger.warning(
                 "login credentials saved but profile lookup failed: account=%s status=%s",
@@ -351,7 +358,26 @@ class AccountService:
             "checked_at": utc_now(),
         })
         self.store.update_metadata(alias, metadata)
-        return public_status(self.store.row(alias), metadata)
+        # Read the usage windows too, but only now that the profile came back:
+        # a suspended account is refused at /auth/me, and asking for windows
+        # after that would just add a second refusal for the same reason.
+        #
+        # Scheduling orders accounts by these windows, so without this a fresh
+        # account has none until it happens to serve a request — it used to be
+        # filled in by the 300s poll that no longer exists. Failure is silent:
+        # the credentials are already saved and the verification code is spent,
+        # so a missing window must not turn a completed login into an error.
+        try:
+            await self.fetch_limits(alias, proxy_url=proxy_url)
+        except RelayError as exc:
+            logger.info("limits unavailable right after login: account=%s %s",
+                        alias, exc)
+        except Exception as exc:  # noqa: BLE001 - a saved login must not fail here
+            logger.info("limits lookup failed right after login: account=%s %s",
+                        alias, exc)
+        # Re-read rather than reporting the local `metadata`: that copy predates
+        # the windows just written, so passing it would hide them from the panel.
+        return public_status(self.store.row(alias))
 
     # --- status ------------------------------------------------------------
 
@@ -372,6 +398,8 @@ class AccountService:
                                                         proxy_url=proxy_url)
         if status < 200 or status >= 300:
             raise RelayError("account identity check failed", status, me)
+        # Only past /auth/me: a suspended account is refused there, and the
+        # calls below would repeat the same refusal.
         ref_status, _, referral = await self.upstream.authed_json(
             alias, "GET", base, "/auth/referral", proxy_url=proxy_url)
         access, _ = self.store.credentials(alias)

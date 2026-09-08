@@ -915,6 +915,62 @@ def _seed_account_runtime(state, alias: str) -> None:
 
 
 @respx.mock
+async def test_login_reads_the_usage_windows_after_the_profile(
+        client, state, auth_headers):
+    """A login has to leave the account schedulable.
+
+    Scheduling orders accounts by their cached windows, and nothing polls for
+    them any more, so without this read a fresh account has no windows until
+    it happens to serve a request.
+    """
+    _mock_login("x@example.com")
+    mock_device_session()
+    limits = respx.get(RELAY_BASE + "/v1/limits").mock(
+        return_value=httpx.Response(200, json=LIMITS_RESPONSE))
+
+    await client.post("/api/login/start", headers=auth_headers,
+                      json={"alias": "fresh", "email": "x@example.com"})
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "fresh", "code": "123456"})
+
+    assert response.status_code == 200
+    assert limits.call_count == 1
+    # Reported straight back, so the panel needs no follow-up refresh.
+    assert [w["name"] for w in response.json()["limits"]["windows"]] \
+        == ["5h", "7d", "30d"]
+
+
+@respx.mock
+async def test_login_skips_the_windows_when_the_profile_is_refused(
+        client, state, auth_headers):
+    """A suspended account is refused at /auth/me. Asking for its windows
+    afterwards would only collect a second refusal for the same reason — and
+    the credentials still have to be kept, since the code is already spent."""
+    respx.post(AUTH_BASE + "/auth/code").mock(
+        return_value=httpx.Response(200, json={"sent": True}))
+    respx.post(AUTH_BASE + "/auth/verify").mock(
+        return_value=httpx.Response(200, json={"access_token": "a",
+                                               "refresh_token": "r"}))
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(403, json={"error": {
+            "type": "permission_error",
+            "message": "this account is suspended; contact support"}}))
+    mock_device_session()
+    limits = respx.get(RELAY_BASE + "/v1/limits").mock(
+        return_value=httpx.Response(200, json=LIMITS_RESPONSE))
+
+    await client.post("/api/login/start", headers=auth_headers,
+                      json={"alias": "banned", "email": "x@example.com"})
+    response = await client.post("/api/login/finish", headers=auth_headers,
+                                 json={"alias": "banned", "code": "123456"})
+
+    assert response.status_code == 200  # the spent code must not be wasted
+    assert response.json()["profile_pending"] is True
+    assert limits.call_count == 0
+    assert state.store.credentials("banned") == ("a", "r")
+
+
+@respx.mock
 async def test_relogin_rotates_the_device_and_clears_old_runtime(
         client, state, auth_headers):
     """A login is the one moment a new device identity is expected.

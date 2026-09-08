@@ -408,9 +408,9 @@ async function removeAccount(alias: string) {
   display: flex; align-items: center; justify-content: center; z-index: 50;
 }
 .modal {
-  background: var(--bg-1, #fff); color: inherit; padding: 18px 20px;
+  background: var(--surface); color: var(--ink); padding: 18px 20px;
   border-radius: 10px; width: min(520px, calc(100vw - 32px));
-  max-height: calc(100vh - 64px); overflow-y: auto; border: 1px solid var(--line);
+  max-height: calc(100vh - 64px); overflow-y: auto; border: 1px solid var(--border);
 }
 .modal h3 { margin: 0; font-size: 15px; }
 .modal > .muted { margin: 2px 0 12px; font-size: 12px; }

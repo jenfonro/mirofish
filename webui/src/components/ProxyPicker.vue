@@ -74,7 +74,7 @@ function pick(id: string): void {
 .caret { color: var(--muted); flex: none; }
 .panel {
   position: absolute; z-index: 60; left: 0; right: 0; top: calc(100% + 4px);
-  background: var(--bg-1, #fff); border: 1px solid var(--line);
+  background: var(--surface); color: var(--ink); border: 1px solid var(--border);
   border-radius: 8px; padding: 8px; box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
 }
 .search { margin: 0 0 6px; }
