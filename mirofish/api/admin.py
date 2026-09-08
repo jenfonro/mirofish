@@ -205,6 +205,15 @@ async def login_finish(request: Request) -> dict[str, Any]:
                       else (DIRECT if requested == DIRECT else None))))
     state.reset_account_runtime(alias)
     state.pending_logins.pop(alias, None)
+    # A login that saved credentials but was refused a profile has already been
+    # judged by the upstream; record it so a suspended account is parked right
+    # away instead of waiting for someone to refresh it by hand.
+    refusal = result.pop("profile_refusal", None)
+    if refusal is not None:
+        status, body = refusal
+        state.note_account_error(alias, RelayError("profile lookup refused", status, body))
+        # Report the state the account is actually in now, not the pre-verdict one.
+        result["health"] = public_status(state.store.row(alias)).get("health") or {}
     return result
 
 

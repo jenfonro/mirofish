@@ -329,6 +329,11 @@ class AccountService:
                 alias, exc.status)
             result = public_status(self.store.row(alias), metadata)
             result["profile_pending"] = True
+            # Hand the verdict up: the caller records it against the account.
+            # Swallowing the refusal keeps the spent code from being wasted,
+            # but it also left a suspended account sitting in the pool looking
+            # healthy until someone refreshed it by hand.
+            result["profile_refusal"] = (exc.status, exc.data)
             return result
 
         profile_ok = (
@@ -344,6 +349,11 @@ class AccountService:
                 "account=%s statuses=%s/%s/%s", alias, s1, s2, s3)
             result = public_status(self.store.row(alias), metadata)
             result["profile_pending"] = True
+            refused = next(((status, body) for status, body in
+                            ((s1, me), (s2, referral), (s3, tenant))
+                            if not 200 <= status < 300), None)
+            if refused is not None:
+                result["profile_refusal"] = refused
             return result
 
         metadata.update({

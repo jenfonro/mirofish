@@ -1000,6 +1000,11 @@ async def test_login_skips_the_windows_when_the_profile_is_refused(
     assert response.json()["profile_pending"] is True
     assert limits.call_count == 0
     assert state.store.credentials("banned") == ("a", "r")
+    # The refusal is a verdict on the account, so it must be recorded now: the
+    # login swallows the error to protect the spent code, which used to leave a
+    # suspended account in the pool reading healthy until a manual refresh.
+    assert state.account_unhealthy("banned")
+    assert response.json()["health"]["state"] == "suspended"
 
 
 @respx.mock
