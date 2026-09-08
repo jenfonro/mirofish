@@ -68,17 +68,33 @@ function profileTitle(account: Account): string {
   for (const w of account.limits?.windows ?? []) {
     if (w.budget > 0) parts.push(`${w.label}预算：${compact(w.budget)}`);
   }
-  return parts.join("\n") || "点「资料+额度」获取更多账号资料";
+  return parts.join("\n") || "点「资料」获取更多账号资料";
 }
 
-async function refreshStatus(alias: string, probe = false) {
+// 资料与额度分属两个数据源：资料是 mirasim 账号数据（套餐、到期、持有人），
+// 额度是 relay 的计量窗口。分开刷新，一个失败不影响另一个——额度用满的账号
+// 照样有套餐可看，而资料正常、额度被 403 拒绝本身就是一个可区分的状态。
+async function refreshProfile(alias: string) {
   busy.value = alias;
   try {
-    await api(`/accounts/${alias}/status${probe ? "?probe=1" : ""}`);
+    await api(`/accounts/${alias}/status`);
     await loadAccounts();
-    toast(probe ? `已刷新 ${alias} 的资料与额度（零模型调用）` : `已刷新 ${alias}`, "ok");
+    toast(`已刷新 ${alias} 的资料`, "ok");
   } catch (error: any) {
-    toast(`刷新 ${alias} 失败：${error.message}`, "error");
+    toast(`刷新 ${alias} 资料失败：${error.message}`, "error");
+  } finally {
+    busy.value = "";
+  }
+}
+
+async function refreshLimits(alias: string) {
+  busy.value = alias;
+  try {
+    await api(`/accounts/${alias}/limits`);
+    await loadAccounts();
+    toast(`已刷新 ${alias} 的额度`, "ok");
+  } catch (error: any) {
+    toast(`刷新 ${alias} 额度失败：${error.message}`, "error");
   } finally {
     busy.value = "";
   }
@@ -243,7 +259,7 @@ async function removeAccount(alias: string) {
                 </div>
               </template>
               <span v-else class="muted"
-                    :title="account.plan ? '该套餐无到期时间' : '点「刷新」获取账号资料'">—</span>
+                    :title="account.plan ? '该套餐无到期时间' : '点「资料」获取账号资料'">—</span>
             </td>
             <td>
               <template v-if="account.proxy">
@@ -278,10 +294,11 @@ async function removeAccount(alias: string) {
             </td>
             <td class="actions">
               <button class="ghost small" :disabled="busy === account.alias"
-                      @click="refreshStatus(account.alias)">刷新</button>
+                      title="读取 /v1/limits 刷新用量窗口；不产生模型调用"
+                      @click="refreshLimits(account.alias)">额度</button>
               <button class="ghost small" :disabled="busy === account.alias"
-                      title="通过 /v1/limits 刷新账号资料与额度；不产生模型调用"
-                      @click="refreshStatus(account.alias, true)">资料+额度</button>
+                      title="读取 mirasim 账号资料（套餐、到期、持有人）；不产生模型调用"
+                      @click="refreshProfile(account.alias)">资料</button>
               <button class="danger small" @click="removeAccount(account.alias)">删除</button>
             </td>
           </tr>

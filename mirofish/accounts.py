@@ -179,7 +179,15 @@ class AccountService:
         self.store = store
         self.upstream = upstream
 
-    _OPTIONAL_TENANT_STATUSES = frozenset({404, 405, 501})
+    # A tenant read must never be what fails a profile refresh. 404/405/501:
+    # the current relay folded tenancy into /auth/me. 429: /me/tenant is a
+    # relay-domain read, so an account out of weekly credit is refused there
+    # while its mirasim profile — plan, expiry, holder — is perfectly
+    # readable, and that is the moment the panel needs it.
+    #
+    # 403 is deliberately absent: a suspension is refused on both domains, and
+    # letting the profile refresh succeed anyway would hide it.
+    _OPTIONAL_TENANT_STATUSES = frozenset({404, 405, 429, 501})
 
     @staticmethod
     def _tenant_from_payload(
@@ -349,6 +357,15 @@ class AccountService:
 
     async def fetch_status(self, alias: str, probe: bool = False,
                            proxy_url: Optional[str] = None) -> dict[str, Any]:
+        """The account's mirasim profile: plan, expiry, holder, tenancy.
+
+        Deliberately separate from ``fetch_limits``. They live on different
+        domains — the profile is mirasim account data, the windows are relay
+        metering — so one must not fail because of the other: an account with
+        no weekly credit left still has a plan and an expiry to show, and an
+        account whose profile reads fine but whose windows are refused with 403
+        is a distinguishable state worth seeing.
+        """
         row = self.store.row(alias)
         base = self.settings.auth_base
         status, _, me = await self.upstream.authed_json(alias, "GET", base, "/auth/me",
@@ -384,10 +401,15 @@ class AccountService:
             "referral": referral, "tenant_response": tenant_snapshot,
             "profile_pending": False, "checked_at": utc_now()})
         if probe:
-            # Keep the legacy query flag/CLI option, but use the upstream's
-            # supported zero-cost availability source instead of a synthetic
-            # one-token Messages request (which is now explicitly rejected).
-            await self.fetch_limits(alias, proxy_url=proxy_url)
+            # Legacy flag: callers that still ask for both get the windows too,
+            # but a refused window read must not lose the profile that was
+            # just fetched successfully — the panel's two buttons hit the two
+            # endpoints separately now.
+            try:
+                await self.fetch_limits(alias, proxy_url=proxy_url)
+            except RelayError as exc:
+                logger.info("limits unavailable during profile refresh: "
+                            "account=%s %s", alias, exc)
             return public_status(self.store.row(alias))
         return public_status(self.store.row(alias), metadata)
 

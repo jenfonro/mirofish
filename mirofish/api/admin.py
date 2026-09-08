@@ -50,22 +50,48 @@ async def list_accounts(request: Request) -> dict[str, Any]:
 @router.get("/accounts/{alias}/status")
 async def account_status(alias: str, request: Request,
                          probe: Optional[str] = None) -> dict[str, Any]:
+    """Refresh one account's profile and usage.
+
+    A refusal aimed at the account (401, 403 suspension, 503 capacity) is
+    recorded: a suspended account otherwise kept reading "正常" in the panel
+    while every refresh failed, and scheduling went on electing it.
+
+    A quota refusal is deliberately *not*: reading a profile is not model
+    traffic, so "out of weekly credit" says nothing about whether this call
+    should have worked, and benching the account for it would be wrong. Nor
+    does success here clear a recorded refusal — only real model traffic
+    proves an account can serve model traffic.
+    """
     state = get_state(request)
     alias = alias_value(alias)
     do_probe = probe in ("1", "true")
-    status = await state.with_proxy(
-        alias, lambda url: state.accounts.fetch_status(alias, do_probe, proxy_url=url))
+    try:
+        status = await state.with_proxy(
+            alias, lambda url: state.accounts.fetch_status(alias, do_probe, proxy_url=url))
+    except RelayError as exc:
+        state.note_account_error(alias, exc)
+        raise
     status["proxy"] = state.pool.account_public(alias)
     return status
 
 
 @router.get("/accounts/{alias}/limits")
 async def account_limits(alias: str, request: Request) -> dict[str, Any]:
-    """Live per-window usage limits from upstream /v1/limits (zero model cost)."""
+    """Live per-window usage limits from upstream /v1/limits (zero model cost).
+
+    Records an account-aimed refusal like ``account_status``, and for the same
+    reason ignores a quota one: this read costs no credit, so being out of
+    credit is not why it failed.
+    """
     state = get_state(request)
     alias = alias_value(alias)
-    return await state.with_proxy(
-        alias, lambda url: state.accounts.fetch_limits(alias, proxy_url=url))
+    try:
+        limits = await state.with_proxy(
+            alias, lambda url: state.accounts.fetch_limits(alias, proxy_url=url))
+    except RelayError as exc:
+        state.note_account_error(alias, exc)
+        raise
+    return limits
 
 
 @router.get("/api/limits")
@@ -78,11 +104,12 @@ async def all_limits(request: Request) -> dict[str, Any]:
         try:
             limits = await state.with_proxy(
                 alias, lambda url: state.accounts.fetch_limits(alias, proxy_url=url))
-            return {"alias": alias, "ok": True, "limits": limits}
         except RelayError as exc:
+            state.note_account_error(alias, exc)
             return {"alias": alias, "ok": False, "error": str(exc), "status": exc.status}
         except Exception as exc:  # noqa: BLE001 - never let one account break the batch
             return {"alias": alias, "ok": False, "error": str(exc) or type(exc).__name__}
+        return {"alias": alias, "ok": True, "limits": limits}
 
     results = await asyncio.gather(*(one(alias) for alias in aliases))
     return {"accounts": list(results)}

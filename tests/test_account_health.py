@@ -31,8 +31,9 @@ import respx
 
 from mirofish.api.state import HEALTH_RETRY_AFTER, AppState
 from mirofish.errors import RelayError
+from mirofish.upstream import LIMITS_PATH
 
-from tests.conftest import RELAY_BASE, add_account
+from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 
 ANTHROPIC_OK = {
     "id": "msg_1", "type": "message", "role": "assistant",
@@ -537,3 +538,115 @@ async def test_the_catalog_response_holds_no_bare_string_list(
         "created_at": "2024-01-01T00:00:00Z", "created": 0,
         "owned_by": "mirofish",
     }]
+
+
+@respx.mock
+async def test_a_failed_refresh_marks_the_account(client, state, auth_headers):
+    """An explicit refresh is a verdict on the account.
+
+    Without this a suspended account read "正常" in the panel while every
+    refresh failed, and scheduling went on electing it — the refresh was the
+    one place that knew, and it threw the answer away.
+    """
+    add_account(state, "work")
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(403, json=BANNED_403))
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(403, json=BANNED_403))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(403, json=BANNED_403))
+
+    response = await client.get("/accounts/work/status", headers=auth_headers)
+
+    assert response.status_code == 403
+    assert state.account_health("work")["state"] == "suspended"
+    assert state.account_unhealthy("work")
+
+
+@respx.mock
+async def test_a_quota_refusal_on_refresh_does_not_bench_the_account(
+        client, state, auth_headers):
+    """Reading a profile is not model traffic.
+
+    "Out of weekly credit" therefore says nothing about whether this call
+    should have worked, and must not cool the account or mark it abnormal.
+    """
+    add_account(state, "work")
+    exhausted = {"type": "error", "error": {
+        "type": "rate_limit_error", "code": "credit_exhausted_7d",
+        "message": "已用满 7 天用量上限"}}
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(429, json=exhausted))
+
+    await client.get("/accounts/work/status", headers=auth_headers)
+
+    assert state.account_health("work") == {}
+    assert not state.account_unhealthy("work")
+    assert state.exhausted_cooldown("work") == 0
+
+
+@respx.mock
+async def test_a_tenant_read_never_fails_a_refresh(client, state, auth_headers):
+    """/me/tenant is a relay-domain read, so a suspended or spent account is
+    refused there — and the panel needs the profile most exactly then."""
+    add_account(state, "work")
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "u1", "plan": "plus"}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={"current_plan": "plus"}))
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(429, json={"type": "error", "error": {
+            "type": "rate_limit_error", "code": "credit_exhausted_7d"}}))
+
+    response = await client.get("/accounts/work/status", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["plan"] == "plus"
+
+
+@respx.mock
+async def test_a_spent_account_still_shows_its_profile(client, state, auth_headers):
+    """Profile and windows are different data on different domains.
+
+    An account with no weekly credit left still has a plan and an expiry, and
+    that is exactly when the panel needs them. /me/tenant is a relay-domain
+    read, so it is refused there while the mirasim profile reads fine.
+    """
+    add_account(state, "work")
+    spent = {"type": "error", "error": {
+        "type": "rate_limit_error", "code": "credit_exhausted_7d",
+        "message": "已用满 7 天用量上限"}}
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(200, json={"id": "u1", "plan": "plus"}))
+    respx.get(AUTH_BASE + "/auth/referral").mock(
+        return_value=httpx.Response(200, json={"current_plan": "plus"}))
+    respx.get(RELAY_BASE + "/me/tenant").mock(
+        return_value=httpx.Response(429, json=spent))
+
+    response = await client.get("/accounts/work/status", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.json()["plan"] == "plus"
+    # A spent window is not a verdict on the account.
+    assert state.account_health("work") == {}
+
+
+@respx.mock
+async def test_a_suspension_on_either_domain_is_recorded(
+        client, state, auth_headers):
+    """Both reads are refused for a suspended account, so either one seeing a
+    403 is enough to mark it — which of them failed only tells the operator
+    where it showed up first."""
+    add_account(state, "profile-side")
+    add_account(state, "limits-side")
+    respx.get(AUTH_BASE + "/auth/me").mock(
+        return_value=httpx.Response(403, json=BANNED_403))
+    respx.get(RELAY_BASE + LIMITS_PATH).mock(
+        return_value=httpx.Response(403, json=BANNED_403))
+    _mock_device_session()
+
+    await client.get("/accounts/profile-side/status", headers=auth_headers)
+    await client.get("/accounts/limits-side/limits", headers=auth_headers)
+
+    assert state.account_health("profile-side")["state"] == "suspended"
+    assert state.account_health("limits-side")["state"] == "suspended"
