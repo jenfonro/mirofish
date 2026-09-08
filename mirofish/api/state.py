@@ -146,20 +146,6 @@ PROFILE_REFRESH_SECONDS = 86400.0
 ACCOUNT_GENERATION_EXTENSION = "mirofish_account_generation"
 
 
-def _is_uuid(value: str) -> bool:
-    """True for a canonically formatted UUID, hyphens and all.
-
-    ``uuid.UUID`` also accepts braces, urn: prefixes and bare hex, none of
-    which an official client would send, so require the round trip.
-    """
-    if len(value) != 36:
-        return False
-    try:
-        return str(uuid.UUID(value)) == value.lower()
-    except ValueError:
-        return False
-
-
 class AppState:
     def __init__(self, settings: Settings, proxy_key: Optional[str] = None) -> None:
         self.settings = settings
@@ -1357,9 +1343,10 @@ class AppState:
                          payload: Any, account: str = "") -> str:
         """Stable, non-secret session id for the upstream relay metadata.
 
-        Preserve Claude Code's own printable session id when available. Other
-        local affinity hints are hashed so arbitrary caller values and message
-        text never appear in an upstream header.
+        Every caller identity is rewritten per account. The hash is the
+        mapping: deterministic, so one conversation on one account keeps one
+        upstream session id for as long as it lives, and derived, so there is
+        no table to persist or expire.
 
         The hash is shaped as a v4 UUID rather than a readable prefix: this
         value is sent as both ``x-mirasim-session`` and, for synthesized client
@@ -1367,21 +1354,22 @@ class AppState:
         sends a bare UUID.  Determinism is what session affinity needs, and it
         is unchanged; only the encoding differs.
 
-        A caller's session id is therefore passed through only when it already
-        *is* a UUID.  Anything else is hashed like any other hint: it still
-        keys the same conversation to the same account, without letting a local
-        caller put an arbitrary label in an upstream header.
+        A caller's own UUID is rewritten too, rather than passed through. It
+        identifies the caller's session, not the account's: one client asking
+        two accounts — which is what failover does on a quota refusal — would
+        otherwise announce the same session id from both, and a real
+        installation cannot know another's. Rewriting also keeps an arbitrary
+        caller-supplied label out of an upstream header.
 
-        ``account`` is mixed into the hash so the same text on two accounts
-        does not produce the same upstream session id. Each account is meant to
-        look like its own client installation, and a session id shared between
-        two of them says otherwise — the derivation is content-based, so two
-        accounts answering the same prompt collided exactly.
+        ``account`` is therefore always in the hash. Without it the derivation
+        is purely content-based, and two accounts answering the same prompt
+        collided exactly.
+
+        The caller's id is lowercased first so the same session written in
+        either case does not fork into two upstream sessions.
         """
-        direct = (claude_session or "").strip()
-        if _is_uuid(direct):
-            return direct.lower()
-        key = direct or (session_hint or "").strip() \
+        key = (claude_session or "").strip().lower() \
+            or (session_hint or "").strip() \
             or cls._session_key_from_payload(payload)
         if key:
             digest = hashlib.sha256(

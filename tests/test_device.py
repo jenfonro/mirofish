@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import uuid
 
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
@@ -137,9 +138,22 @@ def test_the_same_prompt_on_two_accounts_gets_different_session_ids(state):
     assert state.relay_session_id("", "", payload, "alpha") == first
 
 
-def test_a_caller_supplied_uuid_session_is_still_passed_through(state):
-    """A real client's own session id belongs to that client, not to us."""
+def test_a_caller_supplied_uuid_is_rewritten_per_account(state):
+    """A caller's own session id identifies the caller, not the account.
+
+    Passing it through meant one client asking two accounts — which is exactly
+    what failover does on a quota refusal — announced the same session id from
+    both, and a real installation cannot know another's.
+    """
     given = "3f2504e0-4f89-41d3-9a0c-0305e82c3301"
 
-    assert state.relay_session_id(given, "", {}, "alpha") == given
-    assert state.relay_session_id(given, "", {}, "beta") == given
+    first = state.relay_session_id(given, "", {}, "alpha")
+    second = state.relay_session_id(given, "", {}, "beta")
+
+    assert first != given and second != given
+    assert first != second
+    # The rewrite is the mapping: stable per (caller session, account), so one
+    # conversation keeps one upstream id without a table to persist.
+    assert state.relay_session_id(given, "", {}, "alpha") == first
+    # Still a bare UUID, which is all an official client ever sends.
+    assert str(uuid.UUID(first)) == first

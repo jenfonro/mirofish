@@ -164,33 +164,45 @@ def test_route_account_session_header_sticky(state):
     assert state.route_account("", "sess-123", _conv("completely different body")) == first
 
 
-def test_relay_session_id_preserves_claude_id_and_hashes_local_hints(state):
-    # A real client session id is already a UUID and passes through verbatim.
+def test_relay_session_id_rewrites_every_caller_identity(state):
+    """The upstream session id is ours to assign, per account.
+
+    A caller's id identifies the caller's session, not the account's, so it is
+    rewritten rather than forwarded — including a genuine UUID, which used to
+    pass through and therefore announced the same session from every account
+    failover walked. The hash is the mapping: no table to persist or expire.
+    """
     official = "0f20cf48-c292-42e9-a99e-994511307deb"
-    assert state.relay_session_id(official, "local-secret", _conv("x")) == official
-    first = state.relay_session_id("", "local-secret", _conv("private prompt"))
-    second = state.relay_session_id("", "local-secret", _conv("changed prompt"))
-    # Deterministic, and shaped like the bare v4 UUID every official client
-    # sends, so the relay does not name itself in an upstream header.
-    assert first == second
-    assert uuid.UUID(first).version == 4
-    assert "local-secret" not in first and "private prompt" not in first
+    rewritten = state.relay_session_id(official, "local-secret", _conv("x"), "acct")
+
+    assert rewritten != official
+    assert uuid.UUID(rewritten).version == 4
+    # Stable per (caller session, account), which is what affinity needs.
+    assert state.relay_session_id(
+        official, "local-secret", _conv("anything"), "acct") == rewritten
+    # And distinct per account: one client cannot look like two installations
+    # sharing a session.
+    assert state.relay_session_id(
+        official, "local-secret", _conv("x"), "other") != rewritten
 
 
-def test_relay_session_id_never_forwards_a_non_uuid_caller_label(state):
+def test_relay_session_id_never_forwards_a_local_label_or_prompt(state):
     label = "claude-session-1"
-    derived = state.relay_session_id(label, "", _conv("x"))
+    derived = state.relay_session_id(label, "", _conv("x"), "acct")
 
-    # Only a genuine UUID is relayed as-is; anything else is hashed, so a local
-    # caller cannot choose the value upstream sees.
     assert derived != label
     assert uuid.UUID(derived).version == 4
-    # Still deterministic, so affinity for that conversation is unaffected.
-    assert state.relay_session_id(label, "", _conv("different body")) == derived
-    assert state.relay_session_id("other-label", "", _conv("x")) != derived
-    # Case is normalized rather than treated as a different session.
-    upper = "0F20CF48-C292-42E9-A99E-994511307DEB"
-    assert state.relay_session_id(upper, "", _conv("x")) == upper.lower()
+    # Deterministic for that conversation, and it leaks neither the caller's
+    # label nor the prompt into an upstream header.
+    assert state.relay_session_id(label, "", _conv("different body"), "acct") == derived
+    assert state.relay_session_id("other-label", "", _conv("x"), "acct") != derived
+    leaky = state.relay_session_id("", "local-secret", _conv("private prompt"), "acct")
+    assert "local-secret" not in leaky and "private prompt" not in leaky
+    # Case still does not fork a session: the same id in either case maps to
+    # the same upstream session for that account.
+    lower = "0f20cf48-c292-42e9-a99e-994511307deb"
+    assert state.relay_session_id(lower.upper(), "", _conv("x"), "acct") \
+        == state.relay_session_id(lower, "", _conv("x"), "acct")
 
 
 def test_session_key_follows_a_responses_conversation_across_turns(state):
@@ -340,7 +352,9 @@ async def test_messages_preserves_beta_query_and_claude_fingerprint(
     assert sent.headers["anthropic-beta"] == (
         "claude-code-20250219,mid-conversation-system-2026-04-07")
     metadata = relay_metadata(sent)
-    assert metadata["x-mirasim-session"] == session_id
+    # Rewritten per account, not forwarded: a caller's id names the caller.
+    assert metadata["x-mirasim-session"] != session_id
+    assert uuid.UUID(metadata["x-mirasim-session"]).version == 4
     assert metadata["x-mirasim-agent"] == "claude"
     assert metadata["x-mirasim-locale"] == "zh-HK"
     assert sent.headers["authorization"] == "Bearer device-ticket"
@@ -443,8 +457,10 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
     assert '"type":"text_delta","text":"Hi"' in body.replace(" ", "").replace('", "', '","') \
         or 'text_delta' in body
     assert "message_stop" in body
-    assert relay_metadata(route.calls.last.request)["x-mirasim-session"] == \
-        "0f20cf48-c292-42e9-a99e-994511307deb"
+    # The caller's session id is rewritten per account, never forwarded.
+    sent_session = relay_metadata(route.calls.last.request)["x-mirasim-session"]
+    assert sent_session != "0f20cf48-c292-42e9-a99e-994511307deb"
+    assert uuid.UUID(sent_session).version == 4
     assert route.calls.last.request.url.query == b"beta=true"
     assert json.loads(route.calls.last.request.content)["system"] == [
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
@@ -678,7 +694,7 @@ async def test_complete_claude_code_payload_is_forwarded_unchanged(
     assert sent.headers["anthropic-beta"] == betas
     assert sent.headers["user-agent"] == headers["user-agent"]
     assert sent.headers["x-stainless-package-version"] == "0.112.1"
-    assert relay_metadata(sent)["x-mirasim-session"] == session_id
+    assert relay_metadata(sent)["x-mirasim-session"] != session_id
     assert sent.url.query == b"beta=true"
     verify_relay_signature(state, sent, "/v1/messages")
 
@@ -1031,8 +1047,8 @@ async def test_count_tokens_proxied(client, state, auth_headers):
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER},
     ]
     assert route.calls.last.request.headers["authorization"] == "Bearer device-ticket"
-    assert relay_metadata(route.calls.last.request)["x-mirasim-session"] == \
-        count_session
+    assert relay_metadata(route.calls.last.request)["x-mirasim-session"] \
+        != count_session
     assert route.calls.last.request.url.query == b"beta=true"
     verify_relay_signature(state, route.calls.last.request, "/v1/messages/count_tokens")
 
