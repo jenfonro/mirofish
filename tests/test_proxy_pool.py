@@ -1,4 +1,4 @@
-"""Sticky account-to-node behaviour over a manually curated pool."""
+"""Fixed account-to-node behaviour over a manually curated pool."""
 
 import httpx
 import pytest
@@ -80,105 +80,75 @@ def test_deleting_a_node_releases_its_accounts(state):
         state.pool.remove(node_id)
 
 
-async def test_an_account_sticks_to_one_node(state):
+def test_an_account_sticks_to_one_node(state):
     seed(state)
     add_account(state, "acct")
 
-    first = await state.pool.for_account("acct")
-    assert await state.pool.for_account("acct") == first
+    first = state.pool.for_account("acct")
+    assert state.pool.for_account("acct") == first
 
 
-async def test_accounts_spread_across_nodes(state):
+def test_accounts_spread_across_nodes(state):
     """Each account gets its own exit where there are enough to go around."""
     seed(state)
     add_account(state, "one")
     add_account(state, "two")
 
-    a = await state.pool.for_account("one")
-    b = await state.pool.for_account("two")
+    a = state.pool.for_account("one")
+    b = state.pool.for_account("two")
 
     assert a["id"] != b["id"]
 
 
-@respx.mock
-async def test_region_blocked_node_is_rotated_away(state):
-    """A region refusal is a property of the exit, so the account moves to
-    another node rather than being taken out of service."""
+async def test_a_failing_exit_never_moves_the_account(state):
+    """The whole point of the pool: a request goes out through the account's
+    own exit or not at all.
+
+    Retrying through another node would change the account's upstream IP
+    without anyone asking, and two accounts sharing an exit is exactly the
+    correlation that gets them flagged. So the failure propagates, the
+    binding survives, and the second attempt uses the same exit as the first.
+    """
     seed(state)
     add_account(state, "acct")
-    region_error = RelayError(
-        "upstream does not serve this proxy exit region", 502,
-        {"region_blocked": True, "upstream": "shared_quota_unavailable: ..."})
+    bound = state.pool.for_account("acct")["id"]
     attempts = []
 
     async def op(proxy_url):
         attempts.append(proxy_url)
-        if len(attempts) == 1:
-            raise region_error
-        return "ok"
-
-    assert await state.with_proxy("acct", op) == "ok"
-    assert len(attempts) == 2
-    assert attempts[0] != attempts[1]
-    # A region refusal must not mark the node unhealthy for everyone else.
-    assert all(int(row["failure_count"]) == 0 for row in state.store.proxy_rows())
-
-
-async def test_region_refused_everywhere_cools_account_not_pool(state):
-    """When every exit refuses one account, the account is taken out of
-    service, not the pool: other accounts keep their nodes, and the refused
-    account's immediate retry fails fast without another sweep."""
-    seed(state)
-    add_account(state, "acct")
-    add_account(state, "other")
-    region_error = RelayError(
-        "upstream does not serve this proxy exit region", 502,
-        {"region_blocked": True, "upstream": "shared_quota_unavailable: ..."})
-    attempts = []
-
-    async def op(proxy_url):
-        attempts.append(proxy_url)
-        raise region_error
+        raise RelayError("upstream network error", 502, {"proxy_network": True})
 
     with pytest.raises(RelayError) as raised:
         await state.with_proxy("acct", op)
-    assert raised.value.data["region_blocked"] is True
-    assert raised.value.data["region_refused_everywhere"] is True
-    assert len(attempts) == 2  # one sweep: each exit tried exactly once
-    assert state.store.row("acct")["proxy_id"] is None
 
-    # The pool stays healthy for everyone else.
-    assert all(int(row["failure_count"]) == 0 for row in state.store.proxy_rows())
-    assert await state.pool.for_account("other") is not None
+    assert raised.value.status == 502
+    assert len(attempts) == 1  # no second node was tried
+    assert state.store.row("acct")["proxy_id"] == bound
 
-    # The error is account-scoped: selection cools the account down.
-    assert state.note_account_unserviceable("acct", raised.value) is True
-    assert state.exhausted_cooldown("acct") > 0
-
-    # An immediate retry fails fast instead of sweeping the pool again.
-    attempts.clear()
-    with pytest.raises(RelayError) as retried:
+    with pytest.raises(RelayError):
         await state.with_proxy("acct", op)
-    assert retried.value.status == 503
-    assert attempts == []
+    assert attempts[1] == attempts[0]  # same exit, not the other node
 
 
-async def test_a_network_failure_takes_the_node_out_for_everyone(state):
-    """Unlike a region refusal, a dead exit is dead for every account."""
+def test_a_network_failure_marks_the_node_but_keeps_its_accounts(state):
+    """A failing node leaves *new* assignments while its accounts stay put:
+    they have nowhere else to go by design."""
     ids = seed(state)
     add_account(state, "acct")
+    state.store.set_account_proxy("acct", ids[0])
 
-    state.pool.fail("acct", {"id": ids[0]}, "proxy network failure")
+    state.pool.fail({"id": ids[0]}, "proxy network failure")
 
     assert state.pool.active_count() == 1
-    assert state.store.row("acct")["proxy_id"] is None
+    assert state.store.row("acct")["proxy_id"] == ids[0]
+    assert state.pool.for_account("acct")["id"] == ids[0]
 
 
-async def test_a_successful_test_returns_a_failed_node_to_the_rotation(state):
+async def test_a_successful_test_returns_a_failed_node_to_service(state):
     """Testing is how an operator puts a node they have fixed back in."""
     ids = seed(state, [NODES[0]])
     add_account(state, "acct")
-    state.pool.fail("acct", {"id": ids[0]}, "proxy network failure")
+    state.pool.fail({"id": ids[0]}, "proxy network failure")
     assert state.pool.active_count() == 0
 
     with respx.mock:
@@ -219,11 +189,11 @@ async def test_an_unexpected_status_is_a_failure(state):
     assert "200" in result["error"]
 
 
-async def test_an_empty_pool_routes_directly(state):
+def test_an_empty_pool_routes_directly(state):
     """No nodes configured is not an error: requests go out unproxied."""
     add_account(state, "acct")
 
-    assert await state.pool.for_account("acct") is None
+    assert state.pool.for_account("acct") is None
     assert state.pool.configured is False
 
 

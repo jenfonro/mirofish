@@ -540,12 +540,14 @@ def test_accounts_spent_on_different_windows_still_report_one(state):
         "messages": [{"role": "user", "content": "a window"}]}) in {"fable_a", "fable_b"}
 
 
-def test_region_refusal_stays_with_the_proxy_pool(state):
-    # Rotating the exit fixes this one; taking the account out would not.
+def test_shared_quota_refusal_cools_the_account(state):
+    """This used to be exempt from cooldown because rotating the proxy exit
+    was expected to fix it. Accounts now keep one exit, so the only thing
+    that recovers is another account or waiting — i.e. a cooldown."""
     add_account(state, "work")
-    assert not state.note_account_unserviceable(
+    assert state.note_account_unserviceable(
         "work", refusal(429, "shared_quota_unavailable"))
-    assert state.exhausted_cooldown("work") == 0
+    assert state.exhausted_cooldown("work") > 0
 
 
 def test_transport_and_client_errors_are_left_alone(state):

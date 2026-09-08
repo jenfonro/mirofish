@@ -14,7 +14,7 @@ Mirofish Relay 是一个面向本地或自托管环境的多账号中转服务�
 - Codex Responses 透明代理：`/v1/responses` 与 `/backend-api/codex/responses`。
 - `/v1/messages/count_tokens` token 计数接口。
 - 会话亲和与配额感知路由，让同一对话持续使用同一账号。
-- 代理池：面板录入 SOCKS5 / HTTP / HTTPS 节点，账号固定出口、失败自动轮换。
+- 代理池：面板录入 SOCKS5 / HTTP / HTTPS 节点，每个账号固定一个出口。
 - 加密凭证存储：容器内使用 scrypt + AES-256-GCM。
 - 中文 WebUI：账号、额度、用量、代理池与模型调用测试。
 - 单容器 Docker 部署，容器内只有 relay 一个进程。
@@ -30,7 +30,7 @@ Anthropic / OpenAI / Codex 客户端
        │       └── 加密凭证与 SQLite 元数据
        │
        ├── 账号选择与会话亲和
-       └── 固定代理节点与失败轮换
+       └── 账号固定的代理出口
                     │
                     ▼
           代理池（SOCKS5 / HTTP(S)）
@@ -243,7 +243,7 @@ ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是
 | `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.272` | relay 客户端版本标识 |
 | `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY` | 内置 32 字节公钥 | `x-mirasim-enc` 的 X25519 接收公钥 |
 | `MIROFISH_MIRASIM_SEAL_METADATA` | `1` | 是否封装模型请求的 relay 元数据 |
-| `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点停用前的连续失败次数 |
+| `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点连续拨号失败多少次后停用 |
 | `MIROFISH_SESSION_TTL` | `1800` | 会话亲和有效期，单位为秒 |
 | `MIROFISH_KEEPALIVE_EXPIRY` | `75` | 上游 HTTP/1.1 空闲连接保留秒数 |
 | `MIROFISH_MAX_CONNECTIONS` | `100` | 上游连接池总连接上限 |

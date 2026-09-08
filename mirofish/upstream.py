@@ -530,7 +530,6 @@ def _rejection_detail(body: Any) -> str:
     return str(body)[:300]
 
 
-REGION_REFUSAL_TYPE = "shared_quota_unavailable"
 CREDIT_EXHAUSTED_TYPE = "credit_exhausted_shared"
 # The upstream reports quota exhaustion in `code`, not `type`: `type` is the
 # generic "rate_limit_error" for both a spent window and momentary rate
@@ -546,31 +545,18 @@ _SUSPENDED_UNTIL = re.compile(
     r"access resumes at\s*(\d{4}-\d{2}-\d{2}[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)")
 
 
-def _is_region_blocked(status: int, body: Any) -> bool:
-    """The upstream refuses to serve requests from this exit's network region."""
-    if status != 429 or not isinstance(body, dict):
-        return False
-    error = body.get("error")
-    return (isinstance(error, dict)
-            and str(error.get("type")) == REGION_REFUSAL_TYPE)
-
-
 def account_scoped_429(status: int, body: Any) -> bool:
-    """A 429 another account, rather than another proxy exit, can recover from.
+    """A 429 that another account can recover from.
 
     ``credit_exhausted_shared`` is the refusal the product documents, but a
     window that fills up can surface under other 429 types too, so every 429
-    except the region refusal counts. The single definition is shared by all
-    relay paths; account-level failover keys off it.
+    counts. ``shared_quota_unavailable`` used to be excluded and turned into a
+    proxy-rotation signal instead; with a fixed exit per account there is
+    nothing to rotate to, and it is an account-scoped refusal like the rest.
+    The single definition is shared by all relay paths; account-level failover
+    keys off it.
     """
-    if status != 429:
-        return False
-    if not isinstance(body, dict):
-        return True
-    error = body.get("error")
-    if not isinstance(error, dict):
-        return True
-    return str(error.get("type")) != REGION_REFUSAL_TYPE
+    return status == 429
 
 
 def account_overloaded_503(status: int, body: Any) -> bool:
@@ -653,28 +639,6 @@ def account_suspension_403(status: int, body: Any) -> Optional[tuple[bool, Optio
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=datetime.timezone.utc)
     return False, parsed.timestamp()
-
-
-def _region_block_error(status: int, body: Any,
-                        proxy_url: Optional[str]) -> Optional[RelayError]:
-    """Region availability is a property of the proxy node, not the account, so
-    rotating to a node in a served region recovers; without a proxy there is
-    nothing to rotate and the caller sees the upstream refusal as-is."""
-    if not proxy_url or not _is_region_blocked(status, body):
-        return None
-    return RelayError("upstream does not serve this proxy exit region", 502,
-                      {"region_blocked": True, "upstream": _rejection_detail(body)})
-
-
-def _raise_if_region_blocked(alias: str, status: int, body: Any,
-                             proxy_url: Optional[str]) -> None:
-    """Turn an upstream region refusal into the pool's rotatable error shape."""
-    blocked = _region_block_error(status, body, proxy_url)
-    if blocked is None:
-        return
-    logger.warning("upstream refused exit region: account=%s %s",
-                   alias, _rejection_detail(body))
-    raise blocked
 
 
 def _payload_summary(payload: dict[str, Any]) -> str:
@@ -1084,14 +1048,6 @@ class Upstream:
                              {"proxy_network": bool(proxy_url),
                               "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
         data = _parse_body(response)
-        blocked = _region_block_error(response.status_code, data, proxy_url)
-        if blocked is not None:
-            # Generic authenticated calls such as /me/tenant use this path too.
-            # Preserve the rotatable marker so AppState can abandon the exit
-            # instead of collapsing the upstream 429 into an opaque 502.
-            logger.warning("upstream refused exit region: path=%s %s",
-                           path, _rejection_detail(data))
-            raise blocked
         return response.status_code, _lower_headers(response), data
 
     # --- token refresh (single-flight per alias) ------------------------------
@@ -1400,7 +1356,6 @@ class Upstream:
                               "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
         data = _parse_body(response)
         if response.status_code < 200 or response.status_code >= 300:
-            _raise_if_region_blocked(alias, response.status_code, data, proxy_url)
             raise RelayError("device session request rejected", response.status_code, data)
         ticket = data.get("ticket") if isinstance(data, dict) else None
         if not isinstance(ticket, str) or not ticket:
@@ -1421,18 +1376,14 @@ class Upstream:
             delay = TICKET_REFUSED_RETRY_SECONDS
         self._ticket_retry_after[key] = now + delay
 
-    @staticmethod
-    def _mint_failure_is_rotatable(exc: RelayError) -> bool:
-        return isinstance(exc.data, dict) and (
-            exc.data.get("region_blocked") is True
-            or exc.data.get("proxy_network") is True
-        )
-
     def _ticket_fallback(
             self, key: tuple[str, str], alias: str,
             cached: _DeviceTicket | None, exc: RelayError) -> Optional[str]:
         """Record a mint failure and return a still-valid old ticket if possible."""
-        if self._mint_failure_is_rotatable(exc):
+        # A dead exit must surface as itself: falling back to the account
+        # token here would send an unsigned request through a proxy that
+        # cannot carry it, hiding the real failure behind a 401.
+        if isinstance(exc.data, dict) and exc.data.get("proxy_network") is True:
             raise exc
         if exc.status in (404, 501):
             self._signing_unsupported_until[key] = (
@@ -1705,7 +1656,6 @@ class Upstream:
             data = _parse_body(response)
             headers = _lower_headers(response)
             await response.aclose()
-            _raise_if_region_blocked(alias, response.status_code, data, proxy_url)
             return response.status_code, headers, data
         raise RelayError("signed relay request failed after ticket refresh", 401)
 
@@ -1739,8 +1689,6 @@ class Upstream:
             headers = _lower_headers(response)
             await response.aclose()
             if response.status_code >= 400:
-                _raise_if_region_blocked(
-                    alias, response.status_code, response_body, proxy_url)
                 logger.warning(
                     "upstream rejected /v1/messages: account=%s status=%s %s | %s",
                     alias, response.status_code, _rejection_detail(response_body),
@@ -1783,8 +1731,6 @@ class Upstream:
                 await response.aread()
                 response_body = _parse_body(response)
                 await response.aclose()
-                _raise_if_region_blocked(
-                    alias, response.status_code, response_body, proxy_url)
                 logger.warning(
                     "upstream rejected /v1/messages (stream): account=%s status=%s %s | %s",
                     alias, response.status_code, _rejection_detail(response_body),
@@ -1840,8 +1786,6 @@ class Upstream:
                 response.extensions["mirofish_body_decoded"] = True
                 response_body = _parse_body(response)
                 try:
-                    _raise_if_region_blocked(
-                        alias, response.status_code, response_body, proxy_url)
                     if account_scoped_429(response.status_code, response_body):
                         raise RelayError(
                             "model request rejected", response.status_code,

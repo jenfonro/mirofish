@@ -135,7 +135,7 @@ function mask(value: string): string {
 
     <div id="proxy-card-body" v-show="!collapsed">
       <p class="muted" style="margin-top: 0">
-        每个账号固定绑定一个节点；节点网络失败或上游拒绝该账号的出口区域时自动轮换。
+        每个账号固定绑定一个节点，请求只走这个出口，不会自动换到别的节点。
         节点由你手动维护，relay 不会去拉订阅，也不会自己探测。
       </p>
 

@@ -145,7 +145,6 @@ async def set_account_proxy(alias: str, request: Request) -> dict[str, Any]:
     if proxy_id and state.pool.by_id(proxy_id) is None:
         raise RelayError("unknown proxy node: " + proxy_id, 404)
     state.store.set_account_proxy(alias, proxy_id or None)
-    state.pool.clear_region_refusals(alias)
     state.drop_account_sessions(alias)
     return {"alias": alias, "proxy": state.pool.account_public(alias)}
 

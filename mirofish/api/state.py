@@ -18,7 +18,7 @@ import httpx
 from ..accounts import AccountService
 from ..config import Settings
 from ..errors import RelayError
-from ..proxy import ProxyPool
+from ..proxy import ProxyPool, proxy_url
 from ..store import (HEALTH_ERROR, HEALTH_PARKED_STATES, HEALTH_SUSPENDED,
                      Store)
 from ..upstream import (CREDIT_EXHAUSTED_CODE_PREFIX, RESPONSES_PATH,
@@ -37,7 +37,6 @@ LOGIN_TTL_SECONDS = 600.0
 # which point the upstream refuses it and the cooldown takes over. Reserving
 # headroom would only leave credit unspent at the reset.
 QUOTA_EXHAUSTED = 0.999
-MAX_NETWORK_PROXY_ATTEMPTS = 4
 # Fallback cooldown for a spent window whose reset time we cannot read. The
 # refusal holds until the window resets, so re-probing every 10 minutes is
 # already generous; the cached `reset_at` is preferred when available.
@@ -178,7 +177,6 @@ class AppState:
     async def aclose(self) -> None:
         await self.stop_limits_refresh()
         await self.upstream.aclose()
-        await self.pool.aclose()
 
     # --- background limits refresh -------------------------------------------
 
@@ -1059,11 +1057,6 @@ class AppState:
         # New credentials invalidate a recorded 401; a 503 was never about them,
         # but re-probing once after a login is cheaper than staying parked.
         self.note_account_healthy(alias)
-        # A successful login may represent a different upstream identity under
-        # the same local alias. Region refusals belong to the old identity, but
-        # the alias's slot remains valid (and may still carry an in-flight
-        # request), so do not release it here.
-        self.pool.clear_region_refusals(alias)
 
     def remove_account(self, alias: str) -> None:
         """Remove an account and every in-memory identity derived from it."""
@@ -1078,16 +1071,6 @@ class AppState:
         self.reset_account_runtime(alias)
         self.pending_logins.pop(alias, None)
         self.store.remove(alias)
-        self.pool.forget_account(alias)
-
-    @staticmethod
-    def _is_region_refused_everywhere(exc: RelayError) -> bool:
-        """Every available exit region refused this account (flag set by
-        `_rotate_after_failure` once the per-account rotation ran out of
-        exits). Like a shared-quota refusal, this cannot be fixed by another
-        node — only by another account or by waiting."""
-        return (isinstance(exc.data, dict)
-                and exc.data.get("region_refused_everywhere") is True)
 
     def note_account_unserviceable(self, alias: str, exc: RelayError) -> bool:
         """Record an account-scoped upstream refusal so automatic selection
@@ -1108,9 +1091,6 @@ class AppState:
             else:
                 cooldown, reason = TRANSIENT_429_COOLDOWN, "account-scoped 429"
                 window = ""
-        elif self._is_region_refused_everywhere(exc):
-            cooldown, reason = SHARED_QUOTA_COOLDOWN, "region refusal from every exit"
-            window = ""
         else:
             return self.note_account_error(alias, exc)
         self._exhausted_until.setdefault(alias, {})[window] = time.time() + cooldown
@@ -1331,128 +1311,54 @@ class AppState:
         return (exc.status == 502 and isinstance(exc.data, dict)
                 and exc.data.get("proxy_network") is True)
 
-    @staticmethod
-    def _is_region_blocked(exc: RelayError) -> bool:
-        return (exc.status == 502 and isinstance(exc.data, dict)
-                and exc.data.get("region_blocked") is True)
-
-    def _rotate_after_failure(self, alias: str, proxy: dict[str, Any],
-                              exc: RelayError,
-                              network_failures: int) -> Optional[dict[str, Any]]:
-        """Pick the next exit after a routed failure, or raise `exc`.
-
-        A region refusal moves the account through exits it has not been
-        refused from yet — a per-account memory, never a global node failure,
-        because whether a region is served depends on the account's upstream
-        tier. Once every exit has refused the account, `exc` is annotated so
-        account-level failover treats the account as unserviceable. A network
-        failure keeps quarantining the node globally (a dead node is dead for
-        everyone), capped at MAX_NETWORK_PROXY_ATTEMPTS."""
-        if self._is_region_blocked(exc):
-            try:
-                return self.pool.rotate_region(alias, proxy)
-            except RelayError as rotate_exc:
-                if rotate_exc.status == 503:
-                    if isinstance(exc.data, dict):
-                        exc.data["region_refused_everywhere"] = True
-                    raise exc from rotate_exc
-                raise
-        if self._is_proxy_network_failure(exc):
-            if network_failures >= MAX_NETWORK_PROXY_ATTEMPTS:
-                # The final failed node must also be quarantined; otherwise
-                # the next request immediately starts on the same known-bad
-                # exit and repeats the rejection loop.
-                self.pool.fail(alias, proxy, "proxy network failure")
-                raise exc
-            try:
-                return self.pool.rotate(alias, proxy, "proxy network failure")
-            except RelayError as rotate_exc:
-                if rotate_exc.status == 503:
-                    # rotate() already recorded the final failed exit. Keep
-                    # the actionable upstream error instead of replacing it
-                    # with the pool's generic "no node" error.
-                    raise exc from rotate_exc
-                raise
-        raise exc
-
     async def with_proxy(self, alias: str,
                          op: Callable[[Optional[str]], Awaitable[Any]]) -> Any:
-        """Run an account operation, rotating away from unusable sticky exits."""
-        proxy = await self.pool.for_account(alias)
-        network_failures = 0
-        while True:
-            try:
-                async with self.pool.route(alias, proxy) as proxy_url:
-                    result = await op(proxy_url)
-                self.pool.success(proxy)
-                return result
-            except RelayError as exc:
-                if not proxy:
-                    raise
-                if self._is_proxy_network_failure(exc):
-                    network_failures += 1
-                proxy = self._rotate_after_failure(alias, proxy, exc, network_failures)
-                if proxy is None:
-                    raise
+        """Run an account operation through the exit it is bound to.
+
+        There is no second attempt through another node: the account's exit is
+        fixed, so a proxy failure fails the request. Rotating here would give
+        the account a different upstream IP behind the operator's back, which
+        is the correlation between accounts this pool exists to avoid.
+        """
+        proxy = self.pool.for_account(alias)
+        try:
+            result = await op(proxy_url(proxy) if proxy else None)
+        except RelayError as exc:
+            if proxy and self._is_proxy_network_failure(exc):
+                self.pool.fail(proxy, "proxy network failure")
+            raise
+        self.pool.success(proxy)
+        return result
 
     async def with_fixed_proxy(self, alias: str, proxy: Optional[dict[str, Any]],
                                op: Callable[[Optional[str]], Awaitable[Any]]) -> Any:
-        async with self.pool.route(alias, proxy) as proxy_url:
-            return await op(proxy_url)
-
-    @staticmethod
-    def _is_non_api_response(exc: RelayError) -> bool:
-        """The upstream body was not JSON (e.g. an HTML block page from a bad exit)."""
-        return exc.status >= 400 and isinstance(exc.data, dict) and "_raw" in exc.data
+        return await op(proxy_url(proxy) if proxy else None)
 
     async def with_pending_proxy(
             self, alias: str, op: Callable[[Optional[str]], Awaitable[Any]],
-            attempts: int = 3,
             pinned: Optional[dict[str, Any]] = None,
             direct: bool = False) -> tuple[Optional[dict[str, Any]], Any]:
-        """Run a pre-login operation, failing over to another node when the
-        picked one cannot reach the upstream (network error or a non-API
-        response such as an HTML block page). Returns (proxy, result).
+        """Run a pre-login operation through one exit. Returns (proxy, result).
 
-        ``pinned`` is an exit the operator chose, and ``direct`` is them
-        choosing none. Either is used as given and never rotated away from:
-        the choice is the point, and quietly logging in through a different
-        exit would bind the account to a region they did not pick.
+        ``pinned`` is an exit the operator chose and ``direct`` is them
+        choosing none; with neither, the account gets the node it will be
+        bound to. Whichever it is, the login goes through that exit or fails.
+        Trying the next node instead would bind the account to a region the
+        operator did not pick, and the account would keep that exit for good.
         """
         if direct:
             return None, await op(None)
-        if pinned is not None:
-            alias = alias_value(alias)
-            self.pool.clear_region_refusals(alias)
-            async with self.pool.route(alias, pinned) as proxy_url:
-                return pinned, await op(proxy_url)
-        # Region serviceability is account-tier dependent. A deliberate new
-        # login may replace the identity behind this alias, so it must not be
-        # blocked by the previous identity's refusal history. Clear once before
-        # the retry loop; refusals learned by this login attempt still guide
-        # subsequent rotations below.
-        alias = alias_value(alias)
-        self.pool.clear_region_refusals(alias)
-        for attempt in range(attempts):
-            proxy = await self.pool.pending_proxy(alias)
-            if proxy is None:
-                return None, await op(None)
-            try:
-                async with self.pool.route(alias, proxy) as proxy_url:
-                    result = await op(proxy_url)
-                self.pool.success(proxy)
-                return proxy, result
-            except RelayError as exc:
-                region = self._is_region_blocked(exc)
-                retriable = (region or self._is_proxy_network_failure(exc)
-                             or self._is_non_api_response(exc))
-                if not retriable or attempt + 1 >= attempts:
-                    raise
-                if region:
-                    self.pool.mark_region_refused(alias, proxy)
-                else:
-                    self.store.mark_proxy_failure(str(proxy["id"]), str(exc)[:200])
-        raise RelayError("proxy request failed", 502)
+        proxy = pinned if pinned is not None else self.pool.pending_proxy(alias_value(alias))
+        if proxy is None:
+            return None, await op(None)
+        try:
+            result = await op(proxy_url(proxy))
+        except RelayError as exc:
+            if self._is_proxy_network_failure(exc):
+                self.pool.fail(proxy, "proxy network failure")
+            raise
+        self.pool.success(proxy)
+        return proxy, result
 
     async def open_messages_stream(
             self, alias: str,
@@ -1461,38 +1367,31 @@ class AppState:
             session_id: str = "", beta: bool = False,
             raw_body: Optional[bytes] = None,
     ) -> tuple[httpx.Response, AsyncExitStack]:
-        """Open a streaming upstream call inside its proxy route context.
+        """Open a streaming upstream call through the account's fixed exit.
 
-        The returned AsyncExitStack keeps the proxy route and the HTTP
-        response open; the caller closes it when the stream finishes.
+        The returned AsyncExitStack keeps the HTTP response open; the caller
+        closes it when the stream finishes.
         """
-        proxy = await self.pool.for_account(alias)
-        network_failures = 0
-        while True:
-            stack = AsyncExitStack()
-            try:
-                proxy_url = await stack.enter_async_context(
-                    self.pool.route(alias, proxy))
-                account_generation = self.store.account_generation(alias)
-                response = await self.upstream.stream_messages(
-                    alias, payload, proxy_url, request_headers=request_headers,
-                    session_id=session_id, beta=beta, raw_body=raw_body)
-                response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
-                stack.push_async_callback(response.aclose)
-                self.pool.success(proxy)
-                return response, stack
-            except RelayError as exc:
-                await stack.aclose()
-                if not proxy:
-                    raise
-                if self._is_proxy_network_failure(exc):
-                    network_failures += 1
-                proxy = self._rotate_after_failure(alias, proxy, exc, network_failures)
-                if proxy is None:
-                    raise
-            except BaseException:
-                await stack.aclose()
-                raise
+        proxy = self.pool.for_account(alias)
+        stack = AsyncExitStack()
+        try:
+            account_generation = self.store.account_generation(alias)
+            response = await self.upstream.stream_messages(
+                alias, payload, proxy_url(proxy) if proxy else None,
+                request_headers=request_headers,
+                session_id=session_id, beta=beta, raw_body=raw_body)
+            response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
+            stack.push_async_callback(response.aclose)
+        except RelayError as exc:
+            await stack.aclose()
+            if proxy and self._is_proxy_network_failure(exc):
+                self.pool.fail(proxy, "proxy network failure")
+            raise
+        except BaseException:
+            await stack.aclose()
+            raise
+        self.pool.success(proxy)
+        return response, stack
 
     async def open_responses_stream(
             self, alias: str, body: bytes, *,
@@ -1500,41 +1399,33 @@ class AppState:
             session_id: str = "", account_id: str = "",
             query_string: str = "", path: str = RESPONSES_PATH,
     ) -> tuple[httpx.Response, AsyncExitStack]:
-        """Open a Codex relay stream while retaining its proxy route."""
-        proxy = await self.pool.for_account(alias)
-        network_failures = 0
-        while True:
-            stack = AsyncExitStack()
-            try:
-                proxy_url = await stack.enter_async_context(
-                    self.pool.route(alias, proxy))
-                account_generation = self.store.account_generation(alias)
-                response = await self.upstream.stream_responses(
-                    alias, body, proxy_url, request_headers=request_headers,
-                    session_id=session_id, account_id=account_id,
-                    query_string=query_string, path=path)
-                response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
-                stack.push_async_callback(response.aclose)
-                # Unlike the Anthropic path, stream_responses *returns* upstream
-                # rejections so the Codex caller sees them verbatim.  Clearing
-                # the node's failure counter on one of those would credit an
-                # exit that never served a request.
-                if response.status_code < 400:
-                    self.pool.success(proxy)
-                return response, stack
-            except RelayError as exc:
-                await stack.aclose()
-                if not proxy:
-                    raise
-                if self._is_proxy_network_failure(exc):
-                    network_failures += 1
-                proxy = self._rotate_after_failure(
-                    alias, proxy, exc, network_failures)
-                if proxy is None:
-                    raise
-            except BaseException:
-                await stack.aclose()
-                raise
+        """Open a Codex relay stream through the account's fixed exit."""
+        proxy = self.pool.for_account(alias)
+        stack = AsyncExitStack()
+        try:
+            account_generation = self.store.account_generation(alias)
+            response = await self.upstream.stream_responses(
+                alias, body, proxy_url(proxy) if proxy else None,
+                request_headers=request_headers,
+                session_id=session_id, account_id=account_id,
+                query_string=query_string, path=path)
+            response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
+            stack.push_async_callback(response.aclose)
+        except RelayError as exc:
+            await stack.aclose()
+            if proxy and self._is_proxy_network_failure(exc):
+                self.pool.fail(proxy, "proxy network failure")
+            raise
+        except BaseException:
+            await stack.aclose()
+            raise
+        # Unlike the Anthropic path, stream_responses *returns* upstream
+        # rejections so the Codex caller sees them verbatim. Clearing the
+        # node's failure counter on one of those would credit an exit that
+        # never served a request.
+        if response.status_code < 400:
+            self.pool.success(proxy)
+        return response, stack
 
     # --- usage accounting ---------------------------------------------------
 

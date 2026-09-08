@@ -1,4 +1,4 @@
-"""Sticky account-to-node proxy pool over a manually curated node list.
+"""Fixed account-to-node proxy pool over a manually curated node list.
 
 Nodes are added by an operator (one at a time or pasted in bulk) rather than
 pulled from a subscription, and the relay dials them directly. There is no
@@ -8,18 +8,20 @@ list that changed under us, a second process to keep alive, and a whole
 protocol to speak. Dialing HTTP(S)/SOCKS5 ourselves gives the same per-account
 isolation — each account is pinned to its own node — with none of that.
 
-Each account stays pinned to one node and rotates after a proxy network
-failure or an upstream refusal tied to that exit's network region.
+An account keeps the node it was bound to, for good: a node is picked once,
+when the account has none, and nothing moves it afterwards. Failures used to
+rotate the account to another exit, which meant one flaky proxy silently
+changed an account's upstream IP — exactly the kind of correlation between
+accounts that gets them flagged. A broken node now fails its own accounts'
+requests until an operator fixes the node or rebinds the account by hand.
 """
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import sqlite3
 import time
-from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Optional
+from typing import Any, Optional
 
 from ..errors import RelayError
 from ..config import Settings
@@ -27,11 +29,6 @@ from ..store import Store
 from ..validate import alias_value
 from .parse import proxy_identity, proxy_url
 
-# How long an account remembers "this exit's region is refused for me". Whether
-# a region is served depends on the account's upstream tier (plus accounts keep
-# working through exits that shared-tier accounts are refused from), so the
-# memory is per account and must never count against the node globally.
-REGION_REFUSAL_TTL = 1800.0
 # Where a node test dials. Plain HTTP with an empty 204 body: no TLS handshake
 # to confuse a proxy failure with a certificate one, and nothing to download.
 TEST_URL = "http://www.gstatic.com/generate_204"
@@ -42,17 +39,11 @@ class ProxyPool:
     def __init__(self, store: Store, settings: Settings) -> None:
         self.store = store
         self.settings = settings
-        self.lock = asyncio.Lock()
         self.configs = store.proxy_configs()
-        # alias -> node_id -> expiry epoch of a per-account region refusal.
-        self._region_refused: dict[str, dict[str, float]] = {}
 
     @property
     def configured(self) -> bool:
         return bool(self.configs)
-
-    async def aclose(self) -> None:
-        return None
 
     # --- node management ------------------------------------------------------
 
@@ -106,15 +97,13 @@ class ProxyPool:
         self.store.save_proxy_configs(merged)
         self.store.prune_proxies(keep=set(merged))
         self.configs = merged
-        for entries in self._region_refused.values():
-            entries.pop(proxy_id, None)
 
     async def test(self, proxy_id: str) -> dict[str, Any]:
         """Dial TEST_URL through one node and record the verdict.
 
-        A success clears the node's failure count, which is what puts a node
-        an operator has fixed back into rotation; a failure records the reason
-        so the panel can show it.
+        A success clears the node's failure count, which is how an operator
+        puts a repaired node back into new assignments; a failure records the
+        reason so the panel can show it.
         """
         import httpx
 
@@ -146,52 +135,18 @@ class ProxyPool:
         config = self.configs.get(str(row["proxy_id"]))
         return dict(config) if isinstance(config, dict) else None
 
-    def _refused_ids(self, alias: str) -> set[str]:
-        """Node ids this account was region-refused from, pruned by TTL."""
-        entries = self._region_refused.get(alias)
-        if not entries:
-            return set()
-        now = time.time()
-        live = {node_id: until for node_id, until in entries.items() if until > now}
-        if live:
-            self._region_refused[alias] = live
-        else:
-            self._region_refused.pop(alias, None)
-        return set(live)
+    def _select(self, alias: str) -> dict[str, Any]:
+        """Pick the node for an account that has none yet.
 
-    def clear_region_refusals(self, alias: str) -> None:
-        """Forget exit-region refusals attached to an account identity.
-
-        A login uses this so prospective credentials get a fresh region probe
-        instead of inheriting the previous identity's refusals.
+        Only ever called for an unbound account: once an account has a node it
+        keeps it, so this is a one-time assignment rather than a scheduling
+        decision. Least-loaded first, then a stable hash, so a fresh pool
+        spreads accounts over exits instead of stacking them on one.
         """
-        alias = alias_value(alias)
-        self._region_refused.pop(alias, None)
-
-    def forget_account(self, alias: str) -> None:
-        """Drop all proxy-pool state owned by an account that was removed."""
-        self.clear_region_refusals(alias_value(alias))
-
-    def _select(self, alias: str, exclude: Optional[str] = None) -> dict[str, Any]:
-        refused = self._refused_ids(alias)
-        available = [row for row in self.store.proxy_rows(active_only=True)
-                     if int(row["failure_count"]) == 0
-                     and self._config_for_row(row)]
-        rows = [row for row in available
-                if str(row["proxy_id"]) != (exclude or "")
-                and str(row["proxy_id"]) not in refused]
+        rows = [row for row in self.store.proxy_rows(active_only=True)
+                if int(row["failure_count"]) == 0
+                and self._config_for_row(row)]
         if not rows:
-            available_ids = {str(row["proxy_id"]) for row in available}
-            # A previous request may already have swept every usable exit for
-            # this account. Preserve the account-scoped marker so the next
-            # model request can cool this account and fail over without
-            # another upstream call. Do not attach it when the pool is
-            # genuinely empty/dead, or when `exclude` removed a node after a
-            # network failure.
-            if exclude is None and available_ids and available_ids <= refused:
-                raise RelayError("the upstream refuses every available exit region "
-                                 "for this account; retry later", 503,
-                                 {"region_refused_everywhere": True})
             raise RelayError("proxy pool has no available node for this account", 503)
         counts = self.store.proxy_assignment_counts()
         rows.sort(key=lambda row: (counts.get(str(row["proxy_id"]), 0),
@@ -201,7 +156,7 @@ class ProxyPool:
             raise RelayError("proxy pool node configuration is missing", 500)
         return config
 
-    async def pending_proxy(self, alias: str) -> Optional[dict[str, Any]]:
+    def pending_proxy(self, alias: str) -> Optional[dict[str, Any]]:
         """Pick (without persisting) the node a not-yet-saved account would use."""
         if not self.configured:
             return None
@@ -213,59 +168,31 @@ class ProxyPool:
         config = self.configs.get(str(proxy_id))
         return dict(config) if isinstance(config, dict) else None
 
-    async def for_account(self, alias: str) -> Optional[dict[str, Any]]:
+    def for_account(self, alias: str) -> Optional[dict[str, Any]]:
         alias = alias_value(alias)
         if not self.configured:
             return None
         row = self.store.row(alias)
         current_id = str(row["proxy_id"] or "")
-        if current_id and current_id in self._refused_ids(alias):
-            current_id = ""
         if current_id:
-            proxy_row = next((item for item in self.store.proxy_rows(active_only=True)
-                              if str(item["proxy_id"]) == current_id
-                              and int(item["failure_count"]) == 0), None)
-            if proxy_row is not None:
-                config = self._config_for_row(proxy_row)
-                if config:
-                    return config
+            # The binding is honoured even when the node is failing or
+            # deactivated. Handing back a different exit here is the silent
+            # IP change this pool exists to prevent; a broken node is the
+            # operator's to fix (or to rebind the account away from).
+            config = self.configs.get(current_id)
+            if isinstance(config, dict):
+                return dict(config)
         config = self._select(alias)
         self.store.set_account_proxy(alias, str(config["id"]))
         return config
 
-    def rotate(self, alias: str, failed: dict[str, Any], reason: str) -> Optional[dict[str, Any]]:
-        alias = alias_value(alias)
-        self.fail(alias, failed, reason)
-        if not self.configured:
-            return None
-        config = self._select(alias, exclude=str(failed["id"]))
-        self.store.set_account_proxy(alias, str(config["id"]))
-        return config
+    def fail(self, failed: dict[str, Any], reason: str) -> None:
+        """Record that a node could not carry a request.
 
-    def mark_region_refused(self, alias: str, refused: dict[str, Any]) -> None:
-        """The upstream refused this account from this exit's region. A property
-        of the (account, region) pair — other accounts may keep working through
-        the same node — so remember it per account and leave the node's global
-        health untouched."""
-        alias = alias_value(alias)
-        self._region_refused.setdefault(alias, {})[str(refused["id"])] = \
-            time.time() + REGION_REFUSAL_TTL
-        self.store.set_account_proxy(alias, None)
-
-    def rotate_region(self, alias: str, refused: dict[str, Any]) -> dict[str, Any]:
-        """Move the account to an exit it has not been region-refused from yet.
-        Raises 503 once every exit has refused it."""
-        alias = alias_value(alias)
-        self.mark_region_refused(alias, refused)
-        config = self._select(alias)
-        self.store.set_account_proxy(alias, str(config["id"]))
-        return config
-
-    def fail(self, alias: str, failed: dict[str, Any], reason: str) -> None:
-        """Record an unusable exit and remove the account's sticky binding."""
-        alias = alias_value(alias)
+        The count marks the node in the panel and keeps it out of *new*
+        assignments; accounts already bound to it stay bound.
+        """
         self.store.mark_proxy_failure(str(failed["id"]), reason)
-        self.store.set_account_proxy(alias, None)
 
     def success(self, proxy: Optional[dict[str, Any]]) -> None:
         if proxy:
@@ -274,17 +201,6 @@ class ProxyPool:
     def active_count(self) -> int:
         return sum(1 for row in self.store.proxy_rows(active_only=True)
                    if int(row["failure_count"]) == 0)
-
-    # --- routing ----------------------------------------------------------------
-
-    @asynccontextmanager
-    async def route(self, alias: str,
-                    proxy: Optional[dict[str, Any]]) -> AsyncIterator[Optional[str]]:
-        """Yield the proxy URL requests for this account must use right now."""
-        if proxy is None:
-            yield None
-            return
-        yield proxy_url(proxy)
 
     # --- reporting -----------------------------------------------------------
 
