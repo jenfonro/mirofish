@@ -245,6 +245,8 @@ ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是
 | `MIROFISH_MIRASIM_SEAL_METADATA` | `1` | 是否封装模型请求的 relay 元数据 |
 | `MIROFISH_PROXY_FAILURE_THRESHOLD` | `2` | 节点连续拨号失败多少次后停用 |
 | `MIROFISH_SESSION_TTL` | `1800` | 会话亲和有效期，单位为秒 |
+| `MIROFISH_QUOTA_CEILING` | `0.90` | 窗口用到该比例后不再被自动调度选中（0.10–1.0） |
+| `MIROFISH_LIMITS_TTL` | `600` | 额度缓存有效期，单位为秒；遇 429 立即强制刷新 |
 | `MIROFISH_KEEPALIVE_EXPIRY` | `75` | 上游 HTTP/1.1 空闲连接保留秒数 |
 | `MIROFISH_MAX_CONNECTIONS` | `100` | 上游连接池总连接上限 |
 | `MIROFISH_MAX_KEEPALIVE_CONNECTIONS` | `20` | 上游空闲连接上限 |

@@ -12,8 +12,8 @@ import time
 
 import pytest
 
-from mirofish.api.state import (LIMITS_TTL_SECONDS, MAX_QUOTA_COOLDOWN,
-                                QUOTA_EXHAUSTED, SHARED_QUOTA_COOLDOWN,
+from mirofish.api.state import (MAX_QUOTA_COOLDOWN, QUOTA_EXHAUSTED,
+                                SHARED_QUOTA_COOLDOWN,
                                 TRANSIENT_429_COOLDOWN, URGENCY_HORIZON_HOURS)
 from mirofish.errors import RelayError
 
@@ -81,36 +81,30 @@ def test_a_fable_request_skips_an_exhausted_fable_window(state):
 
 
 def test_an_expiring_account_is_spent_to_the_last(state):
-    """99% of an expiring window is still credit that would be thrown away.
-
-    No soft ceiling holds it back: it keeps taking conversations until the
-    window is genuinely gone. The cost of reading a stale 99% is at most a
-    couple of 429s, and a 429 now cools the account for exactly the window it
-    named — so nothing keeps hammering it afterwards.
-    """
-    with_windows(state, "nearly-spent", resets_in_hours=2, seven_day=0.99)
+    """Credit on an expiring window is thrown away at the reset, so it is spent
+    first — right up to the ceiling, which is as far as selection ever goes."""
+    with_windows(state, "nearly-spent", resets_in_hours=2, seven_day=0.89)
     with_windows(state, "has-room", resets_in_hours=140, seven_day=0.10)
 
     assert route(state) == "nearly-spent"
     assert state._quota_ok("nearly-spent", "claude-opus-5")
 
 
-def test_an_account_is_used_until_its_window_is_actually_spent(state):
-    """There is no configurable soft ceiling to reserve headroom.
-
-    An expiring account keeps taking conversations at 90% — that is the credit
-    this ordering exists to spend — and only leaves the rotation once the
-    window is genuinely gone.
-    """
-    with_windows(state, "at-90", resets_in_hours=2, seven_day=0.90)
+def test_selection_stops_at_the_configured_ceiling(state):
+    """The ceiling is where automatic selection stops, short of the upstream's
+    own refusal: it is repeated refusals that get accounts suspended, so the
+    default deliberately leaves the last tenth of a window unspent."""
+    assert state.settings.quota_ceiling == 0.90
+    with_windows(state, "at-ceiling", resets_in_hours=2, seven_day=0.90)
     with_windows(state, "has-room", resets_in_hours=140, seven_day=0.10)
 
-    assert route(state) == "at-90"
-    assert state._quota_ok("at-90", "claude-opus-5")
+    assert not state._quota_ok("at-ceiling", "claude-opus-5")
+    assert route(state) == "has-room"
 
-    with_windows(state, "spent", resets_in_hours=2, seven_day=1.0)
-    assert not state._quota_ok("spent", "claude-opus-5")
-    assert QUOTA_EXHAUSTED == 0.999
+    # Raising it puts that credit back in play without touching the code.
+    state.settings.quota_ceiling = 1.0
+    assert state._quota_ok("at-ceiling", "claude-opus-5")
+    assert route(state, session="after-raise") == "at-ceiling"
 
 
 def test_an_exhausted_fable_window_is_skipped_for_fable_traffic(state):
@@ -705,7 +699,8 @@ async def test_a_fresh_cache_is_not_re_read(state):
 async def test_a_stale_cache_is_re_read_once(state):
     add_account(state, "work")
     state.store.merge_metadata("work", _limits(
-        [_window("7d", 0.1, 24 * 7)], time.time() - LIMITS_TTL_SECONDS - 1))
+        [_window("7d", 0.1, 24 * 7)],
+        time.time() - state.settings.limits_ttl - 1))
     calls = []
 
     async def fake_fetch(alias, proxy_url=None):
@@ -716,6 +711,32 @@ async def test_a_stale_cache_is_re_read_once(state):
     await state.refresh_limits_if_stale("work")
 
     assert calls == ["work"]
+
+
+async def test_the_limits_cache_lifetime_is_configurable(state):
+    """One read per account per TTL, and the TTL is a setting.
+
+    Default 10 minutes: long enough that a busy account is not re-read per
+    request, short enough that a raised or reset window is picked up without
+    spending an upstream refusal to discover it.
+    """
+    assert state.settings.limits_ttl == 600.0
+    add_account(state, "work")
+    state.store.merge_metadata("work", _limits(
+        [_window("7d", 0.1, 24 * 7)], time.time() - 300))
+    calls = []
+
+    async def fake_fetch(alias, proxy_url=None):
+        calls.append(alias)
+
+    state.accounts.fetch_limits = fake_fetch
+
+    await state.refresh_limits_if_stale("work")
+    assert calls == []                      # 5 min old, still fresh
+
+    state.settings.limits_ttl = 120.0
+    await state.refresh_limits_if_stale("work")
+    assert calls == ["work"]                # same cache, shorter TTL
 
 
 async def test_a_quota_refusal_forces_a_re_read(state):
@@ -769,14 +790,14 @@ async def test_a_failed_refresh_never_breaks_the_request(state):
 
 
 def test_a_stale_99_percent_costs_at_most_one_refusal(state):
-    """Why no soft ceiling is needed to absorb the cache lag.
+    """A cache that lags the upstream costs a bounded number of refusals.
 
-    A cached 99% may already be spent upstream, so the account is elected and
-    refused once. That refusal names its window, cools the account for exactly
-    that long, and nothing probes during the cooldown — so the cost is bounded
-    at a request or two, not a stream of them.
+    Even under the ceiling a cached number may already be spent upstream, so
+    the account is elected and refused once. That refusal names its window,
+    cools the account for exactly that long, and nothing probes during the
+    cooldown — so the cost is a request or two, not a stream of them.
     """
-    with_windows(state, "stale", resets_in_hours=2, seven_day=0.99)
+    with_windows(state, "stale", resets_in_hours=2, seven_day=0.89)
     with_windows(state, "spare", resets_in_hours=140, seven_day=0.10)
     assert route(state) == "stale"
 

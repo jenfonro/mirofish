@@ -31,11 +31,10 @@ from ..vault import make_credential_store
 logger = logging.getLogger("mirofish.state")
 
 LOGIN_TTL_SECONDS = 600.0
-# A window at or above this is spent, and automatic selection skips the
-# account for the models that draw on it. There is no configurable soft
-# ceiling below it: an account is used until its window is actually gone, at
-# which point the upstream refuses it and the cooldown takes over. Reserving
-# headroom would only leave credit unspent at the reset.
+# Hard end of a window: at or above this the upstream has nothing left to give,
+# whatever the configured ceiling says. `Settings.quota_ceiling` (default 0.90)
+# is the point automatic selection stops at, and it is what the checks below
+# actually compare against; this constant is the ceiling's own upper bound.
 QUOTA_EXHAUSTED = 0.999
 # Fallback cooldown for a spent window whose reset time we cannot read. The
 # refusal holds until the window resets, so re-probing every 10 minutes is
@@ -125,13 +124,12 @@ RESET_BAND_HOURS = 1.0
 # an upstream round-trip in front of every new conversation. The probe costs
 # no model tokens, and stale numbers only ever cost one extra attempt, since
 # the upstream 429 plus failover is what actually stops a request.
-#
-# How long a cached window is trusted. Nothing polls: the numbers are refreshed
-# for the one account a request elects, and only when they are older than this.
-# An idle relay therefore makes no upstream calls at all — a 5-minute sweep
-# across every account was ~16k calls a day with nobody using it, which is
-# both pointless and the kind of traffic that draws rate-limit attention.
-LIMITS_TTL_SECONDS = 3600.0
+# How long a cached window is trusted is `Settings.limits_ttl`. Nothing polls:
+# the numbers are refreshed for the one account a request elects, and only when
+# they are older than that. An idle relay therefore makes no upstream calls at
+# all — a 5-minute sweep across every account was ~16k calls a day with nobody
+# using it, which is both pointless and the kind of traffic that draws
+# rate-limit attention.
 # Subscription profiles (plan tier, expiry, holder name) change on the scale
 # of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
 # an account whose stored profile is missing (pre-upgrade rows) or a day old.
@@ -279,7 +277,7 @@ class AppState:
         """Whether this account's cached windows are older than the TTL."""
         fetched = (self._windows_envelope(alias) or {}).get("fetched_epoch")
         try:
-            return time.time() - float(fetched) >= LIMITS_TTL_SECONDS
+            return time.time() - float(fetched) >= self.settings.limits_ttl
         except (TypeError, ValueError):
             return True  # never probed, or unreadable: read it once
 
@@ -428,7 +426,8 @@ class AppState:
         refreshes it. No usable data means the account is assumed to have
         room; the upstream 429 stays the final authority either way.
         """
-        if self._load(alias, model) >= QUOTA_EXHAUSTED:
+        ceiling = self.settings.quota_ceiling
+        if self._load(alias, model) >= ceiling:
             return False
         try:
             quota = json.loads(self.store.row(alias)["metadata_json"]).get("quota", {})
@@ -438,7 +437,7 @@ class AppState:
             reset = quota.get("7d_reset_epoch")
             if reset is not None and float(reset) <= time.time():
                 return True  # that window has since reset; the number is history
-            return float(utilization) < QUOTA_EXHAUSTED
+            return float(utilization) < ceiling
         except (RelayError, ValueError, TypeError, json.JSONDecodeError):
             return True
 
@@ -667,7 +666,7 @@ class AppState:
 
     def _last_resort(self, serviceable: list[str],
                      model: Optional[str]) -> list[str]:
-        """What to do when no account is under the exhaustion mark.
+        """What to do when no account is under the ceiling.
 
         Serving anyway is right when the numbers are merely stale or missing —
         the upstream stays the final authority. It is wrong when the cache
@@ -675,6 +674,11 @@ class AppState:
         cannot succeed, and sending it costs one upstream refusal per attempt.
         Repeating that is what suspends an account for a day, and with 76
         accounts over their fable budget it meant 76 refusals an hour forever.
+
+        The test here is `QUOTA_EXHAUSTED`, not the ceiling: a ceiling of 0.90
+        holds back accounts that still have a tenth of their window, and those
+        requests must still be served — refusing them locally would turn
+        deliberate headroom into an outage.
         """
         if all(self._load(alias, model) >= QUOTA_EXHAUSTED
                for alias in serviceable):
@@ -1020,7 +1024,7 @@ class AppState:
             # A known deadline is used in full. Capping it meant a 7-day window
             # was re-probed every hour for days, spending one refusal per
             # account each time; an elected account re-reads its window once
-            # per LIMITS_TTL_SECONDS, so an early reset is noticed there
+            # per `Settings.limits_ttl`, so an early reset is noticed there
             # instead.
             return max(SHARED_QUOTA_COOLDOWN, remaining)
         return MAX_QUOTA_COOLDOWN

@@ -13,12 +13,17 @@ from dataclasses import dataclass, field
 from .seal import DEFAULT_SEAL_PUBLIC_KEY
 
 
-def _env_float(name: str, default: float, minimum: float | None = None) -> float:
+def _env_float(name: str, default: float, minimum: float | None = None,
+               maximum: float | None = None) -> float:
     try:
         value = float(os.environ.get(name, "") or default)
     except ValueError:
         value = default
-    return max(minimum, value) if minimum is not None else value
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
 
 
 def _env_int(name: str, default: int, minimum: int | None = None) -> int:
@@ -89,6 +94,17 @@ class Settings:
     in_docker: bool = False
     default_account: str = ""
     session_ttl: float = 1800.0
+    # Fraction of a usage window at which automatic selection stops electing
+    # the account for models that draw on it. Below 1.0 this deliberately
+    # leaves credit unspent: the point is to stop short of the upstream's own
+    # refusal rather than to discover the limit by being refused, because it is
+    # repeated refusals that get accounts suspended. Raise it once the traffic
+    # is known to behave.
+    quota_ceiling: float = 0.90
+    # How long a cached /v1/limits read stays usable. Nothing polls; the
+    # account that just served a request re-reads its windows when its cache is
+    # older than this, and a 429 forces a read regardless.
+    limits_ttl: float = 600.0
 
     # Consecutive failures before a node leaves the rotation. Nodes are added
     # by an operator now, so there is no subscription to refetch and no
@@ -152,6 +168,11 @@ class Settings:
             max_body_bytes=_env_int(
                 "MIROFISH_MAX_BODY_BYTES", 8 * 1024 * 1024, minimum=1024),
             proxy_failure_threshold=_env_int("MIROFISH_PROXY_FAILURE_THRESHOLD", 2, minimum=1),
+            # 1.0 = use the window until the upstream itself refuses. Values
+            # above that would only invent headroom the upstream will not grant.
+            quota_ceiling=_env_float("MIROFISH_QUOTA_CEILING", 0.90,
+                                     minimum=0.10, maximum=1.0),
+            limits_ttl=_env_float("MIROFISH_LIMITS_TTL", 600.0, minimum=60.0),
         )
         settings.max_keepalive_connections = min(
             settings.max_keepalive_connections, settings.max_connections)
