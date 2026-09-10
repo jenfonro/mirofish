@@ -17,6 +17,7 @@ def create_app(state: AppState) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         state.start_limits_refresh()
+        state.behavior.start()
         yield
         await state.aclose()
 

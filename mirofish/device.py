@@ -1,11 +1,13 @@
-"""Mirasim relay installation identity and request signatures.
+"""Mirasim relay per-account device identity and request signatures.
 
 The model relay accepts an account bearer token for control-plane calls, but
 model traffic normally uses a short-lived device ticket and an Ed25519
 signature over the exact request body.  The official desktop keeps one device
-key per installation, not one per signed-in account.  This module mirrors that
-boundary and migrates one legacy per-account key when upgrading an existing
-relay installation.
+key per installation; mirofish keeps one key **per account** so upstream
+fingerprints do not collapse a multi-account install into a single device.
+Machine-level fields (arch/os, stainless versions, locale) stay
+installation-wide.  Each account's key is created lazily on first use and
+persisted in the encrypted vault.
 """
 
 from __future__ import annotations
@@ -26,7 +28,6 @@ from .errors import RelayError
 from .store import Store
 
 DEVICE_KEY_KIND = "device_private_key"
-DEVICE_KEY_ALIAS = "mirasim-installation"
 
 # 0.0.272 introduced the relay's versioned signing envelope.  Keep the old
 # name exported as well: installations pinned to an older relay build can
@@ -139,13 +140,18 @@ def signing_record(
 
 
 class DeviceSigner:
-    """Load or create the installation's persistent Ed25519 identity."""
+    """Load or create one account's persistent Ed25519 identity."""
 
     def __init__(self, store: Store, client_version: str,
-                 legacy_aliases: Sequence[str] = ()) -> None:
+                 alias: str | Sequence[str] = "") -> None:
         self.store = store
         self.client_version = client_version
-        self.legacy_aliases = tuple(dict.fromkeys(legacy_aliases))
+        if isinstance(alias, (list, tuple)):
+            # Accept a one-element sequence for callers that pass alias lists.
+            alias = alias[0] if alias else ""
+        if not alias:
+            raise RelayError("device identity requires an account alias", 500)
+        self.alias = alias
         self._private_key: Ed25519PrivateKey | None = None
         self._device_id: str | None = None
         self._public_key: str | None = None
@@ -154,7 +160,7 @@ class DeviceSigner:
     def set_client_version(self, client_version: str) -> None:
         """Update the protocol marker used by subsequently signed requests.
 
-        The Ed25519 identity remains installation-wide; only the advertised
+        The Ed25519 identity stays bound to this account; only the advertised
         client build changes when an operator switches between a legacy relay
         profile and the current one.
         """
@@ -181,46 +187,23 @@ class DeviceSigner:
             raise RelayError("stored Mirasim device key is not Ed25519", 500)
         return key
 
-    def _legacy_key(self) -> tuple[str, Ed25519PrivateKey] | None:
-        """Find a valid old per-account key to preserve the existing device id."""
-        aliases = tuple(dict.fromkeys((*self.legacy_aliases, *self.store.aliases())))
-        for alias in aliases:
-            try:
-                pem = self.store.vault.get(alias, DEVICE_KEY_KIND)
-            except RelayError as exc:
-                if self._is_missing(exc):
-                    continue
-                raise
-            try:
-                return pem, self._decode_private_key(pem)
-            except RelayError:
-                # One damaged legacy account must not prevent migration from a
-                # second valid account.  The global slot, once written, remains
-                # fail-closed and is never silently replaced.
-                continue
-        return None
-
     def _load_or_create(self) -> Ed25519PrivateKey:
         with self._lock:
             if self._private_key is not None:
                 return self._private_key
             try:
-                pem = self.store.vault.get(DEVICE_KEY_ALIAS, DEVICE_KEY_KIND)
+                pem = self.store.vault.get(self.alias, DEVICE_KEY_KIND)
                 key = self._decode_private_key(pem)
             except RelayError as exc:
                 if not self._is_missing(exc):
                     raise
-                migrated = self._legacy_key()
-                if migrated is None:
-                    key = Ed25519PrivateKey.generate()
-                    pem = key.private_bytes(
-                        encoding=serialization.Encoding.PEM,
-                        format=serialization.PrivateFormat.PKCS8,
-                        encryption_algorithm=serialization.NoEncryption(),
-                    ).decode("ascii")
-                else:
-                    pem, key = migrated
-                self.store.vault.put(DEVICE_KEY_ALIAS, DEVICE_KEY_KIND, pem)
+                key = Ed25519PrivateKey.generate()
+                pem = key.private_bytes(
+                    encoding=serialization.Encoding.PEM,
+                    format=serialization.PrivateFormat.PKCS8,
+                    encryption_algorithm=serialization.NoEncryption(),
+                ).decode("ascii")
+                self.store.vault.put(self.alias, DEVICE_KEY_KIND, pem)
             self._private_key = key
             return key
 

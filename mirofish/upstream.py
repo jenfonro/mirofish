@@ -1,6 +1,6 @@
 """Async upstream HTTP layer: auth endpoints, token refresh, model relay.
 
-- One httpx.AsyncClient per proxy URL (connection pooling per exit).
+- One httpx.AsyncClient per (alias, proxy URL, route identity) (connection pooling per account and exit).
 - Token refresh is single-flight per alias so concurrent 401s do not stampede
   the refresh endpoint or clobber each other's rotated refresh token.
 - /v1/messages and Codex /v1/responses support true streaming: successful
@@ -33,10 +33,11 @@ DEVICE_SESSION_PATH = "/v1/device/session"
 MESSAGES_PATH = "/v1/messages"
 COUNT_TOKENS_PATH = "/v1/messages/count_tokens"
 RESPONSES_PATH = "/v1/responses"
+RESPONSES_COMPACT_PATH = "/v1/responses/compact"
 ALPHA_SEARCH_PATH = "/v1/alpha/search"
 LIMITS_PATH = "/v1/limits"
 #: Upstream endpoints the Codex agent reaches through the transparent MITM path.
-CODEX_PATHS = (RESPONSES_PATH, ALPHA_SEARCH_PATH)
+CODEX_PATHS = (RESPONSES_PATH, RESPONSES_COMPACT_PATH, ALPHA_SEARCH_PATH)
 
 
 def _is_model_request_path(path: str) -> bool:
@@ -849,7 +850,7 @@ class Upstream:
     def __init__(self, settings: Settings, store: Store) -> None:
         self.settings = settings
         self.store = store
-        self._clients: dict[tuple[str, str], httpx.AsyncClient] = {}
+        self._clients: dict[tuple[str, str, str], Any] = {}
         self._clients_lock = asyncio.Lock()
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._ticket_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -866,7 +867,7 @@ class Upstream:
         # ``__cf_bm``).  One jar per (account, exit) mirrors one desktop
         # install per account; Node's fetch on the Claude path keeps none.
         self._cookie_jars: dict[tuple[str, str], httpx.Cookies] = {}
-        self._device_signer: DeviceSigner | None = None
+        self._device_signers: dict[str, DeviceSigner] = {}
         # Monotonic per-alias epoch. In-flight ticket/refresh work may finish
         # after a re-login or deletion; only results from the current epoch may
         # write account-bound caches or credentials.
@@ -893,27 +894,56 @@ class Upstream:
             return "", ""
         return str(proxy_url), str(getattr(proxy_url, "route_identity", ""))
 
-    async def client(self, proxy_url: Optional[str]) -> httpx.AsyncClient:
-        transport_url, route_identity = self._proxy_route(proxy_url)
-        key = (transport_url, route_identity)
+    async def client(self, proxy_url: Optional[str],
+                     alias: str = "") -> Any:
+        """Return the pooled HTTP client for this (alias, exit) pair.
+
+        When ``Settings.tls_impersonate`` is set, the client is a
+        curl-impersonate session so the ClientHello is Chromium/BoringSSL
+        shaped; the account's Mihomo exit still applies as the CONNECT proxy.
+        Otherwise this is httpx + OpenSSL. ``MIROFISH_TLS_PROXY`` remains the
+        fallback outer proxy when no per-account exit is assigned.
+        """
+        # Per-account proxy takes precedence; tls_proxy is only the direct-path
+        # fallback. Impersonation rides *alongside* either of them.
+        effective_proxy = proxy_url or (getattr(self.settings, "tls_proxy", "") or None)
+        transport_url, route_identity = self._proxy_route(effective_proxy)
+        # The account alias is part of the pool identity: two accounts pinned
+        # to the same exit must never share a keep-alive connection, because a
+        # reused HTTP/1.1 connection or TLS session would carry one account's
+        # request over a tunnel the other account opened.
+        key = (alias, transport_url, route_identity)
         async with self._clients_lock:
             client = self._clients.get(key)
             if client is None:
                 install_profile_header_order()
-                client = httpx.AsyncClient(
-                    proxy=transport_url or None, trust_env=False,
-                    verify=tls_context(),
-                    http2=False,
-                    follow_redirects=False,
-                    timeout=httpx.Timeout(self.settings.timeout, connect=10.0, pool=30.0),
-                    limits=httpx.Limits(
-                        max_connections=getattr(self.settings, "max_connections", 100),
-                        max_keepalive_connections=getattr(
-                            self.settings, "max_keepalive_connections", 20),
-                        keepalive_expiry=getattr(
-                            self.settings, "keepalive_expiry", 75.0),
-                    ),
-                )
+                impersonate = getattr(self.settings, "tls_impersonate", "") or ""
+                if impersonate:
+                    from .tls_impersonate import ImpersonatingClient, impersonation_available
+                    if not impersonation_available():
+                        raise RelayError(
+                            "MIROFISH_TLS_IMPERSONATE is set but curl_cffi is not "
+                            "installed; install the tls-impersonate extra", 500)
+                    client = ImpersonatingClient(
+                        impersonate,
+                        transport_url or None,
+                        float(getattr(self.settings, "timeout", 30.0)),
+                    )
+                else:
+                    client = httpx.AsyncClient(
+                        proxy=transport_url or None, trust_env=False,
+                        verify=tls_context(),
+                        http2=False,
+                        follow_redirects=False,
+                        timeout=httpx.Timeout(self.settings.timeout, connect=10.0, pool=30.0),
+                        limits=httpx.Limits(
+                            max_connections=getattr(self.settings, "max_connections", 100),
+                            max_keepalive_connections=getattr(
+                                self.settings, "max_keepalive_connections", 20),
+                            keepalive_expiry=getattr(
+                                self.settings, "keepalive_expiry", 75.0),
+                        ),
+                    )
                 self._clients[key] = client
             return client
 
@@ -921,7 +951,8 @@ class Upstream:
             self, method: str, url: str,
             headers: Sequence[tuple[str, str]], body: bytes = b"",
             proxy_url: Optional[str] = None, *, stream: bool = False,
-            timeout: Optional[httpx.Timeout] = None) -> httpx.Response:
+            timeout: Optional[httpx.Timeout] = None,
+            alias: str = "") -> httpx.Response:
         """Send one explicitly profiled request without AsyncClient defaults.
 
         Callers own the entire header list, including Host, Connection, and
@@ -932,7 +963,8 @@ class Upstream:
         The sequence is also the wire order: ``mirofish.wire`` replaces h11's
         Host-first writer so ``Host`` and ``Connection`` go out last, where the
         official clients (and every capture-derived golden profile) put them.
-        TLS remains OpenSSL's; see ``tls_context``.
+        TLS is OpenSSL by default; set ``MIROFISH_TLS_IMPERSONATE`` for a
+        Chromium-shaped ClientHello (see ``tls_impersonate``).
         """
         request = httpx.Request(
             method,
@@ -941,7 +973,7 @@ class Upstream:
             headers=headers,
             extensions={"timeout": timeout.as_dict()} if timeout else {},
         )
-        client = await self.client(proxy_url)
+        client = await self.client(proxy_url, alias)
         return await client.send(request, stream=stream)
 
     # --- generic JSON calls -------------------------------------------------
@@ -949,7 +981,8 @@ class Upstream:
     async def json(self, method: str, base: str, path: str,
                    payload: Optional[dict[str, Any]] = None,
                    access: Optional[str] = None,
-                   proxy_url: Optional[str] = None) -> tuple[int, dict[str, str], Any]:
+                   proxy_url: Optional[str] = None,
+                   alias: str = "") -> tuple[int, dict[str, str], Any]:
         body = _json_bytes(payload)
         url = base.rstrip("/") + path
         headers: list[tuple[str, str]] = []
@@ -972,7 +1005,7 @@ class Upstream:
         headers.extend(_wire_tail(url, body))
         try:
             response = await self.send_explicit(
-                method, url, headers, body, proxy_url)
+                method, url, headers, body, proxy_url, alias=alias)
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
                              {"proxy_network": bool(proxy_url),
@@ -1008,22 +1041,29 @@ class Upstream:
         return lock
 
     def _signer(self, alias: str = "") -> DeviceSigner:
-        """Return the installation signer; ``alias`` is only a migration hint."""
-        if self._device_signer is None:
-            legacy = (alias,) if alias else ()
-            self._device_signer = DeviceSigner(
-                self.store, self.settings.mirasim_client_version, legacy)
+        """Return the device signer for ``alias``, creating it on first use."""
+        if not alias:
+            raise RelayError("device identity requires an account alias", 500)
+        signer = self._device_signers.get(alias)
+        if signer is None:
+            signer = DeviceSigner(
+                self.store, self.settings.mirasim_client_version, alias)
+            self._device_signers[alias] = signer
         else:
             # Settings are mutable in the test harness and in long-lived
             # deployments that rotate the upstream client profile without
-            # restarting the process.  The signer is installation-wide, but
-            # its version marker is per active protocol profile.
-            self._device_signer.set_client_version(
-                self.settings.mirasim_client_version)
-        return self._device_signer
+            # restarting the process.  The identity is per-account, but
+            # its version marker follows the active protocol profile.
+            signer.set_client_version(self.settings.mirasim_client_version)
+        return signer
+
+    def reset_device_identity(self, alias: str) -> None:
+        """Drop ``alias``'s cached device identity and its ticket caches."""
+        self._device_signers.pop(alias, None)
+        self._invalidate_ticket(alias)
 
     def ensure_device_identity(self, legacy_alias: str = "") -> str:
-        """Persist/migrate the installation key before account data is removed."""
+        """Persist the account's device key before account data is removed."""
         return self._signer(legacy_alias).device_id
 
     def _advance_credentials(self, alias: str, *, clear_device: bool) -> None:
@@ -1167,7 +1207,7 @@ class Upstream:
             generation = self._credential_generations.get(alias, 0)
             status, _, data = await self.json(
                 "POST", self.settings.auth_base, "/auth/refresh",
-                {"refresh_token": refresh_token}, proxy_url=proxy_url)
+                {"refresh_token": refresh_token}, proxy_url=proxy_url, alias=alias)
             if status < 200 or status >= 300 or not isinstance(data, dict):
                 raise RelayError("account refresh failed", 401, data)
             access = data.get("access_token")
@@ -1195,11 +1235,11 @@ class Upstream:
         """JSON call with the account's token, refreshing once on 401."""
         access, _ = self.store.credentials(alias)
         status, headers, data = await self.json(method, base, path, payload,
-                                                access=access, proxy_url=proxy_url)
+                                                access=access, proxy_url=proxy_url, alias=alias)
         if status == 401:
             access = await self.refresh_access(alias, access, proxy_url)
             status, headers, data = await self.json(method, base, path, payload,
-                                                    access=access, proxy_url=proxy_url)
+                                                    access=access, proxy_url=proxy_url, alias=alias)
         return status, headers, data
 
     async def limits(
@@ -1259,7 +1299,7 @@ class Upstream:
         try:
             response = await self.send_explicit(
                 "POST", url, headers, body, proxy_url,
-                timeout=httpx.Timeout(TICKET_MINT_TIMEOUT_SECONDS))
+                timeout=httpx.Timeout(TICKET_MINT_TIMEOUT_SECONDS), alias=alias)
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
                              {"proxy_network": bool(proxy_url),
@@ -1504,7 +1544,7 @@ class Upstream:
                 )
             response = await self.send_explicit(
                 method, url, headers, body, proxy_url,
-                stream=stream, timeout=timeout)
+                stream=stream, timeout=timeout, alias=alias)
             response.extensions["mirofish_device_ticket"] = (
                 credential.value if credential.kind == "ticket" else "")
             response.extensions["mirofish_relay_credential"] = credential.value

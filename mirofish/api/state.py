@@ -16,6 +16,7 @@ from typing import Any, Awaitable, Callable, Mapping, Optional
 import httpx
 
 from ..accounts import AccountService
+from ..behavior import BehaviorReplayer
 from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool
@@ -85,6 +86,11 @@ LIMITS_REFRESH_SECONDS = 300.0
 # of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
 # an account whose stored profile is missing (pre-upgrade rows) or a day old.
 PROFILE_REFRESH_SECONDS = 86400.0
+# A parked account (upstream answered a real 401: revoked or banned
+# credentials) stays out of scheduling until a probe shows /auth/me accepting
+# it again. Re-probing is deliberately slow: a revocation lifts on
+# human/upstream timescales, and every probe costs an upstream round trip.
+PARK_PROBE_SECONDS = 1800.0
 # httpx response extension used to carry the account generation from request
 # start to stream finalization. This keeps an in-flight old-account response
 # from being logged under a newly re-used alias.
@@ -134,8 +140,10 @@ class AppState:
         self._exhausted_until: dict[str, float] = {}
         self._limits_task: Optional[asyncio.Task[None]] = None
         self._limits_wake: Optional[asyncio.Event] = None
+        self.behavior = BehaviorReplayer(self)
 
     async def aclose(self) -> None:
+        await self.behavior.aclose()
         await self.stop_limits_refresh()
         await self.upstream.aclose()
         await self.pool.aclose()
@@ -150,7 +158,8 @@ class AppState:
         probed keeps its previous values instead of dropping out of the
         ordering. Accounts switched off in the panel are skipped: they never
         take part in automatic selection, so keeping their windows warm would
-        contact the upstream for nothing.
+        contact the upstream for nothing. Parked accounts get no limits/profile
+        refresh either — only the low-frequency recovery probe below.
         """
         async def one(alias: str) -> None:
             try:
@@ -166,10 +175,65 @@ class AppState:
             except Exception as exc:  # noqa: BLE001 - profile is best-effort here
                 logger.debug("profile refresh failed: account=%s %s", alias, exc)
 
-        aliases = [alias for alias in self.store.aliases()
-                   if not self.account_disabled(alias)]
-        if aliases:
-            await asyncio.gather(*(one(alias) for alias in aliases))
+        serviceable, parked = [], []
+        for alias in self.store.aliases():
+            if self.account_disabled(alias):
+                continue
+            (parked if self.account_parked(alias) else serviceable).append(alias)
+        probes = [self._probe_parked(alias) for alias in parked
+                  if self._park_probe_due(alias)]
+        if serviceable or probes:
+            await asyncio.gather(
+                *(one(alias) for alias in serviceable), *probes)
+
+    def _park_probe_due(self, alias: str) -> bool:
+        """True when a parked account is due for its next recovery probe:
+        never probed since the park, or the last probe is older than
+        PARK_PROBE_SECONDS."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except Exception:  # noqa: BLE001 - racing a concurrent account removal
+            return False
+        checked_epoch = self._metadata_epoch(metadata, "park_checked_at")
+        return checked_epoch is None \
+            or time.time() - checked_epoch >= PARK_PROBE_SECONDS
+
+    async def _probe_parked(self, alias: str) -> None:
+        """Recovery probe for a parked account.
+
+        A park means the upstream rejected the account's credentials with a
+        real 401; only /auth/me accepting the account again is proof of
+        recovery. Anything else — a repeated 401, a proxy or network failure,
+        an upstream 5xx — keeps the park untouched.
+        """
+        try:
+            await self.with_proxy(
+                alias, lambda url: self.accounts.fetch_status(alias, proxy_url=url))
+        except Exception as exc:  # noqa: BLE001 - probe failures keep the park
+            try:
+                self.store.merge_metadata(alias, {"park_checked_at": utc_now()})
+            except RelayError:
+                return  # the account was removed mid-probe
+            logger.debug("park probe failed: account=%s %s", alias, exc)
+            return
+        self.accounts.unpark(alias)
+        logger.warning("parked account recovered via probe: account=%s", alias)
+
+    @staticmethod
+    def _metadata_epoch(metadata: dict[str, Any], key: str) -> Optional[float]:
+        value = metadata.get(key)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        try:
+            text = value.strip()
+            if text.endswith(("Z", "z")):
+                text = text[:-1] + "+00:00"
+            parsed = datetime.datetime.fromisoformat(text)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+            return parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
 
     def _profile_stale(self, alias: str) -> bool:
         """True when the stored subscription profile should be re-read: never
@@ -379,27 +443,65 @@ class AppState:
         except (RelayError, json.JSONDecodeError):
             return False
 
+    def account_parked(self, alias: str) -> bool:
+        """Parked (circuit breaker open): the upstream rejected this account's
+        credentials with a persistent real 401, so it stays out of scheduling
+        until a probe or a manual recovery shows it works again."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+            return bool(metadata.get("parked"))
+        except (RelayError, json.JSONDecodeError):
+            return False
+
+    def maybe_park_account(self, alias: str, exc: RelayError) -> bool:
+        """Park the account when ``exc`` is a persistent real-401 credential
+        refusal. Returns True when the error was one.
+
+        ``AccountService.park_reason`` is the classifier: only a 401 counts.
+        The local fail-closed ``device_session_required`` 503 and the
+        upstream's ``model_unavailable`` 503 say nothing about the account's
+        credentials and never park it.
+        """
+        reason = self.accounts.park_reason(exc)
+        if reason is None:
+            return False
+        if self.account_parked(alias):
+            return True
+        self.accounts.park(alias, reason)
+        # Live sessions pinned to the account must be reassigned, and any
+        # quota cooldown is now moot: the park is the stronger signal.
+        self.drop_account_sessions(alias)
+        self._exhausted_until.pop(alias, None)
+        return True
+
     def exhausted_cooldown(self, alias: str) -> float:
         """Seconds left in this account's shared-quota cooldown (0 = serviceable)."""
         return max(0.0, self._exhausted_until.get(alias, 0.0) - time.time())
 
     def _selectable(self, alias: str) -> bool:
-        """Eligible for automatic selection: not switched off in the panel and
-        not cooling down after an upstream shared-quota refusal. Quota load is
-        a soft preference handled separately; these two are hard exclusions."""
-        return not self.account_disabled(alias) and self.exhausted_cooldown(alias) <= 0.0
+        """Eligible for automatic selection: not switched off in the panel, not
+        parked after an upstream credential refusal, and not cooling down after
+        a shared-quota refusal. Quota load is a soft preference handled
+        separately; these three are hard exclusions."""
+        return (not self.account_disabled(alias) and not self.account_parked(alias)
+                and self.exhausted_cooldown(alias) <= 0.0)
 
     def _explicit_account(self, requested: str) -> str:
         """An explicitly requested account is honored even during a cooldown
-        (the caller may know the quota reset), but never when switched off."""
+        (the caller may know the quota reset), but never when switched off or
+        parked — a park means the upstream already refused its credentials."""
         alias = alias_value(requested)
         if self.account_disabled(alias):
             raise RelayError("account is disabled in the panel: " + alias, 403)
+        if self.account_parked(alias):
+            raise RelayError("account is parked after an upstream credential "
+                             "refusal; resume it in the panel first: " + alias, 403)
         return alias
 
     def _no_selectable_error(self) -> RelayError:
-        return RelayError("all accounts are disabled or cooling down after a "
-                          "shared-quota refusal; enable one in the panel or retry later", 503)
+        return RelayError("all accounts are disabled, parked, or cooling down "
+                          "after a shared-quota refusal; enable or resume one "
+                          "in the panel or retry later", 503)
 
     def pick_account(self, requested: str, model: Optional[str] = None) -> str:
         """Explicit header > default account > quota-aware round-robin."""
@@ -703,7 +805,6 @@ class AppState:
         # Validate before mutating runtime state, preserving the existing 404
         # behavior for an unknown alias.
         self.store.row(alias)
-        self.upstream.ensure_device_identity(alias)
         self.upstream.forget_account(alias)
         self.reset_account_runtime(alias)
         self.pending_logins.pop(alias, None)

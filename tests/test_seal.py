@@ -148,7 +148,8 @@ def test_uses_v2_switches_at_the_272_build(version, expected):
 
 #: Reference values produced by the official desktop's WASM crypto core
 #: (``cc_canonical`` / ``cc_sign`` / ``cc_ed25519_pub`` in the 0.0.272
-#: ``server.cjs``), run in Node with a fixed 32-byte seed of 0x07.
+#: ``server.cjs``), run in Node with a fixed 32-byte seed of 0x07.  Re-verified
+#: byte-identical against the 0.0.303 WASM build.
 WASM_SEED = bytes([7]) * 32
 WASM_PUBLIC_HEX = "ea4a6c63e29c520abef5507b132ec5f9954776aebebe7b92421eea691446d22c"
 WASM_CONTEXT = dict(method="POST", path="/v1/device/session",
@@ -216,7 +217,7 @@ def test_canonical_metadata_digest_matches_the_official_wasm_core(pairs, digest)
 
 
 def test_v2_signature_covers_credential_metadata_and_body(state):
-    signer = DeviceSigner(state.store, "0.0.272", ("work",))
+    signer = DeviceSigner(state.store, "0.0.272", "work")
     body = b'{"hello":"world"}'
     metadata = {"x-mirasim-session": "s-1", "x-mirasim-agent": "claude",
                 "x-mirasim-call": "c-1"}
@@ -254,7 +255,7 @@ def test_v2_signature_covers_credential_metadata_and_body(state):
 
 
 def test_signer_rejects_nul_and_unknown_versions(state):
-    signer = DeviceSigner(state.store, "0.0.272", ("work",))
+    signer = DeviceSigner(state.store, "0.0.272", "work")
     with pytest.raises(ValueError):
         signer.headers("POST", "/v1/mes\x00sages", b"{}")
     with pytest.raises(ValueError):
@@ -318,7 +319,7 @@ async def test_seal_switch_restores_clear_metadata_but_keeps_v2_signature(
     assert response.status_code == 200
     sent = route.calls.last.request
     assert SEAL_HEADER not in sent.headers
-    assert sent.headers["x-mirasim-client"] == "0.0.272"
+    assert sent.headers["x-mirasim-client"] == "0.0.303"
     assert sent.headers["x-mirasim-agent"] == "claude"
     assert sent.headers["x-mirasim-session"]
     assert relay_metadata(sent) == {

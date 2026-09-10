@@ -144,7 +144,8 @@ curl -N 'http://127.0.0.1:8787/v1/responses?beta=true' \
   }'
 ```
 
-两个 Responses 路径映射到上游 `/v1/responses`，`/v1/alpha/search` 与
+两个 Responses 路径映射到上游 `/v1/responses`，`/v1/responses/compact` 与
+`/backend-api/codex/responses/compact` 映射到上游 `/v1/responses/compact`，`/v1/alpha/search` 与
 `/backend-api/codex/alpha/search` 映射到上游 `/v1/alpha/search`；签名用的 pathname 是各自的
 上游路径，不会被另一条路径顶替。查询串会保留在 URL 中，但签名只使用 pathname。
 gzip / deflate / br / zstd 请求体会先按大小上限解压，随后以解压后的精确字节重算
@@ -152,7 +153,7 @@ gzip / deflate / br / zstd 请求体会先按大小上限解压，随后以解�
 `x-mirasim-*` 不能覆盖代理生成的字段，其余 Codex 协议头（`x-codex-*`、`session-id`、
 `thread-id`、`chatgpt-account-id` 等）按 blocklist 方式、保持原顺序透传。发出去的请求与官方桌面端
 内置 Codex 的抓包一致：`user-agent` 统一改写为 `MIROFISH_CODEX_USER_AGENT`（默认即抓包中的
-`mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)`），`originator`
+`mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)`），`originator`
 固定为 `mirasim`，独立 Codex CLI 才会带的 `openai-beta` 与 `accept-encoding` 不转发；调用方的
 cookie 一律丢弃，relay 按「账号 × 出口」维护自己的 cookie 罐，把上游（Cloudflare）下发给 relay
 域名的 `__cflb` / `_cfuvid` / `__cf_bm` 等按 RFC 6265 规则在 `authorization` 之前回传，作用域
@@ -189,19 +190,24 @@ SDK system 标记的第三方极简请求误报为 `no upstream available for mo
 h11 默认的 Host 前置写法（`mirofish/wire.py`），loopback 测试逐字节核对。签名的控制面 GET
 （`/v1/models`）使用小写 `authorization`，只有 `/v1/limits` 用量探测保留大写 `Authorization`。
 所有请求形态都以 `tests/fixtures/request_profiles/*_official.json` 为基准，这些文件由抓包经
-`tools/request_profile.py` 脱敏生成。relay 不会复现的整机行为只有 `/events` 遥测、更新检查和
-`/v1/model-roster` 探测。
+`tools/request_profile.py` 脱敏生成。桌面端的后台整机行为（gzipped `/events` 遥测、
+`/v1/model-roster` 探测、`cdn-assets` 更新检查）由 `mirofish/behavior.py` 按账号重放：每个
+账号一条带抖动的循环任务，面板关闭或进入共享额度冷却时暂停；`MIROFISH_BEHAVIOR_REPLAY=0`
+可关闭。
 
-0.0.272 客户端使用“每安装一个 Ed25519 密钥”，不会按账号伪造不同机器。非 CLI 调用方补全为
+0.0.303 客户端的设备身份按**每账号**隔离：每个 alias 有自己的 Ed25519 密钥（首次使用时惰性
+创建，写入 vault，可通过 `POST /api/accounts/<alias>/reset-device` 轮换）。机器层面的字段
+（arch / os、stainless 版本、locale）仍是全安装共用，看起来始终是同一台机器；分散的只有
+`x-mirasim-device`。非 CLI 调用方补全为
 同一套抓包确认的 Claude CLI 指纹；真实 `claude-cli/...` 调用方的 arch / os 等字段保持原值。
-`x-mirasim-device` 始终是那个密钥公钥派生出的 22 字符安装 ID：签名请求与（仅旧版客户端标识
+`x-mirasim-device` 是该账号密钥公钥派生出的 22 字符设备 ID：签名请求与（仅旧版客户端标识
 才允许的）降级到账号 token 的请求发出同一个值，只有时间戳、nonce 与签名三个字段是签名路径独有
 的。若降级路径改用形状不同的标识（例如 36 字符 UUID），单看这一个字段就能区分两条路径。签名为
 `mrs-sig-v2`：签名内容是 method、pathname、时间戳、nonce、设备 ID、客户端版本，以及 bearer
-凭证、relay 元数据和请求体三者的 SHA-256 摘要，凭证本身不会进入被签名的记录。0.0.272 的模型
+凭证、relay 元数据和请求体三者的 SHA-256 摘要，凭证本身不会进入被签名的记录。0.0.303 的模型
 请求拿不到 device ticket 时直接返回 503（`device_session_required`），不会用账号 token 顶替。
 
-0.0.272 还会把模型请求的 relay 元数据封装为 `x-mirasim-enc`：除明文保留的
+0.0.303 还会把模型请求的 relay 元数据封装为 `x-mirasim-enc`：除明文保留的
 `x-mirasim-client` 外，session / agent / device / account / locale / call 以及签名字段都不会
 以明文头发送。封装格式是临时 X25519 公钥、12 字节 nonce 与 ChaCha20-Poly1305 密文，HKDF-SHA256
 使用 `mrs-seal-v1` 作为 info，AAD 绑定 HTTP method 与上游 pathname。relay 使用内置公钥，若上游
@@ -214,6 +220,27 @@ h11 默认的 Host 前置写法（`mirofish/wire.py`），loopback 测试逐字�
 只能替换 TLS 栈。`upstream.tls_context()` 说明了 Python 能调的两个旋钮，以及为什么 ALPN 扩展
 被刻意保留（官方同样带这个扩展，去掉反而更显眼）；`tests/test_tls_profile.py` 在本机回环上抓
 ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是悄悄改变。
+
+### 降低封号風險的邊界
+
+relay 已對齊的部分：每帳號獨立的 Ed25519 裝置身份與 analytics UUID、`mrs-sig-v2` 簽名、
+`mrs-seal-v1` 封裝、抓包推導的請求頭順序/大小寫、prompt-cache 斷點、`max_tokens<=1` 本地短路、
+以及桌面端後台行為重放（`/events`、model-roster、更新檢查）。
+
+TLS ClientHello 預設仍是 OpenSSL。若要把 JA3/JA4 也補到 Chromium/BoringSSL 形狀（官方 Electron
+同源），安裝 optional extra 並開啟模仿：
+
+```bash
+uv sync --extra tls-impersonate
+# .env
+MIROFISH_TLS_IMPERSONATE=chrome136
+```
+
+開啟後上游握手帶 GREASE、x25519 優先、無 OpenSSL ffdhe 群組，ALPN 仍固定 `http/1.1`（與桌面端
+一致）；每帳號的 Mihomo 出口照常疊在同一條 CONNECT 隧道上。header/body 保真不變。也可把
+`MIROFISH_TLS_PROXY` 指到外部 curl-impersonate / utls 網關，由該層負責 ClientHello。
+多帳號共用同一台機器時，機器層級欄位（arch/os、stainless 版本、locale）刻意保持一致以符合官方
+「一台機器」的行為；若需要更徹底的隔離，可為不同帳號組跑多個 relay 實例。
 
 ## 常用接口
 
@@ -232,8 +259,13 @@ ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是
 | `POST` | `/v1/chat/completions` | OpenAI Chat Completions |
 | `POST` | `/v1/responses` | Codex Responses 原始流式转发 |
 | `POST` | `/backend-api/codex/responses` | Codex 原生兼容路径，映射到 `/v1/responses` |
+| `POST` | `/v1/responses/compact` | Codex 上下文压缩转发 |
+| `POST` | `/backend-api/codex/responses/compact` | Codex 原生兼容路径，映射到 `/v1/responses/compact` |
 | `POST` | `/v1/alpha/search` | Codex 检索透传 |
 | `POST` | `/backend-api/codex/alpha/search` | Codex 原生兼容路径，映射到 `/v1/alpha/search` |
+| `POST` | `/api/accounts/<alias>/enabled` | 面板开关：启用 / 停用账号 |
+| `DELETE` | `/api/accounts/<alias>` | 删除账号 |
+| `POST` | `/api/accounts/<alias>/reset-device` | 轮换该账号的设备身份 |
 | `GET` | `/api/usage?hours=24` | 用量统计 |
 
 ## 关键配置
@@ -244,9 +276,9 @@ ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是
 | `MIROFISH_DEFAULT_ACCOUNT` | 空 | 强制使用的默认账号别名 |
 | `MIROFISH_DEFAULT_MODEL` | `gpt-5.6-luna` | OpenAI 兼容请求未提供模型时使用的上游模型 ID |
 | `MIROFISH_RELAY_BASE` | `https://relay.mirasim.ai` | 官方客户端当前使用的模型 relay 地址 |
-| `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.252 (external, mirasim)` | 为非 CLI 调用方补全的官方客户端 User-Agent |
-| `MIROFISH_CODEX_USER_AGENT` | `mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)` | Codex 路径统一改写成的官方内置 Codex User-Agent |
-| `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.272` | relay 客户端版本标识 |
+| `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.261 (external, mirasim)` | 为非 CLI 调用方补全的官方客户端 User-Agent |
+| `MIROFISH_CODEX_USER_AGENT` | `mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)` | Codex 路径统一改写成的官方内置 Codex User-Agent |
+| `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.303` | relay 客户端版本标识 |
 | `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY` | 内置 32 字节公钥 | `x-mirasim-enc` 的 X25519 接收公钥 |
 | `MIROFISH_MIRASIM_SEAL_METADATA` | `1` | 是否封装模型请求的 relay 元数据 |
 | `MIROFISH_PROXY_SUBSCRIPTION_URL` | 空 | Mihomo 代理订阅地址 |
@@ -258,7 +290,10 @@ ClientHello，依赖升级导致的指纹变化会直接测试失败，而不是
 | `MIROFISH_MAX_CONNECTIONS` | `100` | 上游连接池总连接上限 |
 | `MIROFISH_MAX_KEEPALIVE_CONNECTIONS` | `20` | 上游空闲连接上限 |
 | `MIROFISH_STREAM_READ_TIMEOUT` | `600` | 上游流式响应读取超时，单位为秒 |
+| `MIROFISH_ONE_TOKEN_SHORT_CIRCUIT` | `1` | `max_tokens<=1` 探针由本地作答 |
+| `MIROFISH_BEHAVIOR_REPLAY` | `1` | 重放桌面端后台行为（`/events`、model-roster、更新检查） |
 | `MIROFISH_MAX_BODY_BYTES` | `8388608` | 压缩体与解压后请求体的最大字节数 |
+| `MIROFISH_TLS_IMPERSONATE` | 空 | 設為 `chrome136` 時以 Chromium/BoringSSL 形狀 ClientHello 連上游（需 `tls-impersonate` extra） |
 
 完整配置项及示例见
 [`deploy/mirofish-relay/.env.example`](deploy/mirofish-relay/.env.example)。

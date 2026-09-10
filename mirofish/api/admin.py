@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, Request
 
 from .. import __version__
 from ..accounts import public_status
+from ..device import DEVICE_KEY_KIND
 from ..errors import RelayError
 from ..validate import alias_value, email_value
 from .deps import get_state, read_json_body, require_auth
@@ -32,7 +33,8 @@ async def list_accounts(request: Request) -> dict[str, Any]:
     accounts = []
     for alias in state.store.aliases():
         status = public_status(state.store.row(alias),
-                               proxy=state.pool.account_public(alias))
+                               proxy=state.pool.account_public(alias),
+                               device_id=state.upstream._signer(alias).device_id)
         status["active_sessions"] = sessions.get(alias, 0)
         status["shared_quota_cooldown"] = round(state.exhausted_cooldown(alias))
         accounts.append(status)
@@ -47,6 +49,7 @@ async def account_status(alias: str, request: Request,
     do_probe = probe in ("1", "true")
     status = await state.with_proxy(
         alias, lambda url: state.accounts.fetch_status(alias, do_probe, proxy_url=url))
+    status["device_id"] = state.upstream._signer(alias).device_id
     status["proxy"] = state.pool.account_public(alias)
     return status
 
@@ -100,6 +103,18 @@ async def delete_account(alias: str, request: Request) -> dict[str, Any]:
     alias = alias_value(alias)
     state.remove_account(alias)
     return {"deleted": alias}
+
+
+@router.post("/api/accounts/{alias}/reset-device")
+async def reset_device(alias: str, request: Request) -> dict[str, Any]:
+    """Rotate the account's device identity: delete its Ed25519 key and drop
+    every cached device ticket, so the next request mints a fresh identity."""
+    state = get_state(request)
+    alias = alias_value(alias)
+    state.store.row(alias)  # 404 for unknown alias, like delete_account
+    state.store.vault.delete(alias, DEVICE_KEY_KIND)
+    state.upstream.reset_device_identity(alias)
+    return {"alias": alias, "device_id": state.upstream._signer(alias).device_id}
 
 
 @router.post("/api/login/start")

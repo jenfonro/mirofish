@@ -1,12 +1,22 @@
 import { createApp } from "vue";
 import App from "./App.vue";
 import "./style.css";
-import "./miku.css";
 
 const THEME_STORAGE = "mf_theme";
 const SKIN_STORAGE = "mf_skin";
+const PAGE_STORAGE = "mf_page";
 
-export function applyTheme(theme: string): void {
+export type ThemeMode = "system" | "light" | "dark";
+export type PageId =
+  | "overview"
+  | "accounts"
+  | "usage"
+  | "network"
+  | "schedule"
+  | "playground"
+  | "settings";
+
+export function applyTheme(theme: ThemeMode): void {
   if (theme === "light" || theme === "dark") {
     document.documentElement.setAttribute("data-theme", theme);
   } else {
@@ -14,15 +24,16 @@ export function applyTheme(theme: string): void {
   }
 }
 
-export function storedTheme(): string {
+export function storedTheme(): ThemeMode {
   try {
-    return localStorage.getItem(THEME_STORAGE) || "system";
+    const raw = localStorage.getItem(THEME_STORAGE);
+    return raw === "light" || raw === "dark" || raw === "system" ? raw : "system";
   } catch {
     return "system";
   }
 }
 
-export function saveTheme(theme: string): void {
+export function saveTheme(theme: ThemeMode): void {
   try {
     localStorage.setItem(THEME_STORAGE, theme);
   } catch {
@@ -41,9 +52,9 @@ export function applySkin(skin: string): void {
 
 export function storedSkin(): string {
   try {
-    return localStorage.getItem(SKIN_STORAGE) || "miku";
+    return localStorage.getItem(SKIN_STORAGE) || "plain";
   } catch {
-    return "miku";
+    return "plain";
   }
 }
 
@@ -54,6 +65,27 @@ export function saveSkin(skin: string): void {
     /* storage may be blocked; skin then resets per session */
   }
   applySkin(skin);
+}
+
+export function storedPage(): PageId {
+  try {
+    const raw = localStorage.getItem(PAGE_STORAGE) as PageId | null;
+    const pages: PageId[] = [
+      "overview", "accounts", "usage", "network",
+      "schedule", "playground", "settings",
+    ];
+    return raw && pages.includes(raw) ? raw : "overview";
+  } catch {
+    return "overview";
+  }
+}
+
+export function savePage(page: PageId): void {
+  try {
+    localStorage.setItem(PAGE_STORAGE, page);
+  } catch {
+    /* ignore */
+  }
 }
 
 applyTheme(storedTheme());

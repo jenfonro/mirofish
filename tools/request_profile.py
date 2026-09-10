@@ -58,17 +58,17 @@ _SAFE_HEADER_EXACT_VALUES = {
     "originator": frozenset({"codex_cli_rs", "mirasim"}),
     "user-agent": frozenset({
         "claude-cli/2.1.241 (external, mirasim)",
-        "claude-cli/2.1.252 (external, mirasim)",
+        "claude-cli/2.1.261 (external, mirasim)",
         "mirasim-desktop/0.0.228",
-        "mirasim-desktop/0.0.272",
-        "mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
+        "mirasim-desktop/0.0.303",
+        "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
     }),
     "x-app": frozenset({"cli"}),
     # Codex protocol flags carried by the desktop's bundled Codex.
     "x-codex-beta-features": frozenset({"remote_compaction_v2"}),
     "x-openai-internal-codex-responses-lite": frozenset({"true"}),
     "x-mirasim-agent": frozenset({"claude", "codex"}),
-    "x-mirasim-client": frozenset({"0.0.228", "0.0.272"}),
+    "x-mirasim-client": frozenset({"0.0.228", "0.0.272", "0.0.303"}),
     "x-mirasim-locale": frozenset({"zh-HK"}),
     "x-mirasim-probe": frozenset({"usage"}),
     "x-stainless-arch": frozenset({"arm64"}),
@@ -137,6 +137,7 @@ _SAFE_PATHS = {
     "/v1/models",
     "/v1/model-roster",
     "/v1/responses",
+    "/v1/responses/compact",
 }
 _REDACTED_PATH = "/<redacted:path>"
 _REDACTED_QUERY_FIELD = "<redacted:query-field>"

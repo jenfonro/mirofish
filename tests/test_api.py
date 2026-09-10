@@ -282,7 +282,7 @@ async def test_messages_non_stream(client, state, auth_headers):
     assert upstream_request.headers["authorization"] == "Bearer device-ticket"
     # 0.0.272 profile: only the build marker and the sealed envelope travel in
     # clear; every other relay field lives inside x-mirasim-enc.
-    assert upstream_request.headers["x-mirasim-client"] == "0.0.272"
+    assert upstream_request.headers["x-mirasim-client"] == "0.0.303"
     assert upstream_request.headers["x-mirasim-enc"]
     clear = {name.lower() for name in upstream_request.headers
              if name.lower().startswith("x-mirasim-")}

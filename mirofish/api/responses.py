@@ -7,8 +7,8 @@ from typing import Any, AsyncIterator
 from fastapi import APIRouter, Depends, Request
 
 from ..errors import RelayError
-from ..upstream import (ALPHA_SEARCH_PATH, RESPONSES_PATH,
-                        forwarded_response_headers)
+from ..upstream import (ALPHA_SEARCH_PATH, RESPONSES_COMPACT_PATH,
+                        RESPONSES_PATH, forwarded_response_headers)
 from ..validate import model_value
 from .deps import get_state, read_json_body_bytes, require_auth
 from .relay import (_finalize_upstream_stream, _ManagedStreamingResponse,
@@ -124,6 +124,16 @@ async def responses(request: Request) -> Any:
 @router.post("/backend-api/codex/responses")
 async def backend_responses(request: Request) -> Any:
     return await _codex_relay(request, RESPONSES_PATH)
+
+
+@router.post(RESPONSES_COMPACT_PATH)
+async def responses_compact(request: Request) -> Any:
+    return await _codex_relay(request, RESPONSES_COMPACT_PATH)
+
+
+@router.post("/backend-api/codex/responses/compact")
+async def backend_responses_compact(request: Request) -> Any:
+    return await _codex_relay(request, RESPONSES_COMPACT_PATH)
 
 
 @router.post(ALPHA_SEARCH_PATH)

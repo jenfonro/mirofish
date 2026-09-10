@@ -26,7 +26,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock /app/
 COPY mirofish/ /app/mirofish/
 COPY --from=webui /build/mirofish/static /app/mirofish/static
-RUN uv sync --locked --no-dev --no-editable && uv cache clean
+RUN uv sync --locked --no-dev --no-editable --extra tls-impersonate && uv cache clean
 
 COPY deploy/mirofish-relay/docker-entrypoint.sh /usr/local/bin/mirofish-entrypoint
 RUN chmod +x /usr/local/bin/mirofish-entrypoint /usr/local/bin/mihomo

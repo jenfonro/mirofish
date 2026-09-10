@@ -103,7 +103,8 @@ def profile_fields(me: dict[str, Any], referral: dict[str, Any]) -> dict[str, An
 
 
 def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
-                  proxy: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+                  proxy: Optional[dict[str, Any]] = None,
+                  device_id: Optional[str] = None) -> dict[str, Any]:
     metadata = metadata or json.loads(row["metadata_json"])
     return {"alias": row["alias"], "email": row["email"], "user_id": row["user_id"],
             "plan": row["plan"], "tenant": row["tenant"],
@@ -115,7 +116,11 @@ def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
             "limits": metadata.get("limits"),
             "profile_pending": bool(metadata.get("profile_pending")),
             "disabled": bool(metadata.get("disabled")),
+            "parked": bool(metadata.get("parked")),
+            "parked_reason": metadata.get("parked_reason"),
+            "parked_at": metadata.get("parked_at"),
             "checked_at": metadata.get("checked_at"),
+            "device_id": device_id,
             "proxy": proxy}
 
 
@@ -287,10 +292,6 @@ class AccountService:
             previous_email and previous_email.casefold() != email.casefold())
         self.store.save(alias, email, access, renewal, metadata, proxy_id=proxy_id)
         if different_account:
-            # Upgrade old per-account keys into the installation slot before
-            # cleaning up the legacy secret. Re-login rotates authorization and
-            # tickets, never the official installation-wide Ed25519 identity.
-            self.upstream.ensure_device_identity(alias)
             self.store.vault.delete(alias, DEVICE_KEY_KIND)
             self.upstream.forget_account(alias)
         else:
@@ -343,6 +344,48 @@ class AccountService:
         })
         self.store.update_metadata(alias, metadata)
         return public_status(self.store.row(alias), metadata)
+
+    # --- park (circuit breaker) ---------------------------------------------
+
+    @staticmethod
+    def park_reason(exc: RelayError) -> Optional[str]:
+        """Why this failure parks the account, or None when it must not.
+
+        Only a persistent, real 401 — the upstream rejected the account's
+        credentials even after a token refresh already retried — says the
+        account itself is unusable (token revoked, account banned).  The
+        relay's own fail-closed ``device_session_required`` 503 is a local
+        signing condition, and an upstream ``model_unavailable`` 503 is a
+        capacity signal; neither says anything about the account's
+        credentials, so neither parks it.
+        """
+        if exc.status != 401:
+            return None
+        message = ""
+        if isinstance(exc.data, dict):
+            error = exc.data.get("error")
+            detail = error if isinstance(error, dict) else exc.data
+            for key in ("message", "detail", "type"):
+                value = detail.get(key)
+                if isinstance(value, str) and value.strip():
+                    message = value.strip()
+                    break
+        return (message or "upstream rejected the account's credentials (401)")[:300]
+
+    def park(self, alias: str, reason: str) -> dict[str, Any]:
+        """Quarantine an account whose credentials the upstream rejected."""
+        alias = alias_value(alias)
+        metadata = self.store.merge_metadata(
+            alias, {"parked": True, "parked_reason": (reason or "")[:300],
+                    "parked_at": utc_now()})
+        logger.warning("account parked: account=%s reason=%s", alias, reason)
+        return metadata
+
+    def unpark(self, alias: str) -> dict[str, Any]:
+        """Return a parked account to scheduling (manual or probe recovery)."""
+        alias = alias_value(alias)
+        return self.store.merge_metadata(
+            alias, {"parked": False, "parked_reason": None, "parked_at": None})
 
     # --- status ------------------------------------------------------------
 

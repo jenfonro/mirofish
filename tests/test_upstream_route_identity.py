@@ -39,6 +39,18 @@ async def test_client_cache_uses_node_identity_behind_same_slot(state):
     assert await state.upstream.client(node_b) is not client_a
 
 
+async def test_client_cache_is_scoped_to_account_alias(state):
+    """Two accounts on the same exit must never share a connection pool."""
+    manager = SlotManager(_FakeMihomo(), "http://mihomo:7890", 1, 7891,
+                          "MirofishPool")
+    node = await _route(manager, "node-a")
+
+    first = await state.upstream.client(node, "acct")
+    assert await state.upstream.client(node, "acct") is first
+    assert await state.upstream.client(node, "other") is not first
+    assert await state.upstream.client(node) is not first
+
+
 async def test_device_ticket_cache_is_scoped_to_node_route(state, monkeypatch):
     add_account(state, "acct")
     manager = SlotManager(_FakeMihomo(), "http://mihomo:7890", 1, 7891,

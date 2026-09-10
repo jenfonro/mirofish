@@ -15,6 +15,11 @@ dependencies = [
 [project.scripts]
 mirofish = "mirofish.cli:main"
 
+[project.optional-dependencies]
+tls-impersonate = [
+    "curl-cffi>=0.7",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8",

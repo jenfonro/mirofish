@@ -50,12 +50,14 @@ sidecar 与 init 容器。
 - SQLite `/data/accounts.sqlite3` 只保存元数据（邮箱、plan、租户、用量日志）；
 - 丢失主密钥将无法解密已有账号凭证，需要重新登录。
 
-模型 relay 还要求设备签名：0.0.272 客户端在整个安装范围内持久化一个 Ed25519 密钥，
-并按「账号 × 出口」申请约 15 分钟的 device ticket，再为每个请求生成 `mrs-sig-v2` 签名（覆盖
-method、pathname、时间戳、nonce、设备 ID、客户端版本，以及凭证、relay 元数据与请求体的摘要）。
-私钥与账号 token 一样只进入加密凭证存储，不写入 SQLite 或日志。旧版按账号保存的设备密钥会
-自动迁移一个到安装级槽位。当前默认客户端标识为抓包确认的 `0.0.272`。ticket 会提前 120 秒
-刷新；申请端点返回 404/501 时缓存 15 分钟“不支持签名”，其他失败按 1–30 秒退避。0.0.272 的
+模型 relay 还要求设备签名：每个账号各自持久化一把 Ed25519 密钥（首次使用时创建，可经
+`POST /api/accounts/<alias>/reset-device` 轮换），并按「账号 × 出口」申请约 15 分钟的
+device ticket，再为每个请求生成 `mrs-sig-v2` 签名（覆盖 method、pathname、时间戳、nonce、
+设备 ID、客户端版本，以及凭证、relay 元数据与请求体的摘要）。机器层面的字段（arch/os、
+stainless 版本、locale）仍是全安装共用，看起来始终是同一台机器；分散的只有设备 ID。
+私钥与账号 token 一样只进入加密凭证存储，不写入 SQLite 或日志。当前默认客户端标识为
+按 0.0.303 客户端静态分析确认的 `0.0.303`。ticket 会提前 120 秒
+刷新；申请端点返回 404/501 时缓存 15 分钟“不支持签名”，其他失败按 1–30 秒退避。0.0.272+ 的
 模型请求没有 ticket 时直接返回 503（`device_session_required`，处于退避期时附带 `retry_after` 秒数），不会改用
 账号 token——那会把中转故障变成对用户自有账号的意外扣费；只有把
 `MIROFISH_MIRASIM_CLIENT_VERSION` 固定在 0.0.272 以下时才保留旧的账号 token 降级（不发送伪签名）。
@@ -243,7 +245,7 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
 ## 从旧版（单文件 relay）升级
 
 数据卷完全兼容：SQLite 结构自动迁移（新增用量日志表），`secrets.enc` v1 自动升级为 v2，
-旧版账号设备密钥首次使用时迁移为安装级密钥，账号与节点绑定关系保留。直接
+每个账号首次使用时各自创建设备密钥，账号与节点绑定关系保留。直接
 `docker compose up -d --build` 即可。
 
 ## 注意
@@ -267,10 +269,15 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   避免出现 `lang: python` 与 `runtime: node` 并存这种任何真实客户端都不会发出的组合；
   只有 `anthropic-version` 和 `anthropic-beta` 这两个会改变请求语义的选项保留调用方的值。
   `MIROFISH_CLAUDE_CLI_USER_AGENT` 可覆盖 User-Agent。
-- 设备与机器字段遵循 0.0.272 的安装级边界，不按账号虚构。非 CLI 调用方统一补全为抓包中的
+- 设备身份按账号隔离：每个 alias 有自己的 Ed25519 密钥（惰性创建，可经
+  `POST /api/accounts/<alias>/reset-device` 轮换）。机器层面的字段仍是全安装共用：
+  非 CLI 调用方统一补全为抓包中的
   `arm64 / MacOS` Claude CLI 组合；真实 `claude-cli/...` 调用方的 arch / os 原样保留。
-  `x-mirasim-device` 始终是公钥派生的 22 字符安装 ID，签名与（旧版标识下的）无签名降级发出的是同一个值；
+  `x-mirasim-device` 是该账号公钥派生的 22 字符设备 ID，签名与（旧版标识下的）无签名降级发出的是同一个值；
   降级路径不会改用形状不同的替代标识，否则单看这个字段就能区分两条路径。
+- 桌面端后台整机行为由 `mirofish/behavior.py` 重放：gzipped `/events` 遥测、
+  `/v1/model-roster`、`cdn-assets` 更新检查，每账号一条带抖动的循环任务；面板关闭或
+  共享额度冷却时暂停。`MIROFISH_BEHAVIOR_REPLAY=0` 可关闭。
 - 仿真范围只到请求头与请求体。TLS ClientHello 出自 OpenSSL，官方客户端是 Electron 的
   BoringSSL：cipher 列表、扩展顺序与 GREASE 由 TLS 库决定，要对齐 JA3 得换掉 TLS 栈，
   配置 OpenSSL 做不到。因此 ALPN 扩展被刻意保留（官方也带这个扩展，去掉反而更显眼），

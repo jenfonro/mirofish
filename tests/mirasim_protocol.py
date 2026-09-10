@@ -1,5 +1,7 @@
 """Test-side view of the 0.0.272 Mirasim relay protocol.
 
+The protocol is unchanged in 0.0.303; these helpers apply to both.
+
 The relay seals its own ``x-mirasim-*`` metadata into ``x-mirasim-enc`` and
 signs requests with ``mrs-sig-v2``.  Production only needs the upstream's
 *public* seal key, so nothing in the package can open an envelope.  The test

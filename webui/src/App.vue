@@ -1,40 +1,56 @@
 <script setup lang="ts">
-import { onMounted, reactive, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { getKey, setKey } from "./api";
-import { saveSkin, saveTheme, storedSkin, storedTheme } from "./main";
-import { connect, store } from "./store";
-import AccountsCard from "./components/AccountsCard.vue";
-import AddAccountCard from "./components/AddAccountCard.vue";
-import LimitsCard from "./components/LimitsCard.vue";
-import PlaygroundCard from "./components/PlaygroundCard.vue";
-import ProxyCard from "./components/ProxyCard.vue";
-import ScheduleCard from "./components/ScheduleCard.vue";
-import UsageCard from "./components/UsageCard.vue";
+import { iconSvg } from "./icons";
+import {
+  savePage, saveSkin, saveTheme, storedPage, storedSkin, storedTheme,
+  type PageId, type ThemeMode,
+} from "./main";
+import { connect, loadAccounts, store } from "./store";
+import OverviewPage from "./pages/OverviewPage.vue";
+import AccountsPage from "./pages/AccountsPage.vue";
+import UsagePage from "./pages/UsagePage.vue";
+import NetworkPage from "./pages/NetworkPage.vue";
+import SchedulePage from "./pages/SchedulePage.vue";
+import PlaygroundPage from "./pages/PlaygroundPage.vue";
+import SettingsPage from "./pages/SettingsPage.vue";
 
 const keyInput = ref("");
 const keyError = ref("");
-const theme = ref(storedTheme());
+const theme = ref<ThemeMode>(storedTheme());
+const skin = ref(storedSkin());
+const page = ref<PageId>(storedPage());
 const booted = ref(false);
+const navOpen = ref(false);
 
-const THEME_LABEL: Record<string, string> = { system: "跟随系统", light: "浅色", dark: "深色" };
+const THEME_LABEL: Record<ThemeMode, string> = {
+  system: "系统", light: "浅色", dark: "深色",
+};
+
+const PAGES: { id: PageId; label: string; icon: keyof typeof import("./icons").icons }[] = [
+  { id: "overview", label: "总览", icon: "overview" },
+  { id: "accounts", label: "账号", icon: "accounts" },
+  { id: "usage", label: "用量", icon: "usage" },
+  { id: "network", label: "网络", icon: "network" },
+  { id: "schedule", label: "调度", icon: "schedule" },
+  { id: "playground", label: "测试", icon: "playground" },
+  { id: "settings", label: "设置", icon: "settings" },
+];
+
+const pageTitle = computed(() =>
+  PAGES.find((p) => p.id === page.value)?.label ?? "总览");
+
+function go(id: PageId) {
+  page.value = id;
+  savePage(id);
+  navOpen.value = false;
+}
 
 function cycleTheme() {
-  const order = ["system", "light", "dark"];
+  const order: ThemeMode[] = ["system", "light", "dark"];
   theme.value = order[(order.indexOf(theme.value) + 1) % order.length];
   saveTheme(theme.value);
 }
-
-const skin = ref(storedSkin());
-// Character art is optional: each <img> hides itself on load error so the
-// skin degrades to colors-only until PNGs are dropped into webui/public/miku/.
-// Bound via :src so Vite never tries to resolve the (possibly absent) files.
-const MIKU_ART = {
-  logo: "/miku/logo.png",
-  gate: "/miku/gate.png",
-  mascot: "/miku/mascot.png",
-  bg: "/miku/bg.jpg",
-};
-const art = reactive({ logo: true, gate: true, mascot: true, bg: true });
 
 function toggleSkin() {
   skin.value = skin.value === "miku" ? "plain" : "miku";
@@ -54,10 +70,16 @@ function editKey() {
   store.connected = false;
 }
 
+function onKeydown(e: KeyboardEvent) {
+  if (e.key === "Escape") navOpen.value = false;
+}
+
 onMounted(async () => {
+  window.addEventListener("keydown", onKeydown);
   if (getKey()) await connect();
   booted.value = true;
 });
+onUnmounted(() => window.removeEventListener("keydown", onKeydown));
 </script>
 
 <template>
@@ -67,129 +89,121 @@ onMounted(async () => {
     </div>
   </div>
 
-  <header class="topbar">
-    <img v-if="skin === 'miku' && art.logo" class="miku-logo" :src="MIKU_ART.logo"
-         alt="" @error="art.logo = false" />
-    <h1>Mirofish Relay</h1>
-    <span v-if="store.health" class="badge">
-      <span class="dot ok"></span>{{ store.health.accounts }} 个账号
-    </span>
-    <span v-if="store.health" class="badge">代理后端 {{ store.health.proxy_backend }}</span>
-    <span v-if="store.health" class="badge">v{{ store.health.version }}</span>
-    <span class="spacer"></span>
-    <button class="ghost small" @click="toggleSkin">皮肤：{{ skin === "miku" ? "Miku ♪" : "标准" }}</button>
-    <button class="ghost small" @click="cycleTheme">主题：{{ THEME_LABEL[theme] }}</button>
-    <button v-if="store.connected" class="ghost small" @click="editKey">更换密钥</button>
-  </header>
-
-  <img v-if="skin === 'miku' && store.connected && art.bg" class="miku-bg" :src="MIKU_ART.bg"
-       alt="" @error="art.bg = false" />
-
-  <main v-if="booted && store.connected" class="grid">
-    <AccountsCard class="span2" />
-    <LimitsCard class="span2" />
-    <AddAccountCard />
-    <UsageCard />
-    <ScheduleCard class="span2" />
-    <ProxyCard class="span2" />
-    <PlaygroundCard class="span2" />
-  </main>
-
-  <main v-else-if="booted" class="gate">
-    <img v-if="skin === 'miku' && art.gate" class="miku-gate-art" :src="MIKU_ART.gate"
-         alt="" @error="art.gate = false" />
-    <div class="card gate-card">
-      <h2>连接本地中转</h2>
-      <p class="muted">
-        输入数据目录 <span class="mono">proxy.key</span> 中的本地代理密钥。
-        Docker 部署可运行 <span class="mono">docker compose exec mirofish cat /data/proxy.key</span>
-        获取；密钥仅保存在浏览器 localStorage，用于调用管理 API。
-      </p>
-      <label>X-Mirofish-Proxy-Key</label>
-      <input v-model="keyInput" type="password" autocomplete="off"
-             placeholder="proxy.key 中的 Proxy Key" @keyup.enter="submitKey" />
+  <!-- Gate -->
+  <div v-if="booted && !store.connected" class="gate-shell">
+    <div class="gate-card">
+      <div class="gate-brand">
+        <span class="nav-logo" aria-hidden="true"></span>
+        <div>
+          <h1>Mirofish Relay</h1>
+          <p>连接本地中转控制台</p>
+        </div>
+      </div>
+      <div class="field">
+        <label>X-Mirofish-Proxy-Key</label>
+        <input
+          v-model="keyInput"
+          type="password"
+          autocomplete="off"
+          placeholder="proxy.key 中的 Proxy Key"
+          @keyup.enter="submitKey"
+        />
+        <p class="muted mt-2">
+          密钥在数据目录 <span class="mono">proxy.key</span>。
+          Docker：`docker compose exec mirofish cat /data/proxy.key`
+        </p>
+      </div>
       <p v-if="keyError" class="gate-error">{{ keyError }}</p>
-      <div class="row" style="margin-top: 14px">
-        <button :disabled="store.checking || !keyInput.trim()" @click="submitKey">
+      <div class="gate-actions">
+        <button class="btn" :disabled="store.checking || !keyInput.trim()" @click="submitKey">
           {{ store.checking ? "验证中…" : "保存并连接" }}
         </button>
       </div>
     </div>
-  </main>
+  </div>
 
-  <img v-if="skin === 'miku' && art.mascot" class="miku-mascot" :src="MIKU_ART.mascot"
-       alt="" @error="art.mascot = false" />
+  <!-- App shell -->
+  <div v-else-if="booted" class="shell">
+    <div v-if="navOpen" class="nav-scrim" @click="navOpen = false"></div>
+    <aside class="nav" :class="{ open: navOpen }">
+      <div class="nav-brand">
+        <span class="nav-logo" aria-hidden="true"></span>
+        <div>
+          <div class="nav-title">Mirofish</div>
+          <div class="nav-sub">Relay Console</div>
+        </div>
+      </div>
+      <ul class="nav-list">
+        <li v-for="item in PAGES" :key="item.id">
+          <button
+            class="nav-item"
+            :class="{ active: page === item.id }"
+            @click="go(item.id)"
+          >
+            <span class="icon" v-html="iconSvg(item.icon)"></span>
+            <span>{{ item.label }}</span>
+            <span v-if="item.id === 'accounts' && store.accounts.length" class="count">
+              {{ store.accounts.length }}
+            </span>
+          </button>
+        </li>
+      </ul>
+      <div class="nav-foot">
+        <div class="nav-foot-row">
+          <button class="btn ghost sm" style="flex:1" @click="cycleTheme">
+            {{ THEME_LABEL[theme] }}
+          </button>
+          <button class="btn ghost sm" style="flex:1" @click="toggleSkin">
+            {{ skin === "miku" ? "Miku" : "标准" }}
+          </button>
+        </div>
+        <div v-if="store.health" class="nav-ver">
+          v{{ store.health.version }} · {{ store.health.proxy_backend }}
+        </div>
+      </div>
+    </aside>
+
+    <div class="main">
+      <header class="topbar">
+        <button class="menu-btn" aria-label="菜单" @click="navOpen = true">
+          <span class="icon" style="width:16px;height:16px;display:block" v-html="iconSvg('menu')"></span>
+        </button>
+        <h2>{{ pageTitle }}</h2>
+        <span class="spacer"></span>
+        <template v-if="store.health">
+          <span class="chip ok">
+            <span class="dot ok"></span>
+            {{ store.health.accounts }} 账号
+          </span>
+          <span class="chip">{{ store.health.proxy_backend }}</span>
+        </template>
+        <button class="btn ghost sm" @click="editKey">更换密钥</button>
+      </header>
+
+      <div class="content">
+        <div class="content-inner">
+          <OverviewPage v-if="page === 'overview'" @navigate="go" />
+          <AccountsPage v-else-if="page === 'accounts'" />
+          <UsagePage v-else-if="page === 'usage'" />
+          <NetworkPage v-else-if="page === 'network'" />
+          <SchedulePage v-else-if="page === 'schedule'" />
+          <PlaygroundPage v-else-if="page === 'playground'" />
+          <SettingsPage
+            v-else-if="page === 'settings'"
+            :theme="theme"
+            :skin="skin"
+            @update:theme="theme = $event; saveTheme($event)"
+            @update:skin="skin = $event; saveSkin($event)"
+            @edit-key="editKey"
+          />
+        </div>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
-.topbar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 14px 24px;
-  border-bottom: 1px solid var(--border);
-  background: var(--surface);
-}
-.topbar h1 { font-size: 16px; margin-right: 6px; }
-.topbar .spacer { flex: 1; }
-
-.grid {
-  max-width: 1180px;
-  margin: 22px auto 60px;
-  padding: 0 18px;
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 16px;
-  align-items: start;
-}
-.span2 { grid-column: 1 / -1; }
-@media (max-width: 860px) {
-  .grid { grid-template-columns: 1fr; }
-}
-
-.gate { display: flex; justify-content: center; align-items: flex-end; gap: 18px; padding: 12vh 18px 0; }
-.gate-card { width: 420px; max-width: 100%; }
-.gate-error { color: var(--critical); font-size: 13px; margin: 8px 0 0; }
-
-.miku-logo { width: 30px; height: 30px; border-radius: 50%; object-fit: cover; flex: none; }
-.miku-bg {
-  position: fixed;
-  inset: 0;
-  width: 100%;
-  height: 100%;
-  object-fit: cover;
-  z-index: -1;
-  opacity: 0.13;
-  pointer-events: none;
-  user-select: none;
-}
-.miku-gate-art {
-  height: 300px;
-  user-select: none;
-  filter: drop-shadow(0 8px 20px rgba(57, 197, 187, 0.3));
-}
-@media (max-width: 760px) {
-  .miku-gate-art { display: none; }
-}
-.miku-mascot {
-  position: fixed;
-  right: 14px;
-  bottom: -6px;
-  width: 148px;
-  z-index: 5;
-  pointer-events: none;
-  user-select: none;
-  filter: drop-shadow(0 6px 16px rgba(57, 197, 187, 0.35));
-  animation: miku-bob 4.2s ease-in-out infinite;
-}
-@keyframes miku-bob {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-7px); }
-}
-@media (max-width: 1100px) {
-  .miku-mascot { display: none; }
-}
-@media (prefers-reduced-motion: reduce) {
-  .miku-mascot { animation: none; }
-}
+.icon { display: inline-flex; width: 16px; height: 16px; }
+.icon :deep(svg) { width: 100%; height: 100%; }
+.menu-btn .icon :deep(svg) { width: 16px; height: 16px; }
 </style>

@@ -62,10 +62,11 @@ def _mock_device_session(ticket: str = "device-ticket"):
         return_value=httpx.Response(200, json={"ticket": ticket, "expiresIn": 900}))
 
 
-def _verify_signature(state, request: httpx.Request, path: str) -> None:
+def _verify_signature(state, request: httpx.Request, path: str,
+                      alias: str = "work") -> None:
     """The mrs-sig-v2 record binds the bearer the request carries, the
     relay metadata (sealed or clear) and the exact body to this pathname."""
-    verify_signature(state, request, path)
+    verify_signature(state, request, path, alias=alias)
 
 
 #: Field order inside a sealed model envelope: the desktop assigns these onto
@@ -244,7 +245,7 @@ async def test_signed_models_profile_matches_the_capture(state):
 CLAUDE_HEADERS = [
     ("accept", "application/json"),
     ("content-type", "application/json"),
-    ("user-agent", "claude-cli/2.1.252 (external, mirasim)"),
+    ("user-agent", "claude-cli/2.1.261 (external, mirasim)"),
     ("x-claude-code-session-id", "0f20cf48-c292-42e9-a99e-994511307deb"),
     ("x-stainless-arch", "arm64"),
     ("x-stainless-lang", "js"),
@@ -298,7 +299,7 @@ async def test_messages_preserve_sdk_order_and_isolate_caller_credentials(state)
     assert request.content == json.dumps(
         payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert request.headers["authorization"] == "Bearer device-ticket"
-    assert request.headers["x-mirasim-client"] == "0.0.272"
+    assert request.headers["x-mirasim-client"] == "0.0.303"
     sealed = relay_metadata(request, "/v1/messages")
     assert [name for name in sealed if name != "x-mirasim-client"] == \
         SEALED_MODEL_FIELDS
@@ -392,7 +393,7 @@ async def test_caller_sdk_fingerprint_cannot_survive_beside_the_cli_identity(sta
     assert request.headers["accept-encoding"] == "gzip, deflate, br, zstd"
     assert request.headers["anthropic-dangerous-direct-browser-access"] == "true"
     assert request.headers["x-app"] == "cli"
-    assert request.headers["user-agent"] == "claude-cli/2.1.252 (external, mirasim)"
+    assert request.headers["user-agent"] == "claude-cli/2.1.261 (external, mirasim)"
     assert request.headers["x-stainless-lang"] == "js"
     assert request.headers["x-stainless-runtime"] == "node"
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
@@ -495,6 +496,12 @@ async def test_an_accounts_machine_is_the_same_on_every_request(state):
 
 @respx.mock
 async def test_installation_fingerprint_fields_stay_shared(state):
+    """Machine and locale stay installation-wide; device identity does not.
+
+    One box still looks like one box (arch/os, client versions, locale), but
+    each account now presents its own Ed25519 device so upstream fingerprints
+    do not collapse the whole install into a single device.
+    """
     _mock_device_session()
 
     first = await _messages_request(state, "work")
@@ -505,7 +512,7 @@ async def test_installation_fingerprint_fields_stay_shared(state):
         assert first.headers[header] == second.headers[header]
     first_fields, second_fields = relay_metadata(first), relay_metadata(second)
     assert first_fields["x-mirasim-locale"] == second_fields["x-mirasim-locale"]
-    assert first_fields["x-mirasim-device"] == second_fields["x-mirasim-device"]
+    assert first_fields["x-mirasim-device"] != second_fields["x-mirasim-device"]
     assert first_fields["x-mirasim-locale"] == state.settings.mirasim_locale
 
 
@@ -522,7 +529,7 @@ async def test_a_real_cli_caller_keeps_its_own_machine_headers(state):
     assert _machine_slot(request) == ("x64", "Linux")
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
     assert request.headers["x-stainless-package-version"] == "0.112.1"
-    assert request.headers["user-agent"] == "claude-cli/2.1.252 (external, mirasim)"
+    assert request.headers["user-agent"] == "claude-cli/2.1.261 (external, mirasim)"
 
 
 @respx.mock
@@ -643,4 +650,4 @@ async def test_codex_relay_request_matches_the_official_capture(state):
     assert "caller-jar" not in cookie
     assert "codex-caller-secret" not in second.headers.values()
     assert second.content == body
-    _verify_signature(state, second, "/v1/responses")
+    _verify_signature(state, second, "/v1/responses", alias=alias)

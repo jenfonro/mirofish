@@ -74,6 +74,7 @@ export interface Account {
   limits?: AccountLimits | null;
   profile_pending?: boolean;
   disabled?: boolean;
+  device_id?: string | null;
   shared_quota_cooldown?: number;
   active_sessions?: number;
   checked_at?: string | null;

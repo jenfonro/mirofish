@@ -7,7 +7,8 @@ import httpx
 import respx
 
 from mirofish.config import DEFAULT_CODEX_USER_AGENT
-from mirofish.upstream import RESPONSES_PATH, SIGNED_MODEL_REQUIRED_MESSAGE
+from mirofish.upstream import (RESPONSES_COMPACT_PATH, RESPONSES_PATH,
+                               SIGNED_MODEL_REQUIRED_MESSAGE)
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 from tests.mirasim_protocol import relay_metadata, verify_signature
 
@@ -184,6 +185,32 @@ async def test_alpha_search_relays_under_both_local_paths(
         assert request.headers["authorization"] == "Bearer device-ticket"
     # Signed over its own pathname, not /v1/responses.
     _verify_signature(state, route.calls.last.request, path="/v1/alpha/search")
+
+
+@respx.mock
+async def test_responses_compact_relays_under_both_local_paths(
+        client, state, auth_headers):
+    add_account(state, "work")
+    _device_session()
+    route = respx.post(RELAY_BASE + RESPONSES_COMPACT_PATH).mock(
+        return_value=httpx.Response(200, json={"id": "response"}))
+    raw = b'{"model":"gpt-5.6-codex","input":"hi"}'
+
+    first = await client.post(
+        "/v1/responses/compact", headers=auth_headers, content=raw)
+    second = await client.post(
+        "/backend-api/codex/responses/compact", headers=auth_headers, content=raw)
+
+    assert first.status_code == second.status_code == 200
+    assert len(route.calls) == 2
+    for call in route.calls:
+        request = call.request
+        assert request.content == raw
+        assert relay_metadata(request)["x-mirasim-agent"] == "codex"
+        assert request.headers["authorization"] == "Bearer device-ticket"
+    # Signed over its own pathname, not /v1/responses.
+    _verify_signature(state, route.calls.last.request,
+                      path=RESPONSES_COMPACT_PATH)
 
 
 @respx.mock

@@ -32,20 +32,21 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - SQLite stores metadata, non-secret settings (`settings` table, e.g. the schedule mode), and the usage log only.
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
-- Model relay calls use one installation-wide Ed25519 device identity (not one per alias), per-exit
+- Model relay calls use one Ed25519 device identity **per account** (lazy create, vault-persisted,
+  resettable via `POST /api/accounts/{alias}/reset-device`), per-exit
   `/v1/device/session` tickets, and `mrs-sig-v2` signatures over a canonical record (method,
   pathname, timestamp, nonce, device id, client version, and SHA-256 digests of the bearer
   credential, the canonicalized relay metadata, and the exact request body — secrets never enter
   the signed message; the metadata digest line is *empty* when a request carries no metadata,
   which is the device-session mint — `device.signing_record` is pinned byte-for-byte against the
   desktop's WASM `cc_canonical`/`cc_sign` output in `tests/test_seal.py`). The private key lives in the encrypted vault and `x-mirasim-device` is
-  derived from it on both the signed and the unsigned path. With the 0.0.272 profile a model
+  derived from it on both the signed and the unsigned path. Machine-level fields (arch/os, stainless versions, locale) stay installation-wide so one box still looks like one box; only the device id diverges per account. With the 0.0.272+ profile a model
   request without a device ticket fails closed (503 `device_session_required`) instead of falling
   back to the plain account token; that legacy fallback exists only when
   `MIROFISH_MIRASIM_CLIENT_VERSION` is pinned below 0.0.272. `tests/mirasim_protocol.py` is the
   test-side verifier (own X25519 pair, unseal + signature check); `tests/test_seal.py` pins the
   primitives and both operator switches.
-- Current upstream client profile is 0.0.272. For model requests, keep
+- Current upstream client profile is 0.0.303. For model requests, keep
   `x-mirasim-client` clear and seal every other generated `x-mirasim-*` field in
   `x-mirasim-enc` (`mrs-seal-v1`: X25519 + HKDF-SHA256 + ChaCha20-Poly1305,
   pathname/method-bound AAD). A malformed seal key must fail closed; the
@@ -56,20 +57,30 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   body shape); `tests/test_wire_profile.py` measures the same order on a loopback socket. Signed
   control GETs (`/v1/models`) spell `authorization` in lower case; only the `/v1/limits` usage
   probe keeps the capitalized `Authorization` of the desktop's probe object. The Codex path leaves
-  the relay as the desktop's *bundled* Codex would send it: caller protocol headers (`x-codex-*`,
+  the relay as the Codex the desktop launches would send it: caller protocol headers (`x-codex-*`,
   `session-id`, `thread-id`, `chatgpt-account-id`) pass through in order, `user-agent` is replaced
-  by `MIROFISH_CODEX_USER_AGENT` (the captured `mirasim/0.150.1 ...` string) and `originator` by
+  by `MIROFISH_CODEX_USER_AGENT` (the captured `mirasim/0.153.4 ...` string) and `originator` by
   `mirasim`, `openai-beta`/`accept-encoding` are dropped, caller cookies are stripped, and the
   Cloudflare cookies the relay host sets are replayed from a per-(account, exit) `httpx.Cookies`
   jar placed just before `authorization` (RFC 6265 scoping applies, so a `Domain=chatgpt.com`
-  cookie is never replayed; the Claude path sends no cookies, matching Node's fetch). Whole-client
-  behaviour the relay does not reproduce: `/events` telemetry, the `cdn-assets` update check, and
-  the `/v1/model-roster` probe.
-- Impersonation fidelity is header- and body-level. The TLS ClientHello is OpenSSL's, not the
-  official client's BoringSSL one, and matching its JA3 would mean replacing the TLS stack rather
-  than configuring it; `upstream.tls_context()` documents the two knobs that exist and why ALPN is
-  deliberately left alone. `tests/test_tls_profile.py` measures the hello on loopback so a
-  dependency bump cannot change it silently.
+  cookie is never replayed; the Claude path sends no cookies, matching Node's fetch).
+  `mirofish/behavior.py` replays the rest of the desktop's whole-client background behaviour
+  (gzipped `/events` telemetry in the live `{deviceId, sentAt, events}` envelope with
+  `app.heartbeat` records, `/v1/model-roster`, and the `cdn-assets` update check) as one
+  jittered task per account, paused while the account is disabled or cooling down from a shared
+  quota; `MIROFISH_BEHAVIOR_REPLAY=0` turns it off. The analytics `deviceId` is a per-account
+  UUID (desktop `device.json` shape), deliberately distinct from the Ed25519-derived
+  22-char `x-mirasim-device` used on signed model calls, and not shared across accounts so a
+  multi-account relay does not present one installation cluster key.
+- Impersonation fidelity is header- and body-level. The TLS ClientHello is OpenSSL's by default, not the
+  official client's BoringSSL one. Set `MIROFISH_TLS_IMPERSONATE=chrome136` (optional extra
+  `tls-impersonate` / `curl_cffi`) to send a Chromium-shaped ClientHello — GREASE, x25519-first
+  groups, no OpenSSL ffdhe, ALPN still `http/1.1` — while header/body fidelity stays in
+  `upstream.py` (`mirofish/tls_impersonate.py`). Matching JA3 without that extra would mean
+  replacing the TLS stack rather than configuring it; `upstream.tls_context()` documents the two
+  knobs that exist and why ALPN is deliberately left alone. `tests/test_tls_profile.py` measures
+  the OpenSSL hello and `tests/test_tls_impersonate.py` the curl_cffi one, so a dependency bump
+  cannot change either silently.
 - `/v1/messages` streams upstream SSE through unbuffered; `/v1/chat/completions` translates Anthropic stream events to OpenAI chunks incrementally.
 - A Messages request capped at one output token (`max_tokens<=1`) is answered by
   the relay itself and never forwarded: the upstream reads that shape as an

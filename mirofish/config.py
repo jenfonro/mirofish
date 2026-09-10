@@ -46,18 +46,36 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
+#: Chromium family labels curl-impersonate understands. ``chrome136`` is a
+#: stable mid-2025 build close to current Electron; newer labels keep working
+#: as curl_cffi grows them.
+def _normalize_impersonate(raw: str) -> str:
+    value = (raw or "").strip().lower()
+    if not value or value in {"0", "off", "false", "none"}:
+        return ""
+    if value in {"1", "on", "true", "chrome", "default"}:
+        return "chrome136"
+    return value
+
+
 DEFAULT_DATA_DIR = pathlib.Path.home() / ".config" / "mirofish-relay"
 
 # Captured from an official client's /v1/messages request.  Callers that are
 # not themselves a Claude CLI get this identity synthesized so the relay sees a
-# coherent SDK fingerprint instead of a partial one.  Bump alongside
-# ``mirasim_client_version`` when a newer client build is observed.
-DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.252 (external, mirasim)"
-DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.272"
-# The desktop's bundled Codex binary identifies itself as the product, not as
-# ``codex_cli_rs``; this is the exact string from the 0.0.272 capture.
+# coherent SDK fingerprint instead of a partial one.  Since 0.0.303 the desktop
+# no longer bundles Claude, so the claude-cli version in this UA floats with
+# the locally installed binary; the value here is the build installed on the
+# analysis machine.
+DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.261 (external, mirasim)"
+# Still the bare build marker, not a UA string.
+DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.303"
+# The desktop's Codex binary identifies itself as the product, not as
+# ``codex_cli_rs``.  Since 0.0.303 Codex is no longer bundled either, so the
+# version floats with the locally installed binary while the OS/arch/terminal
+# parts stay as captured; this value is the build installed on the analysis
+# machine.
 DEFAULT_CODEX_USER_AGENT = (
-    "mirasim/0.150.1 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
+    "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
 
 
 @dataclass
@@ -96,6 +114,23 @@ class Settings:
     # restore plain passthrough for a caller that really wants one token of
     # model output (and the upstream 400 that comes with it).
     one_token_short_circuit: bool = True
+
+    # Replays the whole-client background behavior of the official desktop:
+    # gzipped /events telemetry, the /v1/model-roster probe, and the
+    # cdn-assets update check. Each account gets its own task with its own
+    # jitter so the fleet does not beat in lockstep.
+    behavior_replay: bool = True
+
+    # Optional outer forward proxy that terminates the TLS handshake instead
+    # of the local OpenSSL stack (e.g. a fingerprint-spoofing gateway). The
+    # upstream URL is left untouched: CONNECT tunnelling forwards the
+    # ClientHello this proxy generates, while header/body fidelity stays here.
+    tls_proxy: str = ""
+    # Chromium-family ClientHello impersonation via curl-impersonate
+    # (``curl_cffi``). Empty disables it (httpx + OpenSSL). A value such as
+    # ``chrome136`` sends upstream traffic with a BoringSSL-shaped JA3/JA4
+    # while still going through the account's own Mihomo exit.
+    tls_impersonate: str = ""
 
     proxy_refresh_seconds: float = 600.0
     proxy_fetch_timeout: float = 10.0
@@ -161,6 +196,10 @@ class Settings:
             session_ttl=_env_float("MIROFISH_SESSION_TTL", 1800.0, minimum=60.0),
             one_token_short_circuit=_env_bool(
                 "MIROFISH_ONE_TOKEN_SHORT_CIRCUIT", True),
+            behavior_replay=_env_bool("MIROFISH_BEHAVIOR_REPLAY", True),
+            tls_proxy=os.environ.get("MIROFISH_TLS_PROXY", "").strip(),
+            tls_impersonate=_normalize_impersonate(
+                os.environ.get("MIROFISH_TLS_IMPERSONATE", "")),
             stream_read_timeout=_env_float(
                 "MIROFISH_STREAM_READ_TIMEOUT", 600.0, minimum=30.0),
             keepalive_expiry=_env_float(

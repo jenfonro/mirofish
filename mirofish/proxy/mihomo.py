@@ -176,22 +176,17 @@ class SlotManager:
                     f"mihomo:{self.legacy_selector}:{node}")
             return
         slot = await self._slot_for(alias)
-        shared = len(slot.accounts) > 1
-        if shared:
-            # More accounts than slots: serialize this slot's requests so one
-            # account's selector switch cannot reroute another mid-request.
-            async with slot.lock:
-                if slot.current_node != node:
-                    await self.client.set_selector(slot.group, node)
-                    slot.current_node = node
-                yield RoutedProxyURL(
-                    self._proxy_url_for_port(slot.port),
-                    f"mihomo:{slot.group}:{node}")
-            return
+        # Every request runs inside the slot lock, whether or not the slot is
+        # shared.  When accounts outnumber slots, the lock serializes requests
+        # queued behind one account's selector switch so it cannot reroute
+        # another mid-request.  With a dedicated slot the selector never moves,
+        # but the account must still queue behind its own in-flight switch; the
+        # lock is the single mechanism for both cases rather than a dynamic
+        # shared selector.
         async with slot.lock:
             if slot.current_node != node:
                 await self.client.set_selector(slot.group, node)
                 slot.current_node = node
-        yield RoutedProxyURL(
-            self._proxy_url_for_port(slot.port),
-            f"mihomo:{slot.group}:{node}")
+            yield RoutedProxyURL(
+                self._proxy_url_for_port(slot.port),
+                f"mihomo:{slot.group}:{node}")
