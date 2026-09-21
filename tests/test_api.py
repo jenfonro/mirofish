@@ -399,30 +399,6 @@ async def test_device_session_refreshes_access_on_401(client, state, auth_header
     assert response.status_code == 200
     assert session.call_count == 2 and refresh.called
     assert state.store.vault.get("work", "access") == "new-access"
-
-
-@respx.mock
-async def test_message_region_refusal_is_exposed_as_rotatable_proxy_error(state):
-    add_account(state, "work")
-    mock_device_session()
-    respx.post(RELAY_BASE + "/v1/messages").mock(
-        return_value=httpx.Response(429, json={
-            "error": {
-                "type": "shared_quota_unavailable",
-                "message": "The cloud route is not served to this network region.",
-            },
-        }))
-
-    with pytest.raises(RelayError) as raised:
-        await state.upstream.messages(
-            "work", {"model": "m", "max_tokens": 16,
-                     "messages": [{"role": "user", "content": "hi"}]},
-            proxy_url="http://proxy.test:8080")
-
-    assert raised.value.status == 502
-    assert raised.value.data["region_blocked"] is True
-
-
 @respx.mock
 async def test_messages_stream_passthrough(client, state, auth_headers):
     add_account(state, "work")
@@ -905,7 +881,6 @@ async def test_relogin_same_email_keeps_device_and_clears_old_runtime(
         "stale-ticket", time.monotonic() + 900)
     state.upstream._device_sessions.add(key)
     _seed_account_runtime(state, "work")
-    state.pool._region_refused["work"] = {"stale-node": time.time() + 1800}
     _mock_login("x@example.com")
 
     await client.post("/api/login/start", headers=auth_headers,
@@ -922,7 +897,6 @@ async def test_relogin_same_email_keeps_device_and_clears_old_runtime(
     assert "work" not in state.model_cache
     assert "work" not in state._exhausted_until
     assert "work" not in state._last_assigned
-    assert "work" not in state.pool._region_refused
     assert all(entry["account"] != "work" for entry in state._sessions.values())
 
 
@@ -963,9 +937,6 @@ async def test_delete_account(client, state, auth_headers):
     _seed_account_runtime(state, "work")
     state.pending_logins["work"] = {
         "email": "work@example.com", "created": time.time(), "proxy_id": None}
-    state.pool._region_refused["work"] = {"stale-node": time.time() + 1800}
-    released = []
-    state.pool.slots = SimpleNamespace(release=released.append)
 
     response = await client.request("DELETE", "/api/accounts/work", headers=auth_headers)
 
@@ -978,10 +949,7 @@ async def test_delete_account(client, state, auth_headers):
     assert "work" not in state._exhausted_until
     assert "work" not in state._last_assigned
     assert "work" not in state.pending_logins
-    assert "work" not in state.pool._region_refused
     assert all(entry["account"] != "work" for entry in state._sessions.values())
-    # remove_account delegates slot ownership to ProxyPool exactly once.
-    assert released == ["work"]
 
     # Account deletion removes authorization only. The official device key is
     # installation-global and therefore survives alias reuse.
@@ -1395,39 +1363,6 @@ async def test_all_limits_survives_one_failure(client, state, auth_headers):
     bad = next(r for r in results.values() if not r["ok"])
     assert ok["limits"]["windows"]
     assert bad["error"]
-
-
-@respx.mock
-async def test_login_start_fails_over_dead_node(client, state, auth_headers):
-    import time as time_module
-
-    from mirofish.proxy.parse import proxy_identity
-
-    # Two direct-mode nodes; pretend the subscription was already refreshed.
-    for name, host in [("node-a", "a.example"), ("node-b", "b.example")]:
-        config = {"name": name, "scheme": "http", "host": host, "port": 8080,
-                  "username": "", "password": ""}
-        node_id = proxy_identity(config)
-        state.pool.configs[node_id] = {**config, "id": node_id}
-        state.store.upsert_proxy(node_id, config)
-    state.pool.subscription_url = "https://sub.test/nodes"
-    state.pool.last_refresh = time_module.time()
-
-    respx.post(AUTH_BASE + "/auth/code").mock(side_effect=[
-        httpx.ConnectError("dead exit"),
-        httpx.Response(200, json={"sent": True}),
-    ])
-    response = await client.post("/api/login/start", headers=auth_headers,
-                                 json={"alias": "work", "email": "x@example.com"})
-    assert response.status_code == 200 and response.json()["sent"] is True
-    failures = [int(row["failure_count"]) for row in state.store.proxy_rows()]
-    assert sorted(failures) == [0, 1]  # the dead node was marked and skipped
-
-
-EXHAUSTED_BODY = {"type": "error", "error": {
-    "type": "credit_exhausted_shared", "message": "shared quota used up"}}
-
-
 async def test_account_toggle_excludes_from_selection(client, state, auth_headers):
     add_account(state, "alpha")
     add_account(state, "beta")
@@ -1458,6 +1393,10 @@ async def test_disable_detaches_live_sessions(client, state, auth_headers):
                       json={"enabled": False})
     # The next turn of the same conversation moves off the disabled account.
     assert state.route_account("", "", conv) == other
+
+
+EXHAUSTED_BODY = {"type": "error", "error": {
+    "type": "credit_exhausted_shared", "message": "shared quota used up"}}
 
 
 @respx.mock
@@ -1536,23 +1475,3 @@ async def test_messages_surface_exhaustion_when_every_account_is_refused(
     assert response.status_code == 429
     assert response.json()["error"]["type"] == "credit_exhausted_shared"
     assert route.call_count == 2
-
-
-async def test_failover_covers_region_refused_everywhere(state):
-    add_account(state, "alpha")
-    add_account(state, "beta")
-    refused = RelayError(
-        "upstream does not serve this proxy exit region", 502,
-        {"region_blocked": True, "region_refused_everywhere": True})
-    served = []
-
-    async def run(account: str):
-        served.append(account)
-        if account == "alpha":
-            raise refused
-        return "ok"
-
-    account, result = await state.with_account_failover("", "", _conv("hello"), run)
-    assert (account, result) == ("beta", "ok")
-    assert served == ["alpha", "beta"]
-    assert state.exhausted_cooldown("alpha") > 0

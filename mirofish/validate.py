@@ -5,6 +5,7 @@ from __future__ import annotations
 import pathlib
 import re
 import urllib.parse
+from typing import Any
 
 from .errors import RelayError
 
@@ -85,3 +86,28 @@ def proxy_subscription_file_value(value: str) -> str:
     if not value or not path.is_absolute() or ".." in path.parts:
         raise RelayError("proxy subscription file must be an absolute container path", 400)
     return value
+
+
+def proxy_node_value(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate one manually entered proxy node.
+
+    The name is optional and falls back to host:port: a pasted endpoint often
+    has no meaningful name, and requiring one would just get a placeholder.
+    """
+    scheme = str(payload.get("scheme", "socks5")).strip().lower()
+    if scheme not in ("socks5", "http", "https"):
+        raise RelayError("proxy scheme must be socks5, http or https", 400)
+    host = str(payload.get("host", "")).strip()
+    if not host or len(host) > 255 or any(c.isspace() for c in host):
+        raise RelayError("proxy host is required", 400)
+    try:
+        port = int(payload.get("port", 0))
+    except (TypeError, ValueError) as exc:
+        raise RelayError("proxy port must be a number", 400) from exc
+    if not 1 <= port <= 65535:
+        raise RelayError("proxy port must be within 1-65535", 400)
+    name = str(payload.get("name", "")).strip()[:200]
+    return {"name": name or "%s:%d" % (host, port), "scheme": scheme,
+            "host": host, "port": port,
+            "username": str(payload.get("username", "")).strip()[:200],
+            "password": str(payload.get("password", ""))[:400]}

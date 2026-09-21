@@ -11,7 +11,8 @@ from .. import __version__
 from ..accounts import public_status
 from ..device import DEVICE_KEY_KIND
 from ..errors import RelayError
-from ..validate import alias_value, email_value
+from ..proxy import DIRECT, proxy_from_uri
+from ..validate import alias_value, email_value, proxy_node_value
 from .deps import get_state, read_json_body, require_auth
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -22,7 +23,7 @@ async def health(request: Request) -> dict[str, Any]:
     state = get_state(request)
     return {"ok": True, "accounts": len(state.store.aliases()),
             "version": __version__,
-            "proxy_backend": "mihomo" if state.pool.uses_mihomo else "direct",
+            "proxy_backend": "direct",
             "default_account": state.default_account or None}
 
 
@@ -117,16 +118,51 @@ async def reset_device(alias: str, request: Request) -> dict[str, Any]:
     return {"alias": alias, "device_id": state.upstream._signer(alias).device_id}
 
 
+@router.post("/api/accounts/{alias}/proxy")
+async def set_account_proxy(alias: str, request: Request) -> dict[str, Any]:
+    """Pin this account to one exit, or release it with an empty id.
+
+    Live sessions are dropped: they are pinned to the account, and the next
+    turn must go out through the exit the operator just chose.
+    """
+    state = get_state(request)
+    alias = alias_value(alias)
+    state.store.row(alias)
+    payload = await read_json_body(request)
+    proxy_id = str(payload.get("proxy_id") or "").strip()
+    if proxy_id and state.pool.by_id(proxy_id) is None:
+        raise RelayError("unknown proxy node: " + proxy_id, 404)
+    # An empty id is "no proxy", stored as DIRECT rather than NULL: NULL reads
+    # as "never assigned" and the next request would hand the account an exit.
+    state.store.set_account_proxy(alias, proxy_id or DIRECT)
+    state.drop_account_sessions(alias)
+    return {"alias": alias, "proxy": state.pool.account_public(alias)}
+
+
 @router.post("/api/login/start")
 async def login_start(request: Request) -> dict[str, Any]:
     state = get_state(request)
     payload = await read_json_body(request)
     alias = alias_value(str(payload.get("alias", "")))
     email = email_value(str(payload.get("email", "")))
+    # An operator can pick the exit up front. An explicitly empty proxy_id is
+    # them choosing no proxy, which must not fall back to auto-selection.
+    pinned = None
+    direct = False
+    if "proxy_id" in payload:
+        requested = str(payload.get("proxy_id") or "").strip()
+        if requested:
+            pinned = state.pool.by_id(requested)
+            if pinned is None:
+                raise RelayError("unknown proxy node: " + requested, 404)
+        else:
+            direct = True
     proxy, _ = await state.with_pending_proxy(
-        alias, lambda url: state.accounts.start_login(alias, email, proxy_url=url))
-    state.put_pending_login(alias, email,
-                            proxy.get("id") if isinstance(proxy, dict) else None)
+        alias, lambda url: state.accounts.start_login(alias, email, proxy_url=url),
+        pinned=pinned, direct=direct)
+    state.put_pending_login(
+        alias, email,
+        proxy.get("id") if isinstance(proxy, dict) else (DIRECT if direct else None))
     return {"sent": True, "alias": alias}
 
 
@@ -136,12 +172,14 @@ async def login_finish(request: Request) -> dict[str, Any]:
     payload = await read_json_body(request)
     alias = alias_value(str(payload.get("alias", "")))
     pending = state.take_pending_login(alias)
-    proxy = state.pool.by_id(pending.get("proxy_id"))
+    requested = str(pending.get("proxy_id") or "")
+    proxy = state.pool.by_id(requested) if requested != DIRECT else None
     result = await state.with_fixed_proxy(
         alias, proxy,
         lambda url: state.accounts.finish_login(
             alias, pending["email"], str(payload.get("code", "")), proxy_url=url,
-            proxy_id=str(proxy["id"]) if proxy and proxy.get("id") else None))
+            proxy_id=(str(proxy["id"]) if proxy and proxy.get("id")
+                      else (DIRECT if requested == DIRECT else None))))
     state.reset_account_runtime(alias)
     state.pending_logins.pop(alias, None)
     return result
@@ -152,11 +190,57 @@ async def proxies(request: Request) -> dict[str, Any]:
     return get_state(request).pool.public_summary()
 
 
-@router.post("/api/proxies/subscription")
-async def set_subscription(request: Request) -> dict[str, Any]:
+@router.post("/api/proxies")
+async def add_proxy(request: Request) -> dict[str, Any]:
+    """Add one node. The name is optional and falls back to host:port, since a
+    pasted endpoint often has no meaningful name to give it."""
     state = get_state(request)
     payload = await read_json_body(request)
-    return await state.pool.set_subscription(str(payload.get("url", "")))
+    return state.pool.add(proxy_node_value(payload))
+
+
+@router.post("/api/proxies/import")
+async def import_proxies(request: Request) -> dict[str, Any]:
+    """Bulk-add from pasted lines.
+
+    Reports per-line outcomes rather than failing the batch: a list pasted
+    from elsewhere routinely has a stray blank or comment in it, and losing
+    the good lines over one bad one is not useful.
+    """
+    state = get_state(request)
+    payload = await read_json_body(request)
+    text = str(payload.get("text", ""))
+    added, failed = [], []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        config = proxy_from_uri(line) or proxy_from_uri("socks5://" + line)
+        if config is None:
+            failed.append(line[:120])
+            continue
+        added.append(state.pool.add(proxy_node_value(config)))
+    return {"added": len(added), "failed": failed,
+            "pool": state.pool.public_summary()}
+
+
+@router.patch("/api/proxies/{proxy_id}")
+async def edit_proxy(proxy_id: str, request: Request) -> dict[str, Any]:
+    state = get_state(request)
+    payload = await read_json_body(request)
+    return state.pool.update(proxy_id, proxy_node_value(payload))
+
+
+@router.delete("/api/proxies/{proxy_id}")
+async def delete_proxy(proxy_id: str, request: Request) -> dict[str, Any]:
+    state = get_state(request)
+    state.pool.remove(proxy_id)
+    return {"ok": True, "pool": state.pool.public_summary()}
+
+
+@router.post("/api/proxies/{proxy_id}/test")
+async def test_proxy(proxy_id: str, request: Request) -> dict[str, Any]:
+    return await get_state(request).pool.test(proxy_id)
 
 
 @router.get("/api/schedule")
@@ -176,16 +260,7 @@ async def set_schedule(request: Request) -> dict[str, Any]:
         raise RelayError("max_utilization must be a number", 400) from exc
     settings = state.set_schedule_settings(
         str(payload.get("mode", current["mode"])), ceiling)
-    # Both modes read the cached windows: make sure the sweep is running and
-    # probe now rather than ordering on days-old numbers until the next tick.
-    state.start_limits_refresh()
-    state.kick_limits_refresh()
     return settings
-
-
-@router.post("/api/proxies/refresh")
-async def refresh_proxies(request: Request) -> dict[str, Any]:
-    return await get_state(request).pool.refresh(force=True)
 
 
 @router.get("/api/usage")

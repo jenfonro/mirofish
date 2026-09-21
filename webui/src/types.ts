@@ -1,10 +1,11 @@
 export interface ProxyInfo {
-  id: string;
+  id: string | null;
   name?: string;
   scheme?: string;
   host?: string;
   port?: number;
   active: boolean;
+  status?: "ok" | "error" | "untested" | "invalid" | "unbound" | "missing";
   failure_count?: number;
   last_error?: string | null;
 }
@@ -100,14 +101,22 @@ export interface ScheduleSettings {
 
 export interface ProxySummary {
   configured: boolean;
-  backend: "mihomo" | "direct";
   active: number;
   total: number;
   assigned: number;
-  last_refresh: string | null;
-  last_error: string | null;
-  skipped_nodes: number;
-  nodes: ProxyInfo[] & { assigned?: number }[];
+  nodes: ProxyNode[];
+}
+
+export interface ProxyNode extends ProxyInfo {
+  id: string;
+  name: string;
+  scheme: string;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  assigned: number;
+  last_checked: string | null;
 }
 
 export interface Health {

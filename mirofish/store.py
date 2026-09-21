@@ -382,7 +382,10 @@ class Store:
     def proxy_assignment_counts(self) -> dict[str, int]:
         with self.db_lock:
             rows = self.db.execute(
-                "SELECT proxy_id,COUNT(*) AS count FROM accounts WHERE proxy_id IS NOT NULL GROUP BY proxy_id")
+                # 'direct' is proxy.pool.DIRECT: an account deliberately left
+                # unproxied. Spelled out because store must not import proxy.
+                "SELECT proxy_id,COUNT(*) AS count FROM accounts "
+                "WHERE proxy_id IS NOT NULL AND proxy_id<>'direct' GROUP BY proxy_id")
             return {str(row[0]): int(row[1]) for row in rows}
 
     # --- usage log ----------------------------------------------------------

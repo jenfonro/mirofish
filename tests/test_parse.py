@@ -1,79 +1,77 @@
-import base64
+"""Parsing manually entered proxy endpoints."""
 
 import pytest
 
 from mirofish.errors import RelayError
-from mirofish.proxy.parse import parse_proxy_subscription, proxy_identity, proxy_url
-
-URI_LIST = """
-http://user:pass@proxy-a.example.com:8080#Node%20A
-socks5://proxy-b.example.com:1080#NodeB
-vmess://ignored-encrypted-node
-"""
-
-YAML_DOC = """
-proxies:
-  - name: "HK-01"
-    type: http
-    server: hk.example.com
-    port: 8080
-    username: u1
-    password: p1
-  - name: "SS-01"
-    type: ss
-    server: ss.example.com
-    port: 8388
-    cipher: aes-256-gcm
-  - {name: "SG-02", type: socks5, server: sg.example.com, port: 1080}
-"""
+from mirofish.proxy.parse import proxy_from_uri, proxy_identity, proxy_url
+from mirofish.validate import proxy_node_value
 
 
-def test_uri_list():
-    nodes, skipped = parse_proxy_subscription(URI_LIST.encode())
-    assert [n["name"] for n in nodes] == ["Node A", "NodeB"]
-    assert nodes[0]["scheme"] == "http" and nodes[0]["username"] == "user"
-    assert nodes[1]["scheme"] == "socks5"
-    assert skipped == 1  # the vmess line
+@pytest.mark.parametrize("line,expected", [
+    ("socks5://user:pass@198.51.100.24:1080",
+     {"scheme": "socks5", "host": "198.51.100.24", "port": 1080,
+      "username": "user", "password": "pass"}),
+    ("http://1.2.3.4:3128",
+     {"scheme": "http", "host": "1.2.3.4", "port": 3128,
+      "username": "", "password": ""}),
+    ("socks5h://h.example.com:1080",
+     {"scheme": "socks5", "host": "h.example.com", "port": 1080,
+      "username": "", "password": ""}),
+])
+def test_a_pasted_uri_becomes_a_node(line, expected):
+    node = proxy_from_uri(line)
+    for key, value in expected.items():
+        assert node[key] == value
 
 
-def test_base64_wrapped_uri_list():
-    encoded = base64.b64encode(URI_LIST.strip().encode())
-    nodes, _ = parse_proxy_subscription(encoded)
-    assert len(nodes) == 2
+def test_a_name_comes_from_the_fragment_or_the_endpoint():
+    assert proxy_from_uri("socks5://h.example.com:1080#Tokyo%201")["name"] == "Tokyo 1"
+    # No fragment: the endpoint is the only honest label available.
+    assert proxy_from_uri("socks5://h.example.com:1080")["name"] == "h.example.com:1080"
 
 
-def test_mihomo_yaml():
-    nodes, skipped = parse_proxy_subscription(YAML_DOC.encode())
-    assert [n["name"] for n in nodes] == ["HK-01", "SG-02"]
-    assert nodes[0]["port"] == 8080 and nodes[0]["password"] == "p1"
-    assert skipped == 1  # the ss node
+@pytest.mark.parametrize("line", [
+    "", "not-a-proxy", "vmess://encrypted-node", "socks5://h.example.com",
+    "ftp://h.example.com:21",
+])
+def test_unusable_lines_are_rejected(line):
+    """A bulk import reports these per line rather than failing the batch."""
+    assert proxy_from_uri(line) is None
 
 
-def test_json_subscription():
-    doc = b'{"proxies": [{"name": "J1", "type": "http", "server": "j.example.com", "port": 3128}]}'
-    nodes, _ = parse_proxy_subscription(doc)
-    assert nodes[0]["name"] == "J1"
-
-
-def test_unsupported_only_raises():
-    with pytest.raises(RelayError):
-        parse_proxy_subscription(b"vmess://only-encrypted-nodes")
-
-
-def test_identity_matches_legacy_algorithm():
-    import hashlib
-    import json as jsonlib
-    config = {"name": "N", "scheme": "http", "host": "h", "port": 1,
-              "username": "", "password": ""}
-    canonical = jsonlib.dumps(config, ensure_ascii=False, sort_keys=True,
-                              separators=(",", ":"))
-    assert proxy_identity(config) == hashlib.sha256(canonical.encode()).hexdigest()[:32]
+def test_identity_is_the_endpoint_not_the_name():
+    """Renaming must not re-identify a node: accounts are pinned by id, so a
+    rename that changed it would silently unpin every account on that exit."""
+    base = {"scheme": "socks5", "host": "h", "port": 1080,
+            "username": "u", "password": "p"}
+    assert proxy_identity({**base, "name": "Tokyo"}) \
+        == proxy_identity({**base, "name": "Osaka"})
+    # A different endpoint is a different node.
+    assert proxy_identity({**base, "port": 1081}) != proxy_identity(base)
+    assert proxy_identity({**base, "password": "q"}) != proxy_identity(base)
 
 
 def test_proxy_url_quoting():
     config = {"scheme": "socks5", "host": "h.example.com", "port": 1080,
               "username": "u@x", "password": "p:w"}
     assert proxy_url(config) == "socks5://u%40x:p%3Aw@h.example.com:1080"
+
+
+def test_a_node_needs_a_host_a_port_and_a_dialable_scheme():
+    with pytest.raises(RelayError):
+        proxy_node_value({"host": "", "port": 1080})
+    with pytest.raises(RelayError):
+        proxy_node_value({"host": "h", "port": 0})
+    with pytest.raises(RelayError):
+        proxy_node_value({"host": "h", "port": 1080, "scheme": "vmess"})
+
+
+def test_a_blank_name_falls_back_to_the_endpoint():
+    """A pasted endpoint usually has no meaningful name, and demanding one
+    would only produce placeholders."""
+    node = proxy_node_value({"host": "h.example.com", "port": 1080})
+    assert node["name"] == "h.example.com:1080"
+    assert node["scheme"] == "socks5"
 
 
 def test_payload_summary_redacts_content():
