@@ -11,7 +11,6 @@ import OverviewPage from "./pages/OverviewPage.vue";
 import AccountsPage from "./pages/AccountsPage.vue";
 import UsagePage from "./pages/UsagePage.vue";
 import NetworkPage from "./pages/NetworkPage.vue";
-import SchedulePage from "./pages/SchedulePage.vue";
 import PlaygroundPage from "./pages/PlaygroundPage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
 
@@ -32,7 +31,6 @@ const PAGES: { id: PageId; label: string; icon: keyof typeof import("./icons").i
   { id: "accounts", label: "账号", icon: "accounts" },
   { id: "usage", label: "用量", icon: "usage" },
   { id: "network", label: "网络", icon: "network" },
-  { id: "schedule", label: "调度", icon: "schedule" },
   { id: "playground", label: "测试", icon: "playground" },
   { id: "settings", label: "设置", icon: "settings" },
 ];
@@ -186,7 +184,6 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
           <AccountsPage v-else-if="page === 'accounts'" />
           <UsagePage v-else-if="page === 'usage'" />
           <NetworkPage v-else-if="page === 'network'" />
-          <SchedulePage v-else-if="page === 'schedule'" />
           <PlaygroundPage v-else-if="page === 'playground'" />
           <SettingsPage
             v-else-if="page === 'settings'"

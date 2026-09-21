@@ -12,7 +12,6 @@ export type PageId =
   | "accounts"
   | "usage"
   | "network"
-  | "schedule"
   | "playground"
   | "settings";
 
@@ -72,7 +71,7 @@ export function storedPage(): PageId {
     const raw = localStorage.getItem(PAGE_STORAGE) as PageId | null;
     const pages: PageId[] = [
       "overview", "accounts", "usage", "network",
-      "schedule", "playground", "settings",
+      "playground", "settings",
     ];
     return raw && pages.includes(raw) ? raw : "overview";
   } catch {

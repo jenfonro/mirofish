@@ -85,13 +85,8 @@ const healthRows = computed(() => {
 const scheduleHint = computed(() => {
   const s = store.schedule;
   if (!s) return null;
-  const labels: Record<string, string> = {
-    balanced: "均衡分配",
-    reset_first: "优先重置窗口",
-    fable_first: "优先重置 + Fable",
-  };
   return {
-    mode: labels[s.mode] || s.mode,
+    mode: "优先重置 + Fable 已用最高",
     ceiling: `${(s.max_utilization * 100).toFixed(0)}%`,
   };
 });
@@ -145,7 +140,7 @@ onMounted(async () => {
       <div class="panel-head">
         <h3>调度策略</h3>
         <span class="spacer"></span>
-        <button class="btn ghost sm" @click="emit('navigate', 'schedule')">修改</button>
+        <button class="btn ghost sm" @click="emit('navigate', 'settings')">修改</button>
       </div>
       <div class="panel-body">
         <template v-if="scheduleHint">

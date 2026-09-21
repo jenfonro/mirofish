@@ -258,9 +258,7 @@ async def set_schedule(request: Request) -> dict[str, Any]:
         ceiling = float(payload.get("max_utilization", current["max_utilization"]))
     except (TypeError, ValueError) as exc:
         raise RelayError("max_utilization must be a number", 400) from exc
-    settings = state.set_schedule_settings(
-        str(payload.get("mode", current["mode"])), ceiling)
-    return settings
+    return state.set_schedule_settings(ceiling)
 
 
 @router.get("/api/usage")

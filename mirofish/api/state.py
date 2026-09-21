@@ -313,23 +313,22 @@ class AppState:
     # --- account selection ----------------------------------------------------
 
     def schedule_settings(self) -> dict[str, Any]:
-        mode = self.store.setting(SETTING_SCHEDULE_MODE, SCHEDULE_BALANCED)
-        if mode not in SCHEDULE_MODES:
-            mode = SCHEDULE_BALANCED
+        # There is a single scheduling policy now: order new conversations by
+        # the soonest-resetting window, then (for non-fable models) by how spent
+        # the account's own fable window is, so expiring/fable-locked credit is
+        # used first. The former mode selector is gone; only the utilization
+        # ceiling is operator-configurable (moved to Settings).
         try:
             ceiling = float(self.store.setting(
                 SETTING_SCHEDULE_MAX_UTILIZATION,
                 str(DEFAULT_SCHEDULE_MAX_UTILIZATION)))
         except ValueError:
             ceiling = DEFAULT_SCHEDULE_MAX_UTILIZATION
-        return {"mode": mode, "max_utilization": ceiling}
+        return {"mode": SCHEDULE_FABLE_FIRST, "max_utilization": ceiling}
 
-    def set_schedule_settings(self, mode: str, max_utilization: float) -> dict[str, Any]:
-        if mode not in SCHEDULE_MODES:
-            raise RelayError("unknown schedule mode: " + str(mode), 400)
+    def set_schedule_settings(self, max_utilization: float) -> dict[str, Any]:
         if not 0.0 < max_utilization <= 2.0:
             raise RelayError("max_utilization must be within (0, 2]", 400)
-        self.store.set_setting(SETTING_SCHEDULE_MODE, mode)
         self.store.set_setting(SETTING_SCHEDULE_MAX_UTILIZATION, repr(max_utilization))
         return self.schedule_settings()
 
@@ -604,7 +603,7 @@ class AppState:
         return self._no_selectable_error()
 
     def pick_account(self, requested: str, model: Optional[str] = None) -> str:
-        """Explicit header > default account > quota-aware round-robin."""
+        """Explicit header > default account > quota-aware reset/fable ordering."""
         requested = requested.strip()
         if requested:
             return self._explicit_account_for_model(requested, model)
@@ -618,32 +617,15 @@ class AppState:
         if not eligible:
             raise self._no_candidate_error(model, serviceable)
         schedule = self.schedule_settings()
-        if schedule["mode"] == SCHEDULE_RESET_FIRST:
-            # There is no session key to stay stable for, but the live session
-            # counts still say where the load already is, so reuse the same
-            # tilted ordering instead of sending every keyless request to the
-            # one account with the nearest reset.
-            counts = self.session_counts()
-            with self._rr_lock:
-                chosen = min(eligible,
-                             key=lambda alias: self._assignment_key(
-                                 alias, counts, schedule, model))
-                self._last_assigned[chosen] = time.time()
-                return chosen
+        # Single policy: order by soonest reset, then fable-spend, then load.
+        # The live session counts still say where load already is, so no keyless
+        # request piles onto the one account with the nearest reset.
+        counts = self.session_counts()
         with self._rr_lock:
-            start = self._rr_index
-            chosen = None
-            for offset in range(len(aliases)):
-                candidate = aliases[(start + offset) % len(aliases)]
-                if candidate in eligible:
-                    chosen = candidate
-                    self._rr_index = (start + offset + 1) % len(aliases)
-                    break
-            if chosen is None:
-                # Eligible is non-empty but not on the round-robin ring order;
-                # fall back to the first eligible account (never a spent one).
-                chosen = eligible[0]
-                self._rr_index = (start + 1) % len(aliases)
+            chosen = min(eligible,
+                         key=lambda alias: self._assignment_key(
+                             alias, counts, schedule, model))
+            self._last_assigned[chosen] = time.time()
             return chosen
 
     # --- session-affinity routing --------------------------------------------

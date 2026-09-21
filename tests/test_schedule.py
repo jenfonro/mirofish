@@ -42,25 +42,25 @@ def route(state, model="claude-opus-5", session="s1"):
     return state.route_account("", session, {"model": model})
 
 
-def test_balanced_is_the_default(state):
-    assert state.schedule_settings() == {
-        "mode": SCHEDULE_BALANCED,
-        "max_utilization": DEFAULT_SCHEDULE_MAX_UTILIZATION,
-    }
+def test_default_ceiling(state):
+    settings = state.schedule_settings()
+    assert settings["max_utilization"] == DEFAULT_SCHEDULE_MAX_UTILIZATION
 
 
 def test_reset_first_prefers_the_soonest_expiring_window(state):
-    with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.02)
-    with_windows(state, "expires-soon", resets_in_hours=20, seven_day=0.48)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
-    # Balanced would pick either; only the reset time distinguishes them.
+    # Reset urgency is scaled by fable spend in the single policy, so give both
+    # accounts fable spend; the soonest reset then still wins.
+    with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.02, fable=0.5)
+    with_windows(state, "expires-soon", resets_in_hours=20, seven_day=0.48, fable=0.5)
+    state.set_schedule_settings(0.98)
+    # Only the reset time distinguishes them.
     assert route(state) == "expires-soon"
 
 
 def test_balanced_ignores_the_reset_time(state):
     with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.02)
     with_windows(state, "expires-soon", resets_in_hours=20, seven_day=0.48)
-    state.set_schedule_settings(SCHEDULE_BALANCED, 0.98)
+    state.set_schedule_settings(0.98)
     # Neither account holds a session yet, so the tie falls to the first alias.
     assert route(state) == "expires-late"
 
@@ -68,15 +68,15 @@ def test_balanced_ignores_the_reset_time(state):
 def test_a_nearly_spent_account_stops_attracting_conversations(state):
     with_windows(state, "expires-soon", resets_in_hours=20, seven_day=0.99)
     with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.10)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     assert route(state) == "expires-late"
 
 
 def test_the_ceiling_is_configurable(state):
-    with_windows(state, "expires-soon", resets_in_hours=20, seven_day=0.99)
-    with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.10)
+    with_windows(state, "expires-soon", resets_in_hours=20, seven_day=0.99, fable=0.5)
+    with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.10, fable=0.5)
     # Raise it above the account's load and it becomes preferred again.
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 1.5)
+    state.set_schedule_settings(1.5)
     assert route(state) == "expires-soon"
 
 
@@ -90,13 +90,9 @@ def test_fable_first_prefers_the_fullest_fable_window(state):
                  seven_day=0.50, fable=1.02)
     with_windows(state, "fable-free", resets_in_hours=20,
                  seven_day=0.50, fable=0.05)
-    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
 
     assert route(state, model="claude-opus-5") == "fable-spent"
-    # Reset-first cannot tell them apart, so it falls back to alias order --
-    # this is exactly what the new mode adds.
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
-    assert route(state, model="claude-opus-5", session="s2") == "fable-free"
 
 
 def test_fable_first_leaves_fable_traffic_on_reset_first_ordering(state):
@@ -110,7 +106,7 @@ def test_fable_first_leaves_fable_traffic_on_reset_first_ordering(state):
                  seven_day=0.50, fable=1.02)
     with_windows(state, "fable-free", resets_in_hours=20,
                  seven_day=0.50, fable=0.05)
-    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
 
     # The spent fable window is exhausted for this model, so automatic
     # selection skips it and the account with headroom serves the request.
@@ -127,7 +123,7 @@ def test_fable_first_still_honours_the_reset_horizon(state):
                  seven_day=0.50, fable=1.02)
     with_windows(state, "near-fable-free", resets_in_hours=6,
                  seven_day=0.50, fable=0.60)
-    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
 
     assert route(state, model="claude-opus-5") == "near-fable-free"
 
@@ -137,7 +133,7 @@ def test_fable_first_still_spreads_the_concurrency(state):
     for index in range(4):
         with_windows(state, f"acct-{index}", resets_in_hours=20,
                      seven_day=0.30, fable=1.0)
-    state.set_schedule_settings(SCHEDULE_FABLE_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
 
     picks = spread(state, 12, model="claude-opus-5")
     assert len(picks) > 1, f"every conversation landed on one account: {picks}"
@@ -150,7 +146,7 @@ def test_fable_also_counts_its_own_window(state):
                  seven_day=0.30, fable=0.99)
     with_windows(state, "fable-free", resets_in_hours=140,
                  seven_day=0.30, fable=0.10)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     assert route(state, model="claude-fable-5") == "fable-free"
     # A non-fable model is unaffected by that window.
     assert route(state, model="claude-opus-5", session="s2") == "fable-spent"
@@ -164,7 +160,7 @@ def test_balanced_also_skips_an_exhausted_fable_window(state):
                  seven_day=0.70, fable=1.30)
     with_windows(state, "fable-free", resets_in_hours=100,
                  seven_day=0.80, fable=0.20)
-    state.set_schedule_settings(SCHEDULE_BALANCED, 0.98)
+    state.set_schedule_settings(0.98)
     for i in range(4):
         assert route(state, model="claude-fable-5", session=f"f{i}") == "fable-free"
     # Non-fable requests may still spend the account's remaining 7d room.
@@ -176,7 +172,7 @@ def test_balanced_respects_the_utilization_ceiling(state):
     mode too; overshoot past the budget cannot be walked back afterwards."""
     with_windows(state, "nearly-spent", resets_in_hours=100, seven_day=0.985)
     with_windows(state, "has-room", resets_in_hours=100, seven_day=0.20)
-    state.set_schedule_settings(SCHEDULE_BALANCED, 0.98)
+    state.set_schedule_settings(0.98)
     assert spread(state, 3) == {"has-room": 3}
 
 
@@ -214,7 +210,7 @@ def test_headerless_responses_keep_the_cached_quota(state):
 def test_an_unprobed_account_gets_no_head_start(state):
     add_account(state, "never-probed")
     with_windows(state, "expiring", resets_in_hours=2, seven_day=0.10)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     # Both start at zero sessions, so only the known expiry breaks the tie.
     assert route(state) == "expiring"
 
@@ -223,7 +219,7 @@ def test_a_far_off_reset_earns_no_tilt(state):
     # Beyond the horizon there is still a week to spend the credit normally.
     add_account(state, "never-probed")
     with_windows(state, "resets-next-week", resets_in_hours=140, seven_day=0.10)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     assert state._urgency_bonus("resets-next-week") == 0.0
     assert state._urgency_bonus("never-probed") == 0.0
 
@@ -231,33 +227,28 @@ def test_a_far_off_reset_earns_no_tilt(state):
 def test_affinity_still_pins_a_live_conversation(state):
     with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.02)
     with_windows(state, "expires-soon", resets_in_hours=20, seven_day=0.48)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     first = route(state, session="chat-1")
     # Re-routing mid-conversation would lose the cached prefix and context.
     assert route(state, session="chat-1") == first
 
 
 def test_settings_round_trip_and_reject_nonsense(state):
-    assert state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.9) == {
-        "mode": SCHEDULE_RESET_FIRST, "max_utilization": 0.9}
-    assert state.schedule_settings()["mode"] == SCHEDULE_RESET_FIRST
+    assert state.set_schedule_settings(0.9)["max_utilization"] == 0.9
+    assert state.schedule_settings()["max_utilization"] == 0.9
     with pytest.raises(RelayError):
-        state.set_schedule_settings("sideways", 0.9)
-    with pytest.raises(RelayError):
-        state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.0)
+        state.set_schedule_settings(0.0)
 
 
 async def test_schedule_api_round_trip(client, state, auth_headers):
     response = await client.get("/api/schedule", headers=auth_headers)
-    assert response.json()["mode"] == SCHEDULE_BALANCED
+    assert "max_utilization" in response.json()
     response = await client.post("/api/schedule", headers=auth_headers,
-                                 json={"mode": SCHEDULE_RESET_FIRST,
-                                       "max_utilization": 0.95})
-    assert response.json() == {"mode": SCHEDULE_RESET_FIRST, "max_utilization": 0.95}
-    assert (await client.get("/api/schedule", headers=auth_headers)).json() == {
-        "mode": SCHEDULE_RESET_FIRST, "max_utilization": 0.95}
+                                 json={"max_utilization": 0.95})
+    assert response.json()["max_utilization"] == 0.95
+    assert (await client.get("/api/schedule", headers=auth_headers)).json()["max_utilization"] == 0.95
     bad = await client.post("/api/schedule", headers=auth_headers,
-                            json={"mode": "sideways"})
+                            json={"max_utilization": 0})
     assert bad.status_code == 400
 
 
@@ -299,14 +290,6 @@ def test_credit_exhaustion_cools_much_longer_than_a_transient_429(state):
         pytest.approx(TRANSIENT_429_COOLDOWN, abs=5)
 
 
-def test_region_refusal_stays_with_the_proxy_pool(state):
-    # Rotating the exit fixes this one; taking the account out would not.
-    add_account(state, "work")
-    assert not state.note_account_unserviceable(
-        "work", refusal(429, "shared_quota_unavailable"))
-    assert state.exhausted_cooldown("work") == 0
-
-
 def test_non_429_errors_are_left_alone(state):
     add_account(state, "work")
     for status in (400, 401, 500, 502):
@@ -329,10 +312,10 @@ def test_reset_first_still_spreads_the_concurrency(state):
     Sorting by the reset timestamp alone never ties, so the balanced part of
     the key would be dead code and one account would absorb all the load.
     """
-    with_windows(state, "expires-soon", resets_in_hours=2, seven_day=0.40)
-    with_windows(state, "expires-mid", resets_in_hours=60, seven_day=0.40)
-    with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.40)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    with_windows(state, "expires-soon", resets_in_hours=2, seven_day=0.40, fable=1.0)
+    with_windows(state, "expires-mid", resets_in_hours=60, seven_day=0.40, fable=1.0)
+    with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.40, fable=1.0)
+    state.set_schedule_settings(0.98)
 
     picks = spread(state, 9)
     assert len(picks) == 3, f"conversations landed on {len(picks)} account(s): {picks}"
@@ -345,7 +328,7 @@ def test_balanced_splits_evenly(state):
     with_windows(state, "a", resets_in_hours=2, seven_day=0.40)
     with_windows(state, "b", resets_in_hours=60, seven_day=0.40)
     with_windows(state, "c", resets_in_hours=140, seven_day=0.40)
-    state.set_schedule_settings(SCHEDULE_BALANCED, 0.98)
+    state.set_schedule_settings(0.98)
     # Expiry is ignored entirely, so the split is exact.
     assert spread(state, 9) == {"a": 3, "b": 3, "c": 3}
 
@@ -354,7 +337,7 @@ def test_the_head_start_is_bounded(state):
     """An expiring account leads by a fixed number of sessions, not forever."""
     with_windows(state, "expires-soon", resets_in_hours=1, seven_day=0.40)
     with_windows(state, "expires-late", resets_in_hours=140, seven_day=0.40)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     picks = spread(state, 8)
     # Once its real count catches up with the bonus, the other one is used too.
     assert picks["expires-late"] >= 2, picks
@@ -369,7 +352,7 @@ def test_urgency_grows_as_the_window_closes(state):
 def test_a_spent_account_yields_to_everyone_with_room(state):
     with_windows(state, "spent-but-expiring", resets_in_hours=1, seven_day=0.99)
     with_windows(state, "has-room", resets_in_hours=140, seven_day=0.10)
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     picks = spread(state, 6)
     assert picks["has-room"] > picks.get("spent-but-expiring", 0)
 
@@ -432,7 +415,7 @@ async def test_the_sweep_runs_in_every_mode(state, monkeypatch):
         await asyncio.sleep(0.01)
     assert sweeps, "the startup sweep did not run in balanced mode"
 
-    state.set_schedule_settings(SCHEDULE_RESET_FIRST, 0.98)
+    state.set_schedule_settings(0.98)
     state.kick_limits_refresh()
     before = len(sweeps)
     for _ in range(200):

@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { ref } from "vue";
-import { store } from "../store";
+import { computed, onMounted, ref } from "vue";
+import { api } from "../api";
+import { loadSchedule, store, toast } from "../store";
 import type { PageId, ThemeMode } from "../main";
 
 const props = defineProps<{
@@ -14,6 +15,43 @@ const emit = defineEmits<{
 }>();
 
 const copied = ref("");
+
+// 用量上限 (dispatch ceiling): the only scheduling knob. Above it an account is
+// skipped on the request path; a fully-spent pool answers a local 429 rather
+// than forwarding upstream.
+const ceiling = ref(0.98);
+const ceilingBusy = ref(false);
+const ceilingDirty = computed(() =>
+  !!store.schedule && Math.abs(store.schedule.max_utilization - ceiling.value) > 1e-9);
+
+function adoptCeiling() {
+  if (store.schedule) ceiling.value = store.schedule.max_utilization;
+}
+
+async function saveCeiling() {
+  ceilingBusy.value = true;
+  try {
+    store.schedule = await api("/api/schedule", {
+      method: "POST",
+      body: JSON.stringify({ max_utilization: ceiling.value }),
+    });
+    adoptCeiling();
+    toast("用量上限已保存", "ok");
+  } catch (e: any) {
+    toast(`保存失败：${e.message}`, "error");
+  } finally {
+    ceilingBusy.value = false;
+  }
+}
+
+onMounted(async () => {
+  try {
+    await loadSchedule();
+  } catch {
+    /* the overview/connect already hydrates it; ignore a soft failure */
+  }
+  adoptCeiling();
+});
 
 async function copy(text: string, tag: string) {
   try {
@@ -69,6 +107,34 @@ function curlExample(path: string): string {
                     @click="emit('update:skin', 'miku')">Miku ♪</button>
           </div>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Dispatch ceiling -->
+  <div class="panel">
+    <div class="panel-head">
+      <h3>用量上限</h3>
+      <span class="spacer"></span>
+      <span class="chip">{{ (ceiling * 100).toFixed(0) }}%</span>
+    </div>
+    <div class="panel-body">
+      <p class="muted mb-2">
+        账号在任一相关窗口（5 小时 / 7 天 / 7 天 Claude / fable 另看 7 天 Fable）
+        用量达到此上限后，就不再被分配新请求，也不会转发到上游；所有账号都到顶时
+        本机直接返回 429，等窗口重置。上游返回 429 时会自动换号重试。
+      </p>
+      <div class="field-row">
+        <div class="grow">
+          <input type="range" min="0.5" max="1" step="0.01" v-model.number="ceiling" />
+        </div>
+        <span class="chip accent" style="min-width:56px;text-align:center">
+          {{ (ceiling * 100).toFixed(0) }}%
+        </span>
+      </div>
+      <div class="row mt-2">
+        <button class="btn" :disabled="ceilingBusy || !ceilingDirty" @click="saveCeiling">保存</button>
+        <button class="btn ghost" :disabled="ceilingBusy || !ceilingDirty" @click="adoptCeiling">撤销</button>
       </div>
     </div>
   </div>

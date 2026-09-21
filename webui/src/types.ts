@@ -95,7 +95,7 @@ export interface LimitsSummary {
 }
 
 export interface ScheduleSettings {
-  mode: "balanced" | "reset_first" | "fable_first";
+  mode?: string;
   max_utilization: number;
 }
 
