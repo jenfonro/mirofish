@@ -12,41 +12,52 @@ def test_proxy_key_notice_never_contains_secret(state):
     assert "不会写入日志" in notice
 
 
-class _FakeAccounts:
-    async def start_login(self, alias, email, proxy_url=None):
-        return None
-
-    async def finish_login(self, alias, email, code, proxy_url=None, proxy_id=None):
-        return {"alias": alias, "email": email, "code": code}
-
-
 class _FakeState:
     def __init__(self):
-        self.accounts = _FakeAccounts()
-        self.reset = []
         self.removed = []
-
-    async def with_pending_proxy(self, alias, operation):
-        return None, await operation(None)
-
-    async def with_fixed_proxy(self, alias, proxy, operation):
-        return await operation(None)
-
-    def reset_account_runtime(self, alias):
-        self.reset.append(alias)
 
     def remove_account(self, alias):
         self.removed.append(alias)
 
 
-async def test_cli_add_resets_account_runtime(monkeypatch):
-    state = _FakeState()
+async def test_cli_add_resets_account_runtime(state, monkeypatch):
+    from tests.conftest import add_account
+    add_account(state, "work")
+    resets = []
+    async def start(*args, **kwargs):
+        pass
+    async def finish(*args, **kwargs):
+        return {}
+    monkeypatch.setattr(state.accounts, "start_login", start)
+    monkeypatch.setattr(state.accounts, "finish_login", finish)
+    monkeypatch.setattr(state, "reset_account_runtime", resets.append)
     monkeypatch.setattr("mirofish.cli.getpass.getpass", lambda _prompt: "123456")
     monkeypatch.setattr("mirofish.cli._print", lambda _value: None)
 
     await _cmd_add(state, "work", "work@example.com")
 
-    assert state.reset == ["work"]
+    assert resets == ["work"]
+
+
+async def test_cli_relogin_keeps_selected_proxy(state, monkeypatch):
+    from tests.conftest import add_account
+    add_account(state, "work")
+    proxy = state.pool.add({"scheme": "http", "host": "proxy.test", "port": 8080})
+    state.store.set_account_proxy("work", proxy["id"])
+    calls = []
+    async def start(alias, email, proxy_url=None):
+        calls.append(proxy_url)
+    async def finish(alias, email, code, proxy_url=None, proxy_id=None):
+        calls.append(proxy_url)
+        assert proxy_id == proxy["id"]
+        return {}
+    monkeypatch.setattr(state.accounts, "start_login", start)
+    monkeypatch.setattr(state.accounts, "finish_login", finish)
+    monkeypatch.setattr("mirofish.cli.getpass.getpass", lambda _prompt: "123456")
+    monkeypatch.setattr("mirofish.cli._print", lambda _value: None)
+    await _cmd_add(state, "work", "work@example.com")
+    assert calls == ["http://proxy.test:8080"] * 2
+    assert state.store.row("work")["proxy_id"] == proxy["id"]
 
 
 def test_cli_remove_uses_state_lifecycle(capsys):

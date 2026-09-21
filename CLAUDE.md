@@ -15,7 +15,7 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   - `mirofish/seal.py`: `mrs-seal-v1` envelope (`x-mirasim-enc`) for the relay's own request metadata.
   - `mirofish/wire.py`: makes h11 write request headers in profile order (`Host`/`Connection` last,
     as the official clients do) instead of hoisting `Host` to the first line.
-  - `mirofish/proxy/`: subscription parsing (PyYAML), Mihomo controller client + slot manager, sticky pool.
+  - `mirofish/proxy/`: manually maintained proxy endpoints (HTTP/HTTPS/SOCKS5 URI parsing, fixed per-account bindings). No subscription, auto-selection, or engine.
   - `mirofish/vault/`: credential backends (macOS Keychain; AES-256-GCM file vault with legacy v1 migration).
   - `mirofish/store.py`: SQLite metadata + usage log.
   - `mirofish/translate.py`: OpenAI ⇄ Anthropic translation incl. incremental stream translation.
@@ -24,16 +24,16 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
 - `tests/`: pytest suite (respx-mocked upstream; no live calls). `tests/mirasim_protocol.py` is the
   shared unseal/verify helper; `tests/fixtures/request_profiles/` holds redacted golden request profiles.
 - `tools/request_profile.py`: mitmproxy addon + validator that turns captures into those golden fixtures.
-- `deploy/mirofish-relay/`: multi-stage Dockerfile (bundles the Mihomo binary), single-service docker-compose, `docker-entrypoint.sh` (starts Mihomo then the relay in one container), `.env.example`, deployment README.
+- `deploy/mirofish-relay/`: multi-stage Dockerfile (relay only, no bundled engine), single-service docker-compose (journald logging), `docker-entrypoint.sh` (execs the relay), `.env.example`, deployment README.
 
 ## Architecture
 
 - FastAPI + httpx (async); dependencies managed by uv via `pyproject.toml`.
-- SQLite stores metadata, non-secret settings (`settings` table, e.g. the schedule mode), and the usage log only.
+- SQLite stores metadata, non-secret settings (`settings` table, e.g. `quota_ceiling`), and the usage log only.
 - Credentials live in macOS Keychain (host) or the encrypted `secrets.enc` file (containers): v2 = scrypt + AES-256-GCM; legacy v1 blobs are read and transparently rewritten as v2.
 - Access tokens refresh on upstream HTTP 401 with a per-alias single-flight lock.
-- Model relay calls use one Ed25519 device identity **per account** (lazy create, vault-persisted,
-  resettable via `POST /api/accounts/{alias}/reset-device`), per-exit
+- Model relay calls use one Ed25519 device identity **per account** (lazy create, vault-persisted),
+  per-exit
   `/v1/device/session` tickets, and `mrs-sig-v2` signatures over a canonical record (method,
   pathname, timestamp, nonce, device id, client version, and SHA-256 digests of the bearer
   credential, the canonicalized relay metadata, and the exact request body — secrets never enter
@@ -46,6 +46,10 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   `MIROFISH_MIRASIM_CLIENT_VERSION` is pinned below 0.0.272. `tests/mirasim_protocol.py` is the
   test-side verifier (own X25519 pair, unseal + signature check); `tests/test_seal.py` pins the
   primitives and both operator switches.
+  A same-email relogin keeps the account's device key and signer (only stale authorization is
+  invalidated); a different-email login taking over an alias, and account deletion, drop the key
+  and signer so a reused alias is treated as a new client with an independent device identity.
+  Each account is one official client: device ids never collide across accounts.
 - Current upstream client profile is 0.0.303. For model requests, keep
   `x-mirasim-client` clear and seal every other generated `x-mirasim-*` field in
   `x-mirasim-enc` (`mrs-seal-v1`: X25519 + HKDF-SHA256 + ChaCha20-Poly1305,
@@ -64,14 +68,11 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   Cloudflare cookies the relay host sets are replayed from a per-(account, exit) `httpx.Cookies`
   jar placed just before `authorization` (RFC 6265 scoping applies, so a `Domain=chatgpt.com`
   cookie is never replayed; the Claude path sends no cookies, matching Node's fetch).
-  `mirofish/behavior.py` replays the rest of the desktop's whole-client background behaviour
-  (gzipped `/events` telemetry in the live `{deviceId, sentAt, events}` envelope with
-  `app.heartbeat` records, `/v1/model-roster`, and the `cdn-assets` update check) as one
-  jittered task per account, paused while the account is disabled or cooling down from a shared
-  quota; `MIROFISH_BEHAVIOR_REPLAY=0` turns it off. The analytics `deviceId` is a per-account
-  UUID (desktop `device.json` shape), deliberately distinct from the Ed25519-derived
-  22-char `x-mirasim-device` used on signed model calls, and not shared across accounts so a
-  multi-account relay does not present one installation cluster key.
+  There is **no** background whole-client behaviour replay: with no business request in flight the
+  relay makes zero upstream calls. Session ids in the relay metadata (and, for synthesized client
+  identities, `x-claude-code-session-id`) are rewritten per account so two accounts never announce
+  the same session id; the rewrite is deterministic in (account, caller session) so one
+  conversation on one account keeps one upstream session id.
 - Impersonation fidelity is header- and body-level. The TLS ClientHello is OpenSSL's by default, not the
   official client's BoringSSL one. Set `MIROFISH_TLS_IMPERSONATE=chrome136` (optional extra
   `tls-impersonate` / `curl_cffi`) to send a Chromium-shaped ClientHello — GREASE, x25519-first
@@ -87,10 +88,10 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   availability probe and refuses it with a 400 pointing at `/v1/limits`, so
   relaying it only spends a signed round trip and a device ticket per probe.
   The reply is a valid Messages envelope with empty `content` and
-  `stop_reason: "max_tokens"`; `usage.input_tokens` comes from the non-billable
-  upstream `/v1/messages/count_tokens` (shared with the relay's own
-  `count_tokens` endpoint through `_input_token_count`) and falls back to
-  `_estimate_input_tokens`. No usage row is recorded, the response carries
+  `stop_reason: "max_tokens"`; `usage.input_tokens` is a purely local estimate
+  (`_estimate_input_tokens`) — the probe makes **zero** upstream calls, so it
+  does not touch `/v1/messages/count_tokens` and does not affect account health.
+  No usage row is recorded, the response carries
   `X-Mirofish-Probe: short-circuit`, and the caller's `user-agent` is logged
   because the access log only shows the Docker bridge address for anything
   reaching a published port. The OpenAI path short-circuits the same way
@@ -110,33 +111,59 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   existing root handlers are left alone. Adding a diagnostic `logger.info`
   anywhere in the package now works; removing this makes the one-token probe
   log — the only record of which caller sends them — invisible again.
-- Docker runs a single container: `docker-entrypoint.sh` generates the Mihomo config and starts the bundled Mihomo engine (skipped when no subscription is set), then starts the relay; the relay reaches the engine over loopback (`127.0.0.1:9090`/`7890`). If either process exits the container restarts. The generated config defines N slot listeners (`MIROFISH_MIHOMO_SLOTS`, default 8), each with its own selector group; accounts pin to slots so proxied requests run concurrently. Configs without slots fall back to the legacy single-selector mode automatically. Mihomo config + provider cache live under `/data/mihomo/`.
-- Each account binds persistently to one proxy node, rotating on proxy network failure, on an
-  upstream 429 `shared_quota_unavailable` (the exit's region is not served to THIS account —
-  whether a region is served depends on the account's upstream tier, so the refusal is
-  remembered per (account, node) for `REGION_REFUSAL_TTL` (1800s) and never counts against the
-  node's global health), and when a provider auto-update renames nodes so the stored assignment
-  no longer exists (Mihomo answers 400; the pool resyncs immediately instead of waiting for
-  the refresh interval). Once every exit has region-refused an account, the error is marked
-  `region_refused_everywhere` and handled like `credit_exhausted_shared`: account cooldown +
-  failover, never further proxy rotation. Do not rotate on account/shared-quota errors such as
-  `credit_exhausted_shared`; those are not exit properties. Mihomo nodes behind the same slot URL
-  must carry distinct route identities into the upstream connection/ticket caches; otherwise an
-  existing HTTPS CONNECT tunnel can keep retries on the old exit after the selector changes.
+- Docker runs a single relay container: `docker-entrypoint.sh` execs the relay directly (no engine,
+  no subscription, no generated config). If it exits the container restarts.
+- Each account binds to exactly one manually configured proxy node, or to the explicit `DIRECT`
+  sentinel. A binding is never rotated, auto-selected, or resynced: it is used as-is for every
+  request. A `NULL`/empty stored binding (never chosen) fails closed (503) rather than falling back
+  to direct; only the explicit `direct` marker permits direct traffic. A missing/incomplete bound
+  node also fails closed. Proxy network failures update the node's diagnostic status only — they do
+  not change the binding or move the account to another exit, because a later business request may
+  legitimately retry the same endpoint. Nodes are added/edited/removed/tested manually
+  (`/api/proxies*`, Google `generate_204` for the test); a node bound to accounts cannot be deleted
+  until it is unbound.
 - Local API auth: `X-Mirofish-Proxy-Key`, `X-Api-Key`, or `Authorization: Bearer`.
 - Missing OpenAI-compatible model ids use `MIROFISH_DEFAULT_MODEL` (currently
   `gpt-5.6-luna`). The legacy `claude-haiku-4-5-20251001` id is normalized to
   `claude-haiku-4-5`; model catalog presence does not guarantee live upstream capacity.
-- Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default account > session affinity > quota-aware round-robin (skipping accounts with an exhausted window — for fable requests the tighter of `7d` and `7d_fable`). Accounts disabled via
-  the WebUI switch (`POST /api/accounts/{alias}/enabled`, `disabled` in metadata) are excluded
-  from automatic selection and return 403 when requested explicitly. Any account-scoped 429 —
-  every 429 except the region refusal `shared_quota_unavailable` (`account_scoped_429` in
-  `upstream.py` is the shared definition, applied on the Anthropic, OpenAI, and Codex responses
-  paths alike) — is an account property: the request fails over to another account (never when
-  explicitly pinned) and the account's live sessions are reassigned — without rotating its proxy
-  node. The documented `credit_exhausted_shared` cools the account for `SHARED_QUOTA_COOLDOWN`
-  (600s); any other 429 shape is usually transient rate pressure and cools for
-  `TRANSIENT_429_COOLDOWN` (60s). Session affinity keys a conversation to one account so a single dialogue is never served by alternating accounts: the key is `X-Mirofish-Session`, else the request body's `metadata.user_id`, else a hash of the first user message (stable across a conversation's turns, the system prompt deliberately ignored so shared prompts don't collapse windows). A new session is assigned by the schedule mode (WebUI card; `GET`/`POST /api/schedule`; persisted in the SQLite `settings` table): `balanced` (default) picks the least-loaded eligible account so separate windows fan out; `reset_first` keeps that ordering but treats an account whose 7-day window resets within `URGENCY_HORIZON_HOURS` (48h) as carrying up to `URGENCY_MAX_BONUS` (2) fewer live sessions, so expiring credit is spent first without funneling the whole concurrency onto one account; `fable_first` is `reset_first` with that head start scaled by how spent the account's own `7d_fable` window is, and only for non-fable models — among the accounts inside the horizon it prefers the one whose fable credit is gone (a fable request there would be refused anyway), so its expiring general credit is spent while accounts with fable headroom stay free for fable traffic; a fable request keeps plain `reset_first` ordering, since there the fable window is the constraint `_load` already weighs, not the selection criterion (the existing bonus is scaled rather than a tie-break key appended, because the tilted session count is a float that rarely ties). Utilization constraints apply in both modes: fable requests weigh the model's own `7d_fable` window (the tighter of the two counts), accounts above the configurable utilization ceiling (default 0.98) sort behind every account with room, and accounts whose relevant window is exhausted (`QUOTA_EXHAUSTED`, or the ceiling when configured above it) are skipped by automatic selection entirely — the upstream meters lazily enough that keeping them in rotation drives windows far past 100% — falling back to serving them only when every account is exhausted (explicit pinning is unaffected; the upstream 429 stays the final authority). Both modes read cached `/v1/limits` windows kept warm by a background sweep (`LIMITS_REFRESH_SECONDS` = 300s, skipping disabled accounts, kicked immediately when settings change; the same sweep also re-reads `/auth/me` + `/auth/referral` into the stored subscription profile — plan tier, expiry, holder — when it is missing or older than `PROFILE_REFRESH_SECONDS` (86400s)) — never probed on the request path; a cached window whose `reset_at` has passed counts as no data, and response quota headers merge into (never wipe) the cached quota values. Sessions expire after `MIROFISH_SESSION_TTL` (default 1800s). `pick_account` remains the round-robin used for `/v1/models` (in reset-first mode it applies the same tilted ordering).
+- Account selection (`AppState.route_account`): `X-Mirofish-Account` header > configured default
+  account > session affinity > quota-aware ordering. Disabled accounts (`POST /api/accounts/{alias}/enabled`,
+  `disabled` in metadata), suspended accounts, accounts parked by a health refusal, accounts in a
+  window cooldown, and accounts at/over the utilization ceiling are all excluded from automatic
+  selection; requesting such an account explicitly is refused (403 disabled, 401 login required,
+  429 cooldown/exhausted). No candidate uses the upstream as an oracle: before any bytes are sent,
+  `with_account_failover` requires a **successful** cached/forced `/v1/limits` preflight and
+  rechecks the ceiling and window state for the requested model. When the whole eligible pool is
+  over-ceiling/exhausted for the requested model, the relay answers locally with a 429 keyed to the
+  tightest window rather than sending anything upstream — so e.g. a Fable-exhausted pool 429s Fable
+  requests while Opus/Codex traffic still routes.
+- Relevant windows per model family: **Fable** weighs `5h`, `7d`, `7d_claude`, `7d_fable` (all
+  fable models share one `7d_fable` window); other **Claude** models weigh `5h`, `7d`, `7d_claude`;
+  other models weigh `5h`, `7d`. Any one relevant window at/over the ceiling blocks that model on
+  that account. Cooldowns are per-window, so a Fable-only exhaustion never benches the account for
+  Opus.
+- New-session ordering is fixed (no modes): among eligible accounts, prefer the soonest 7d reset
+  (banded to `RESET_BAND_HOURS`=1h within `URGENCY_HORIZON_HOURS`=48h so same-era accounts tie),
+  then the highest `7d_fable` utilization (spend nearly-gone fable credit first), then least-recently
+  assigned. Session affinity keys a conversation to one account (key: `X-Mirofish-Session`, else the
+  body's `metadata.user_id`/conversation id, else a hash of the first user message; the system prompt
+  is ignored so shared prompts do not collapse windows), TTL `MIROFISH_SESSION_TTL` (1800s).
+- On an upstream 429 the relay force-refreshes that account's `/v1/limits` once, cools the account
+  per the exhausted window (honouring a known `reset_at`, else the window length), reassigns its
+  live sessions, and (unless the account was explicitly pinned) fails over to another eligible
+  account — each account is tried at most once per request. A 401 parks the account for re-login; a
+  permanent `suspended` 403 parks it until support lifts it; a timed suspension 403 uses the stated
+  deadline; only a real `overloaded_error` 503 parks with a 1-day business retry — ordinary edge
+  503s (no device session, no proxy, HTML error pages) are transient and do not touch quota/health.
+  Health only self-heals on a **completed** model conversation (or re-login for a 401); profile,
+  limits, roster and count_tokens successes never clear it.
+- Quota reads are on demand only: `AccountService.fetch_limits` caches every read — success **and**
+  failure — for `MIROFISH_LIMITS_TTL` (600s) with a per-alias single-flight lock; a manual refresh
+  or a 429 may force one extra read (a 1-second floor coalesces 429 bursts). GET `/api/limits`
+  returns only the cache; `POST /api/limits/refresh` (skips disabled/suspended) and
+  `GET /accounts/{alias}/limits` are the explicit reads. The subscription profile
+  (`/auth/me` + `/auth/referral`) is read only on login or a manual status refresh; there is no
+  background sweep.
 - The upstream meters every fable model against ONE `7d_fable` window and reports a single
   number, so `AccountService._attach_fable_split` breaks it down per model (`FABLE_MODELS`)
   from the local usage log and attaches it as `models` on that window (also cached in
@@ -155,8 +182,8 @@ Host CLI (from the repository root; requires `uv sync` once):
 ```bash
 uv run mirofish add <alias> --email <email>
 uv run mirofish list
-uv run mirofish status <alias> [--probe]
-uv run mirofish models <alias> [--scan]
+uv run mirofish status <alias>
+uv run mirofish models <alias>
 uv run mirofish remove <alias>
 uv run mirofish serve --host 127.0.0.1 --port 8787
 ```
@@ -187,11 +214,15 @@ docker compose logs -f mirofish-relay
 - Validate aliases, email addresses, verification codes, model names, request sizes, and JSON payloads at trust boundaries (`mirofish/validate.py`).
 - Maintain both credential backends when changing credential persistence, and keep the v1 file-vault migration path working.
 - Keep SQLite limited to metadata, non-secret settings, and usage logs. Credentials belong in Keychain or the encrypted file vault.
-- Status probes use zero-cost `/v1/limits`; treat explicit model scans as billable upstream
-  requests and document that behavior.
-- Proxy subscription URLs and node credentials must not enter source control; SQLite stores only proxy metadata and account-to-node IDs. Docker writes Mihomo's runtime config and provider cache under `/data/mihomo/` on the data volume.
-- Preserve the explicit-account, default-account, then round-robin selection order.
+- `status` reads only the subscription profile (`/auth/me` + `/auth/referral`); `models` reads the
+  account's signed `/v1/model-roster`. Neither sends a model request, and there is no model scan.
+- Proxy node credentials must not enter source control; SQLite stores only proxy metadata and
+  account-to-node bindings, and node secrets live in the encrypted vault.
+- Preserve the explicit-account, default-account, session-affinity, then quota-aware selection
+  order, and the fixed reset→fable→least-recently-assigned tie-breaking (no scheduling modes).
 - `proxy_identity()` hashing must stay byte-compatible with stored assignments; changing it orphans existing account-to-node bindings.
+- Fixed proxy bindings must stay fail-closed: never auto-select, rotate, or silently fall back to
+  direct. Model dispatch must never send upstream when a relevant window is over the ceiling.
 - When changing API behavior, update the WebUI (`webui/`) and `deploy/mirofish-relay/README.md` together.
 - Bind locally by default. Any public exposure requires separate reverse-proxy authentication and transport security.
 
@@ -215,6 +246,6 @@ For container-related changes, build the deployment:
 docker compose -f deploy/mirofish-relay/docker-compose.yml build
 ```
 
-Avoid live login, model-scan, or model requests during routine validation unless explicitly
-requested. Status probes use `/v1/limits` and are zero-cost, but still contact upstream. The pytest
-suite mocks all upstream calls.
+Avoid live login or model requests during routine validation unless explicitly requested. The
+pytest suite mocks all upstream calls, and with no business request in flight the relay makes no
+upstream calls at all.

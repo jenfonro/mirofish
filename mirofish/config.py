@@ -6,6 +6,7 @@ so existing .env files and Docker volumes keep working.
 
 from __future__ import annotations
 
+import math
 import os
 import pathlib
 from dataclasses import dataclass, field
@@ -13,12 +14,17 @@ from dataclasses import dataclass, field
 from .seal import DEFAULT_SEAL_PUBLIC_KEY
 
 
-def _env_float(name: str, default: float, minimum: float | None = None) -> float:
+def _env_float(name: str, default: float, minimum: float | None = None,
+               maximum: float | None = None) -> float:
     try:
         value = float(os.environ.get(name, "") or default)
     except ValueError:
         value = default
-    return max(minimum, value) if minimum is not None else value
+    if not math.isfinite(value):
+        value = default
+    if minimum is not None:
+        value = max(minimum, value)
+    return min(maximum, value) if maximum is not None else value
 
 
 def _env_int(name: str, default: int, minimum: int | None = None) -> int:
@@ -102,7 +108,7 @@ class Settings:
     max_connections: int = 100
     max_keepalive_connections: int = 20
     max_body_bytes: int = 8 * 1024 * 1024
-    model_catalog_ttl: float = 300.0
+    model_catalog_ttl: float = 600.0
     cred_backend: str = ""
     in_docker: bool = False
     default_account: str = ""
@@ -115,39 +121,11 @@ class Settings:
     # model output (and the upstream 400 that comes with it).
     one_token_short_circuit: bool = True
 
-    # Replays the whole-client background behavior of the official desktop:
-    # gzipped /events telemetry, the /v1/model-roster probe, and the
-    # cdn-assets update check. Each account gets its own task with its own
-    # jitter so the fleet does not beat in lockstep.
-    behavior_replay: bool = True
-
-    # Optional outer forward proxy that terminates the TLS handshake instead
-    # of the local OpenSSL stack (e.g. a fingerprint-spoofing gateway). The
-    # upstream URL is left untouched: CONNECT tunnelling forwards the
-    # ClientHello this proxy generates, while header/body fidelity stays here.
-    tls_proxy: str = ""
-    # Chromium-family ClientHello impersonation via curl-impersonate
-    # (``curl_cffi``). Empty disables it (httpx + OpenSSL). A value such as
-    # ``chrome136`` sends upstream traffic with a BoringSSL-shaped JA3/JA4
-    # while still going through the account's own Mihomo exit.
+    # Model dispatch is blocked at this utilization on every applicable window.
+    quota_ceiling: float = 0.90
+    limits_ttl: float = 600.0
+    # Optional transport only; never an additional proxy or a background task.
     tls_impersonate: str = ""
-
-    proxy_refresh_seconds: float = 600.0
-    proxy_fetch_timeout: float = 10.0
-    proxy_fetch_max_bytes: int = 8 * 1024 * 1024
-    proxy_subscription_user_agent: str = "mihomo/1.19.0"
-    proxy_failure_threshold: int = 2
-    # Regex over node names; matches are dropped from the pool entirely
-    # (Mihomo provider exclude-filter + direct-mode parse filter).
-    proxy_node_exclude: str = ""
-
-    mihomo_controller: str = ""
-    mihomo_proxy: str = ""
-    mihomo_selector: str = "MirofishPool"
-    mihomo_provider: str = "mirofish"
-    mihomo_controller_timeout: float = 5.0
-    mihomo_slots: int = 8
-    mihomo_slot_base_port: int = 7891
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -196,8 +174,6 @@ class Settings:
             session_ttl=_env_float("MIROFISH_SESSION_TTL", 1800.0, minimum=60.0),
             one_token_short_circuit=_env_bool(
                 "MIROFISH_ONE_TOKEN_SHORT_CIRCUIT", True),
-            behavior_replay=_env_bool("MIROFISH_BEHAVIOR_REPLAY", True),
-            tls_proxy=os.environ.get("MIROFISH_TLS_PROXY", "").strip(),
             tls_impersonate=_normalize_impersonate(
                 os.environ.get("MIROFISH_TLS_IMPERSONATE", "")),
             stream_read_timeout=_env_float(
@@ -210,23 +186,10 @@ class Settings:
                 "MIROFISH_MAX_KEEPALIVE_CONNECTIONS", 20, minimum=1),
             max_body_bytes=_env_int(
                 "MIROFISH_MAX_BODY_BYTES", 8 * 1024 * 1024, minimum=1024),
-            proxy_refresh_seconds=_env_float("MIROFISH_PROXY_REFRESH_SECONDS", 600.0, minimum=30.0),
-            proxy_fetch_timeout=_env_float("MIROFISH_PROXY_FETCH_TIMEOUT", 10.0, minimum=3.0),
-            proxy_subscription_user_agent=(
-                os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT", "mihomo/1.19.0").strip()
-                or "mihomo/1.19.0"),
-            proxy_failure_threshold=_env_int("MIROFISH_PROXY_FAILURE_THRESHOLD", 2, minimum=1),
-            proxy_node_exclude=os.environ.get("MIROFISH_PROXY_NODE_EXCLUDE", "").strip(),
-            mihomo_controller=os.environ.get("MIROFISH_MIHOMO_CONTROLLER", "").rstrip("/"),
-            mihomo_proxy=os.environ.get("MIROFISH_MIHOMO_PROXY", "").strip(),
-            mihomo_selector=os.environ.get("MIROFISH_MIHOMO_SELECTOR", "MirofishPool").strip() or "MirofishPool",
-            mihomo_provider=os.environ.get("MIROFISH_MIHOMO_PROVIDER", "mirofish").strip() or "mirofish",
-            mihomo_slots=_env_int("MIROFISH_MIHOMO_SLOTS", 8, minimum=1),
-            mihomo_slot_base_port=_env_int("MIROFISH_MIHOMO_SLOT_BASE_PORT", 7891, minimum=1025),
+            quota_ceiling=_env_float("MIROFISH_QUOTA_CEILING", 0.90,
+                                     minimum=0.10, maximum=1.0),
+            limits_ttl=_env_float("MIROFISH_LIMITS_TTL", 600.0, minimum=60.0),
         )
-        settings.mihomo_controller_timeout = max(
-            1.0, min(settings.proxy_fetch_timeout,
-                     _env_float("MIROFISH_MIHOMO_CONTROLLER_TIMEOUT", 5.0)))
         settings.max_keepalive_connections = min(
             settings.max_keepalive_connections, settings.max_connections)
         return settings

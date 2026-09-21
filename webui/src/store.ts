@@ -48,13 +48,17 @@ export async function loadUsage(hours = 24): Promise<void> {
   store.usage = await api<UsageSummary>(`/api/usage?hours=${hours}`);
 }
 
-/** Live per-window usage limits for every account (zero model cost). */
-export async function loadLimits(): Promise<void> {
+/** Explicit operator action; normal page loads only read cached /accounts. */
+export async function refreshLimits(): Promise<void> {
   store.limitsLoading = true;
   try {
-    store.limits = await api<LimitsSummary>("/api/limits");
+    store.limits = await api<LimitsSummary>("/api/limits/refresh", { method: "POST" });
   } finally {
-    store.limitsLoading = false;
+    try {
+      await loadAccounts();
+    } finally {
+      store.limitsLoading = false;
+    }
   }
 }
 
@@ -68,7 +72,7 @@ export async function connect(): Promise<boolean> {
       loadAccounts().catch(() => undefined),
       loadProxies().catch(() => undefined),
       loadUsage().catch(() => undefined),
-      loadLimits().catch(() => undefined),
+      loadSchedule().catch(() => undefined),
     ]);
     return true;
   } catch {

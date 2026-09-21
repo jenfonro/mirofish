@@ -9,7 +9,6 @@ dependencies = [
     "uvicorn>=0.30",
     "httpx[brotli,socks,zstd]>=0.27",
     "cryptography>=42",
-    "pyyaml>=6",
 ]
 
 [project.scripts]

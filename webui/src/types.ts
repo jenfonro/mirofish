@@ -1,10 +1,11 @@
 export interface ProxyInfo {
-  id: string;
+  id: string | null;
   name?: string;
   scheme?: string;
   host?: string;
   port?: number;
   active: boolean;
+  status?: "ok" | "error" | "untested" | "invalid" | "unbound" | "missing";
   failure_count?: number;
   last_error?: string | null;
 }
@@ -62,6 +63,8 @@ export interface ReferralInfo {
 
 export interface Account {
   alias: string;
+  /** Local metadata.display_name; alias remains the storage/routing key. */
+  display_name?: string | null;
   email: string;
   user_id?: string;
   plan?: string | null;
@@ -76,6 +79,16 @@ export interface Account {
   disabled?: boolean;
   device_id?: string | null;
   shared_quota_cooldown?: number;
+  healthy?: boolean;
+  health?: {
+    state?: "error" | "suspended" | string;
+    status?: number;
+    kind?: string;
+    message?: string;
+    at?: string;
+    retry_at?: number | null;
+  };
+  health_retry_in?: number | null;
   active_sessions?: number;
   checked_at?: string | null;
   proxy?: ProxyInfo | null;
@@ -94,27 +107,35 @@ export interface LimitsSummary {
 }
 
 export interface ScheduleSettings {
-  mode: "balanced" | "reset_first" | "fable_first";
   max_utilization: number;
+  limits_ttl: number;
+  policy: "reset_first_fable";
+}
+
+export interface ProxyNode extends ProxyInfo {
+  id: string;
+  name: string;
+  scheme: string;
+  host: string;
+  port: number;
+  username?: string;
+  password?: string;
+  assigned: number;
+  last_checked: string | null;
 }
 
 export interface ProxySummary {
   configured: boolean;
-  backend: "mihomo" | "direct";
   active: number;
   total: number;
   assigned: number;
-  last_refresh: string | null;
-  last_error: string | null;
-  skipped_nodes: number;
-  nodes: ProxyInfo[] & { assigned?: number }[];
+  nodes: ProxyNode[];
 }
 
 export interface Health {
   ok: boolean;
   accounts: number;
   version: string;
-  proxy_backend: string;
   default_account: string | null;
 }
 

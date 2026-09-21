@@ -1,13 +1,16 @@
 <script setup lang="ts">
 import { computed, onMounted } from "vue";
-import { loadAccounts, loadLimits, loadUsage, store } from "../store";
+import { loadAccounts, loadUsage, store } from "../store";
+import { accountName, accountStatus } from "../accounts";
+import { proxyLabel } from "../proxies";
+import AccountStatus from "../components/AccountStatus.vue";
 import type { PageId } from "../main";
 
 const emit = defineEmits<{ navigate: [page: PageId] }>();
 
 const kpis = computed(() => {
   const accounts = store.accounts;
-  const active = accounts.filter((a) => !a.disabled).length;
+  const active = accounts.filter((a) => accountStatus(a).label === "正常").length;
   const cooling = accounts.filter((a) => (a.shared_quota_cooldown ?? 0) > 0).length;
   const sessions = accounts.reduce((sum, a) => sum + (a.active_sessions || 0), 0);
 
@@ -27,7 +30,7 @@ const kpis = computed(() => {
       label: "账号",
       value: `${active}`,
       unit: `/ ${accounts.length}`,
-      hint: cooling ? `${cooling} 个冷却中` : "全部可用",
+      hint: cooling ? `${cooling} 个窗口冷却中` : `正常 ${active} / ${accounts.length}`,
     },
     {
       label: "活跃会话",
@@ -59,25 +62,18 @@ function formatCompact(n: number): string {
 /** Account health rows for the overview list. */
 const healthRows = computed(() => {
   return store.accounts.map((a) => {
-    const util = Number(a.quota?.["7d_utilization"]);
+    const raw = a.quota?.["7d_utilization"];
+    const util = raw == null || raw === "" ? NaN : Number(raw);
     const utilPct = Number.isFinite(util) ? util * 100 : null;
-    let status: "ok" | "warn" | "cool" | "off" = "ok";
-    if (a.disabled) status = "off";
-    else if ((a.shared_quota_cooldown ?? 0) > 0) status = "cool";
-    else if (utilPct !== null && utilPct >= 90) status = "warn";
     return {
+      account: a,
       alias: a.alias,
+      name: accountName(a),
       email: a.email,
-      plan: a.plan || "—",
-      status,
-      statusText: a.disabled ? "已停用"
-        : (a.shared_quota_cooldown ?? 0) > 0 ? "冷却中"
-        : utilPct !== null && utilPct >= 90 ? "接近上限"
-        : "正常",
+      plan: a.plan || "未知",
       utilPct,
       sessions: a.active_sessions || 0,
-      proxy: a.proxy?.name || a.proxy?.id || "直连",
-      proxyActive: a.proxy?.active ?? null,
+      proxy: a.proxy ? proxyLabel(a.proxy) : "无代理",
     };
   });
 });
@@ -85,13 +81,8 @@ const healthRows = computed(() => {
 const scheduleHint = computed(() => {
   const s = store.schedule;
   if (!s) return null;
-  const labels: Record<string, string> = {
-    balanced: "均衡分配",
-    reset_first: "优先重置窗口",
-    fable_first: "优先重置 + Fable",
-  };
   return {
-    mode: labels[s.mode] || s.mode,
+    mode: "重置优先 + Fable 使用偏好",
     ceiling: `${(s.max_utilization * 100).toFixed(0)}%`,
   };
 });
@@ -107,7 +98,6 @@ onMounted(async () => {
   // store.connect already hydrates; this is a soft refresh
   loadAccounts().catch(() => undefined);
   loadUsage().catch(() => undefined);
-  loadLimits().catch(() => undefined);
 });
 </script>
 
@@ -151,7 +141,7 @@ onMounted(async () => {
         <template v-if="scheduleHint">
           <div class="row">
             <span class="chip accent">{{ scheduleHint.mode }}</span>
-            <span class="chip">用量上限 {{ scheduleHint.ceiling }}</span>
+            <span class="chip">硬阈值 {{ scheduleHint.ceiling }}</span>
           </div>
           <p class="muted mt-2">新会话按此策略分配；已开始的对话不会中途切换。</p>
         </template>
@@ -176,7 +166,7 @@ onMounted(async () => {
       <table class="data">
         <thead>
           <tr>
-            <th>别名</th>
+            <th>账号名称</th>
             <th>状态</th>
             <th>套餐</th>
             <th>7 天用量</th>
@@ -187,12 +177,12 @@ onMounted(async () => {
         <tbody>
           <tr v-for="row in healthRows" :key="row.alias" class="clickable"
               @click="emit('navigate', 'accounts')">
-            <td class="mono">{{ row.alias }}</td>
             <td>
-              <span class="chip" :class="row.status === 'ok' ? 'ok' : row.status === 'warn' ? 'warn' : row.status === 'cool' ? 'warn' : ''">
-                <span class="dot" :class="row.status === 'ok' ? 'ok' : row.status === 'off' ? 'off' : 'bad'"></span>
-                {{ row.statusText }}
-              </span>
+              <div :title="row.alias">{{ row.name }}</div>
+              <div class="muted">{{ row.email }}</div>
+            </td>
+            <td>
+              <AccountStatus :account="row.account" />
             </td>
             <td>{{ row.plan }}</td>
             <td style="min-width: 120px">

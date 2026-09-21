@@ -1,21 +1,31 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { api } from "../api";
+import { accountName } from "../accounts";
 import { compact, deriveAll } from "../limits";
-import { loadAccounts, store, toast } from "../store";
+import { proxyLabel, proxyStatus } from "../proxies";
+import { loadAccounts, loadProxies, store, toast } from "../store";
 import type { Account } from "../types";
 import { iconSvg } from "../icons";
+import AccountStatus from "../components/AccountStatus.vue";
+import ConfirmDialog from "../components/ConfirmDialog.vue";
+import ProxyPicker from "../components/ProxyPicker.vue";
+import WindowTokens from "../components/WindowTokens.vue";
 
 const busy = ref("");
 const search = ref("");
 const filter = ref<"all" | "active" | "off" | "cool">("all");
 const drawer = ref<Account | null>(null);
+const editName = ref("");
+const editProxy = ref("");
+const deleting = ref<Account | null>(null);
 const showAdd = ref(false);
 
 // Add-account form
 const addAlias = ref("");
 const addEmail = ref("");
 const addCode = ref("");
+const addProxy = ref("");
 const addStage = ref<"start" | "verify">("start");
 const addBusy = ref(false);
 
@@ -28,17 +38,15 @@ const filtered = computed(() => {
     if (!q) return true;
     return (
       a.alias.toLowerCase().includes(q) ||
+      accountName(a).toLowerCase().includes(q) ||
       (a.email || "").toLowerCase().includes(q) ||
       (a.plan || "").toLowerCase().includes(q)
     );
   });
 });
 
-function utilization(a: Account): number | null {
-  const raw = a.quota?.["7d_utilization"];
-  if (raw === null || raw === undefined || raw === "") return null;
-  const v = Number(raw);
-  return Number.isFinite(v) ? v : null;
+function accountWindows(a: Account) {
+  return a.limits ? deriveAll(a.limits) : [];
 }
 
 function utilColor(v: number): string {
@@ -54,6 +62,7 @@ function planExpiry(a: Account) {
   const pad = (n: number) => String(n).padStart(2, "0");
   return {
     date: `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`,
+    time: `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
     days: Math.ceil((epoch * 1000 - Date.now()) / 86_400_000),
   };
 }
@@ -71,22 +80,18 @@ function planClass(plan?: string | null): string {
   return "";
 }
 
-function cooldownLabel(s: number): string {
-  return s >= 90 ? `${Math.ceil(s / 60)} 分钟` : `${s} 秒`;
-}
-
-async function refreshStatus(alias: string, probe = false) {
+async function refreshProfile(alias: string) {
   busy.value = alias;
   try {
-    await api(`/accounts/${alias}/status${probe ? "?probe=1" : ""}`);
-    await loadAccounts();
-    if (drawer.value?.alias === alias) {
-      drawer.value = store.accounts.find((a) => a.alias === alias) || drawer.value;
-    }
-    toast(probe ? `已刷新 ${alias} 资料与额度` : `已刷新 ${alias}`, "ok");
+    await api(`/accounts/${encodeURIComponent(alias)}/status`);
+    toast(`已刷新 ${alias} 的资料`, "ok");
   } catch (error: any) {
-    toast(`刷新失败：${error.message}`, "error");
+    toast(`刷新资料失败：${error.message}`, "error");
   } finally {
+    await loadAccounts().catch(() => toast("加载账号失败", "error"));
+    if (drawer.value?.alias === alias) {
+      drawer.value = store.accounts.find((a) => a.alias === alias) ?? null;
+    }
     busy.value = "";
   }
 }
@@ -95,7 +100,7 @@ async function toggleEnabled(a: Account) {
   busy.value = a.alias;
   try {
     const enabled = !!a.disabled;
-    await api(`/api/accounts/${a.alias}/enabled`, {
+    await api(`/api/accounts/${encodeURIComponent(a.alias)}/enabled`, {
       method: "POST",
       body: JSON.stringify({ enabled }),
     });
@@ -108,41 +113,59 @@ async function toggleEnabled(a: Account) {
   }
 }
 
-async function removeAccount(alias: string) {
-  if (!confirm(`删除账号 ${alias} 的本地凭证？（不会注销远端账号）`)) return;
+async function removeAccount() {
+  const account = deleting.value;
+  if (!account) return;
+  busy.value = account.alias;
   try {
-    await api(`/api/accounts/${alias}`, { method: "DELETE" });
-    drawer.value = null;
+    await api(`/api/accounts/${encodeURIComponent(account.alias)}`, { method: "DELETE" });
+    if (drawer.value?.alias === account.alias) drawer.value = null;
+    deleting.value = null;
     await loadAccounts();
-    toast(`已删除 ${alias}`, "ok");
+    toast(`已删除 ${account.alias}`, "ok");
   } catch (error: any) {
     toast(`删除失败：${error.message}`, "error");
+  } finally {
+    busy.value = "";
   }
 }
 
-async function resetDevice(a: Account) {
-  if (!confirm(`重置 ${a.alias} 的设备身份？将生成新的设备密钥。`)) return;
+const dirty = computed(() => drawer.value && (
+  editName.value.trim() !== (drawer.value.display_name ?? "") ||
+  editProxy.value !== (drawer.value.proxy?.id ?? "") ||
+  drawer.value.proxy?.status === "unbound"
+));
+
+async function saveAccount() {
+  const a = drawer.value;
+  if (!a) return;
   busy.value = a.alias;
   try {
-    await api(`/api/accounts/${a.alias}/reset-device`, { method: "POST" });
+    await api(`/api/accounts/${encodeURIComponent(a.alias)}`, {
+      method: "PATCH",
+      body: JSON.stringify({ display_name: editName.value.trim(), proxy_id: editProxy.value }),
+    });
     await loadAccounts();
     if (drawer.value?.alias === a.alias) {
-      drawer.value = store.accounts.find((x) => x.alias === a.alias) || drawer.value;
+      drawer.value = store.accounts.find((item) => item.alias === a.alias) ?? null;
     }
-    toast(`已重置 ${a.alias} 设备身份`, "ok");
+    toast(`已保存 ${a.alias}`, "ok");
   } catch (error: any) {
-    toast(`重置失败：${error.message}`, "error");
+    toast(`保存失败：${error.message}`, "error");
   } finally {
     busy.value = "";
   }
 }
 
 async function sendCode() {
+  if (addBusy.value || !addAlias.value.trim() || !addEmail.value.trim()) return;
   addBusy.value = true;
   try {
     await api("/api/login/start", {
       method: "POST",
-      body: JSON.stringify({ alias: addAlias.value.trim(), email: addEmail.value.trim() }),
+      body: JSON.stringify({
+        alias: addAlias.value.trim(), email: addEmail.value.trim(), proxy_id: addProxy.value,
+      }),
     });
     addStage.value = "verify";
     toast("验证码已发送，请查收邮箱", "ok");
@@ -154,6 +177,7 @@ async function sendCode() {
 }
 
 async function verify() {
+  if (addBusy.value || addCode.value.trim().length !== 6) return;
   addBusy.value = true;
   try {
     const result = await api<{ alias: string; plan?: string; profile_pending?: boolean }>(
@@ -164,18 +188,28 @@ async function verify() {
       ? `登录成功：${result.alias}（资料可稍后刷新）`
       : `登录成功：${result.alias}（${result.plan || "未知套餐"}）`, "ok");
     addAlias.value = addEmail.value = addCode.value = "";
+    addProxy.value = "";
     addStage.value = "start";
     showAdd.value = false;
-    await loadAccounts();
   } catch (error: any) {
     toast(`登录失败：${error.message}`, "error");
   } finally {
+    await loadAccounts().catch(() => toast("加载账号失败", "error"));
     addBusy.value = false;
   }
 }
 
 function openDrawer(a: Account) {
+  if (busy.value) return;
   drawer.value = a;
+  editName.value = a.display_name ?? "";
+  editProxy.value = a.proxy?.id ?? "";
+  loadProxies().catch(() => toast("读取代理列表失败", "error"));
+}
+
+function openAdd() {
+  showAdd.value = !showAdd.value;
+  if (showAdd.value) loadProxies().catch(() => toast("读取代理列表失败", "error"));
 }
 
 const drawerWindows = computed(() => {
@@ -203,14 +237,14 @@ onMounted(() => {
         </div>
         <input
           v-model="search"
-          placeholder="搜索别名 / 邮箱…"
+          placeholder="搜索名称 / 别名 / 邮箱…"
           style="width:160px"
         />
         <button class="btn ghost sm" @click="loadAccounts().catch(() => undefined)">
           <span style="width:12px;height:12px;display:inline-flex" v-html="iconSvg('refresh')"></span>
           刷新
         </button>
-        <button class="btn sm" @click="showAdd = !showAdd">
+        <button class="btn sm" :disabled="addBusy" @click="openAdd">
           <span style="width:12px;height:12px;display:inline-flex" v-html="iconSvg('plus')"></span>
           添加
         </button>
@@ -221,17 +255,23 @@ onMounted(() => {
     <div v-if="showAdd" class="panel-body" style="border-bottom:1px solid var(--border); background:var(--bg-subtle)">
       <div class="field-row">
         <div class="grow">
-          <label>别名</label>
-          <input v-model="addAlias" placeholder="work" :disabled="addStage === 'verify'" />
+          <label for="login-alias">本地别名（alias）</label>
+          <input id="login-alias" v-model="addAlias" placeholder="work" :disabled="addBusy || addStage === 'verify'" />
         </div>
         <div class="grow">
-          <label>邮箱</label>
-          <input v-model="addEmail" type="email" placeholder="you@example.com"
-                 :disabled="addStage === 'verify'" />
+          <label for="login-email">登录邮箱</label>
+          <input id="login-email" v-model="addEmail" type="email" placeholder="you@example.com"
+                 :disabled="addBusy || addStage === 'verify'" />
+          <div class="field mt-3">
+            <label>固定代理</label>
+            <ProxyPicker v-model="addProxy" :nodes="store.proxies?.nodes ?? []"
+                         :disabled="addBusy || addStage === 'verify'" />
+          </div>
         </div>
         <div v-if="addStage === 'verify'" class="grow" style="max-width:140px">
-          <label>验证码</label>
-          <input v-model="addCode" maxlength="6" inputmode="numeric" placeholder="123456"
+          <label for="login-code">验证码</label>
+          <input id="login-code" v-model="addCode" maxlength="6" inputmode="numeric" placeholder="123456"
+                 :disabled="addBusy"
                  @keyup.enter="verify" />
         </div>
         <template v-if="addStage === 'start'">
@@ -258,7 +298,7 @@ onMounted(() => {
       <div class="empty-hint">
         {{ store.accounts.length ? "换个筛选或关键词试试。" : "点右上「添加」用邮箱验证码登录第一个账号。" }}
       </div>
-      <button v-if="!store.accounts.length" class="btn sm mt-2" @click="showAdd = true">添加账号</button>
+      <button v-if="!store.accounts.length && !showAdd" class="btn sm mt-2" @click="openAdd">添加账号</button>
     </div>
 
     <!-- Table -->
@@ -267,14 +307,14 @@ onMounted(() => {
         <thead>
           <tr>
             <th style="width:48px">启用</th>
-            <th>别名</th>
-            <th>邮箱</th>
+            <th>状态</th>
+            <th>账号名称</th>
             <th>套餐</th>
             <th>到期</th>
             <th>出口</th>
-            <th style="min-width:100px">7 天用量</th>
+            <th>额度窗口（缓存）</th>
             <th class="num">会话</th>
-            <th></th>
+            <th>操作</th>
           </tr>
         </thead>
         <tbody>
@@ -283,23 +323,23 @@ onMounted(() => {
               <button
                 class="toggle"
                 :class="{ on: !a.disabled }"
-                :disabled="busy === a.alias"
+                :disabled="!!busy"
+                role="switch"
+                :aria-checked="!a.disabled"
+                :aria-label="`${accountName(a)} 启用`"
                 :title="a.disabled ? '点击启用' : '点击停用'"
                 @click="toggleEnabled(a)"
               >
                 <span class="knob"></span>
               </button>
             </td>
-            <td class="mono">{{ a.alias }}</td>
-            <td>
-              {{ a.email }}
-              <div v-if="a.profile?.name" class="muted">{{ a.profile.name }}</div>
+            <td><AccountStatus :account="a" /></td>
+            <td class="identity">
+              <div :title="a.alias">{{ accountName(a) }}</div>
+              <div class="muted">{{ a.email }}</div>
             </td>
             <td>
               <span class="chip" :class="planClass(a.plan)">{{ a.plan || "未知" }}</span>
-              <span v-if="a.shared_quota_cooldown" class="chip warn" style="margin-left:4px">
-                冷却 {{ cooldownLabel(a.shared_quota_cooldown) }}
-              </span>
             </td>
             <td>
               <template v-if="planExpiry(a)">
@@ -314,29 +354,33 @@ onMounted(() => {
             </td>
             <td>
               <span v-if="a.proxy" class="muted">
-                <span class="dot" :class="a.proxy.active ? 'ok' : 'bad'"
+                <span class="dot" :class="proxyStatus(a.proxy).tone === 'ok' ? 'ok'
+                      : proxyStatus(a.proxy).tone === 'danger' ? 'bad' : 'off'"
                       style="display:inline-block;margin-right:4px"></span>
-                {{ a.proxy.name || a.proxy.id }}
+                {{ proxyLabel(a.proxy) }}
               </span>
-              <span v-else class="muted">直连</span>
+              <span v-else class="muted">无代理</span>
             </td>
             <td>
-              <template v-if="utilization(a) !== null">
-                <div class="row" style="gap:6px">
-                  <div class="meter" style="width:60px">
+              <div v-if="accountWindows(a).length" class="account-windows">
+                <div v-for="w in accountWindows(a)" :key="w.name"
+                     :title="`${w.label} · ${w.resetText}`">
+                  <div class="muted tnum">{{ w.name }} · {{ w.usedPct }}%</div>
+                  <div class="meter mt-2">
                     <div class="meter-fill"
-                         :style="{ width: Math.min(100, utilization(a)! * 100) + '%',
-                                   background: utilColor(utilization(a)!) }"></div>
+                         :style="{ width: Math.min(100, w.usedPct) + '%',
+                                   background: utilColor(w.usedPct / 100) }"></div>
                   </div>
-                  <span class="tnum muted">{{ (utilization(a)! * 100).toFixed(0) }}%</span>
                 </div>
-              </template>
-              <span v-else class="muted">—</span>
+              </div>
+              <span v-else class="muted">暂无缓存</span>
             </td>
             <td class="num tnum">{{ a.active_sessions || 0 }}</td>
             <td @click.stop>
-              <button class="btn ghost sm" :disabled="busy === a.alias"
-                      @click="refreshStatus(a.alias)">刷新</button>
+              <div class="row" style="flex-wrap:nowrap">
+                <button class="btn ghost sm" :disabled="!!busy" @click="openDrawer(a)">修改</button>
+                <button class="btn danger sm" :disabled="!!busy" @click="deleting = a">删除</button>
+              </div>
             </td>
           </tr>
         </tbody>
@@ -346,20 +390,28 @@ onMounted(() => {
 
   <!-- Drawer -->
   <template v-if="drawer">
-    <div class="drawer-scrim" @click="drawer = null"></div>
-    <aside class="drawer">
+    <div class="drawer-scrim" @click="!busy && (drawer = null)"></div>
+    <aside class="drawer" role="dialog" aria-modal="true" aria-label="修改账号"
+           @keydown.esc="!busy && (drawer = null)">
       <div class="drawer-head">
-        <h3 class="mono">{{ drawer.alias }}</h3>
+        <h3>{{ accountName(drawer) }}</h3>
         <span class="chip" :class="planClass(drawer.plan)">{{ drawer.plan || "未知" }}</span>
-        <button class="btn ghost icon-only sm" @click="drawer = null">
+        <button class="btn ghost icon-only sm" :disabled="!!busy" aria-label="关闭" @click="drawer = null">
           <span style="width:14px;height:14px;display:inline-flex" v-html="iconSvg('close')"></span>
         </button>
       </div>
       <div class="drawer-body">
+        <div class="drawer-section">
+          <label for="account-display-name">账号显示名称</label>
+          <input id="account-display-name" v-model="editName" maxlength="120"
+                 :placeholder="drawer.alias" :disabled="!!busy" />
+          <p class="muted mt-2">留空使用本地别名；不会修改 alias 或存储 key。</p>
+        </div>
         <!-- Basic -->
         <div class="drawer-section">
           <h4>基本信息</h4>
           <dl class="kv">
+            <dt>本地别名</dt><dd class="mono">{{ drawer.alias }}</dd>
             <dt>邮箱</dt><dd>{{ drawer.email }}</dd>
             <dt v-if="drawer.profile?.name">姓名</dt>
             <dd v-if="drawer.profile?.name">{{ drawer.profile.name }}</dd>
@@ -371,30 +423,25 @@ onMounted(() => {
             <dd v-if="drawer.device_id" class="mono" style="font-size:11px">{{ drawer.device_id }}</dd>
             <dt>状态</dt>
             <dd>
-              <span class="chip" :class="drawer.disabled ? '' : 'ok'">
-                {{ drawer.disabled ? "已停用" : "已启用" }}
-              </span>
-              <span v-if="drawer.shared_quota_cooldown" class="chip warn" style="margin-left:4px">
-                冷却 {{ cooldownLabel(drawer.shared_quota_cooldown) }}
-              </span>
-            </dd>
-            <dt>出口</dt>
-            <dd>
-              <template v-if="drawer.proxy">
-                {{ drawer.proxy.name || drawer.proxy.id }}
-                <span class="muted"> · {{ drawer.proxy.host }}:{{ drawer.proxy.port }}</span>
-              </template>
-              <span v-else class="muted">直连</span>
+              <AccountStatus :account="drawer" />
             </dd>
           </dl>
         </div>
 
+        <div class="drawer-section">
+          <label>固定代理</label>
+          <ProxyPicker v-model="editProxy" :nodes="store.proxies?.nodes ?? []" :disabled="!!busy" />
+          <p v-if="drawer.proxy?.status === 'unbound'" class="muted mt-2">
+            当前未绑定；保存「无代理」才会显式使用直连。
+          </p>
+        </div>
+
         <!-- Expiry -->
-        <div v-if="planExpiry(drawer)" class="drawer-section">
-          <h4>套餐到期</h4>
-          <div class="row">
+        <div class="drawer-section">
+          <h4>套餐到期（本地时间）</h4>
+          <div v-if="planExpiry(drawer)" class="row">
             <span class="mono tnum" style="font-size:16px;font-weight:600">
-              {{ planExpiry(drawer)!.date }}
+              {{ planExpiry(drawer)!.date }} {{ planExpiry(drawer)!.time }}
             </span>
             <span class="chip" :class="planExpiry(drawer)!.days <= 3 ? 'danger' : planExpiry(drawer)!.days <= 7 ? 'warn' : 'ok'">
               {{ planExpiry(drawer)!.days < 0 ? "已到期"
@@ -402,6 +449,7 @@ onMounted(() => {
                 : `剩 ${planExpiry(drawer)!.days} 天` }}
             </span>
           </div>
+          <span v-else class="muted">—</span>
         </div>
 
         <!-- Limits windows -->
@@ -426,13 +474,7 @@ onMounted(() => {
               <span class="spacer"></span>
               <span>{{ w.resetText }}</span>
             </div>
-            <div v-if="w.models.length" class="mt-2">
-              <div v-for="m in w.models" :key="m.model" class="row muted"
-                   style="font-size:11px; justify-content:space-between">
-                <span class="mono">{{ m.model.replace("claude-", "") }}</span>
-                <span class="tnum">{{ m.requests }} 次 · {{ compact(m.total_tokens) }}</span>
-              </div>
-            </div>
+            <WindowTokens :models="w.models" />
           </div>
         </div>
 
@@ -452,16 +494,21 @@ onMounted(() => {
           <h4>操作</h4>
           <div class="row">
             <button class="btn ghost sm" :disabled="busy === drawer.alias"
-                    @click="refreshStatus(drawer.alias)">刷新状态</button>
-            <button class="btn ghost sm" :disabled="busy === drawer.alias"
-                    title="通过 /v1/limits 刷新，不产生模型调用"
-                    @click="refreshStatus(drawer.alias, true)">资料+额度</button>
-            <button class="btn ghost sm" :disabled="busy === drawer.alias"
-                    @click="resetDevice(drawer)">重置设备</button>
-            <button class="btn danger sm" @click="removeAccount(drawer.alias)">删除账号</button>
+                    @click="refreshProfile(drawer.alias)">刷新资料</button>
+            <button class="btn" :disabled="!!busy || !dirty" @click="saveAccount">保存修改</button>
           </div>
         </div>
       </div>
     </aside>
   </template>
+
+  <ConfirmDialog v-if="deleting" title="删除账号"
+                 :message="`删除 ${accountName(deleting)}（${deleting.alias}）的本地凭证？不会注销远端账号。`"
+                 :busy="!!busy" @close="deleting = null" @confirm="removeAccount" />
 </template>
+
+<style scoped>
+.identity { line-height: 1.4; }
+.account-windows { display: flex; gap: 12px; }
+.account-windows > div { flex: 1; min-width: 90px; }
+</style>

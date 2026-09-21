@@ -675,6 +675,7 @@ table.data .mono { font-family: var(--mono); font-size: 12px; }
   bottom: 0;
   width: min(440px, 100vw);
   background: var(--surface);
+  color: var(--ink);
   border-left: 1px solid var(--border);
   z-index: 41;
   display: flex;

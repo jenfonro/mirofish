@@ -13,10 +13,19 @@ import threading
 from typing import Any, Optional, Sequence
 
 from .errors import RelayError
-from .validate import alias_value, proxy_subscription_value
+from .validate import alias_value
 from .vault import CredentialStore
 
 PROXY_POOL_ALIAS = "proxy_pool"
+# Health states surfaced in the panel's status column.
+HEALTH_OK = "ok"
+HEALTH_ERROR = "error"
+# The upstream suspended the account outright ("contact support"). Kept apart
+# from HEALTH_ERROR because the two call for different actions: an error may
+# clear on its own or on the next successful request, a suspension only when
+# support lifts it.
+HEALTH_SUSPENDED = "suspended"
+HEALTH_PARKED_STATES = (HEALTH_ERROR, HEALTH_SUSPENDED)
 
 
 def utc_now() -> str:
@@ -24,15 +33,13 @@ def utc_now() -> str:
 
 
 class Store:
-    def __init__(self, data_dir: pathlib.Path, credentials: CredentialStore,
-                 proxy_failure_threshold: int = 2) -> None:
+    def __init__(self, data_dir: pathlib.Path, credentials: CredentialStore) -> None:
         self.data_dir = data_dir.expanduser().resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
         os.chmod(self.data_dir, stat.S_IRWXU)
         self.db_path = self.data_dir / "accounts.sqlite3"
         self.proxy_key_path = self.data_dir / "proxy.key"
         self.vault = credentials
-        self.proxy_failure_threshold = proxy_failure_threshold
         self.db_lock = threading.RLock()
         self.db = sqlite3.connect(str(self.db_path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -51,6 +58,8 @@ class Store:
         columns = {str(row[1]) for row in self.db.execute("PRAGMA table_info(accounts)")}
         if "proxy_id" not in columns:
             self.db.execute("ALTER TABLE accounts ADD COLUMN proxy_id TEXT")
+        # Leave historical NULL bindings unbound. Only an operator's explicit
+        # "direct" marker permits direct traffic; migration must not pick an exit.
         if "account_generation" not in columns:
             self.db.execute("ALTER TABLE accounts ADD COLUMN account_generation TEXT")
         self.db.execute("""
@@ -242,6 +251,48 @@ class Store:
             self.db.commit()
         return metadata
 
+    # --- account health ----------------------------------------------------
+
+    def mark_account_error(self, alias: str, status: int, message: str,
+                           kind: str,
+                           retry_after: Optional[float] = None,
+                           state: str = HEALTH_ERROR) -> dict[str, Any]:
+        """Record an upstream refusal that makes this account unusable.
+
+        Stored in metadata rather than a new column so it travels with the
+        existing atomic merge and needs no schema migration.
+
+        ``retry_after`` is the epoch after which automatic selection may try
+        the account again; ``None`` means never (the refusal does not heal by
+        itself, so only an operator can clear it).
+
+        ``state`` distinguishes a suspension the operator has to resolve from
+        an ordinary refusal, so the panel can say which one it is.
+        """
+        return self.merge_metadata(alias, {"health": {
+            "state": state,
+            "status": int(status),
+            "kind": kind,
+            "message": message[:300],
+            "at": utc_now(),
+            "retry_at": float(retry_after) if retry_after is not None else None,
+        }})
+
+    def clear_account_error(self, alias: str) -> None:
+        """Drop the error record after the account serves a request again."""
+        alias = alias_value(alias)
+        with self.db_lock:
+            row = self.db.execute("SELECT metadata_json FROM accounts WHERE alias=?",
+                                  (alias,)).fetchone()
+            if row is None:
+                return
+            metadata = json.loads(row["metadata_json"])
+            if not metadata.pop("health", None):
+                return
+            self.db.execute("UPDATE accounts SET metadata_json=?,updated_at=? WHERE alias=?",
+                            (json.dumps(metadata, ensure_ascii=False), utc_now(), alias))
+            self.db.commit()
+
     def remove(self, alias: str) -> None:
         alias = alias_value(alias)
         self.row(alias)
@@ -261,25 +312,6 @@ class Store:
             if "missing" in str(exc).lower():
                 return ""
             raise
-
-    def proxy_subscription_url(self) -> str:
-        file_path = os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_URL_FILE", "").strip()
-        if file_path:
-            try:
-                return proxy_subscription_value(
-                    pathlib.Path(file_path).read_text(encoding="utf-8"))
-            except OSError as exc:
-                raise RelayError("could not read proxy subscription URL file", 500) from exc
-        env_value = os.environ.get("MIROFISH_PROXY_SUBSCRIPTION_URL", "").strip()
-        if env_value:
-            return proxy_subscription_value(env_value)
-        return self._optional_secret(PROXY_POOL_ALIAS, "subscription_url").strip()
-
-    def set_proxy_subscription_url(self, value: str) -> None:
-        if value.strip():
-            self.vault.put(PROXY_POOL_ALIAS, "subscription_url", proxy_subscription_value(value))
-        else:
-            self.vault.delete(PROXY_POOL_ALIAS, "subscription_url")
 
     # --- non-secret settings -------------------------------------------------
 
@@ -309,36 +341,19 @@ class Store:
     def save_proxy_configs(self, configs: dict[str, dict[str, Any]]) -> None:
         self.vault.put(PROXY_POOL_ALIAS, "configs", json.dumps(configs, ensure_ascii=False))
 
-    def account_proxy_ids(self) -> set[str]:
-        """Proxy ids some account is currently pinned to."""
+    def delete_proxy(self, proxy_id: str) -> None:
+        """Delete a single manual node, never a referenced account binding."""
         with self.db_lock:
-            rows = self.db.execute(
-                "SELECT DISTINCT proxy_id FROM accounts WHERE proxy_id IS NOT NULL").fetchall()
-        return {str(row[0]) for row in rows}
-
-    def prune_proxies(self, keep: set[str]) -> int:
-        """Delete proxy rows outside `keep`. Provider auto-updates rename every
-        node and subscription switches replace the set wholesale, so rows that
-        are neither current nor pinned by an account are dead weight."""
-        with self.db_lock:
-            existing = [str(row[0]) for row in
-                        self.db.execute("SELECT proxy_id FROM proxies").fetchall()]
-            stale = [proxy_id for proxy_id in existing if proxy_id not in keep]
-            for proxy_id in stale:
-                self.db.execute("DELETE FROM proxies WHERE proxy_id=?", (proxy_id,))
-            if stale:
-                self.db.commit()
-        return len(stale)
+            if self.db.execute("SELECT 1 FROM accounts WHERE proxy_id=? LIMIT 1",
+                               (proxy_id,)).fetchone() is not None:
+                raise RelayError("proxy is bound to accounts; unbind it first", 409)
+            self.db.execute("DELETE FROM proxies WHERE proxy_id=?", (proxy_id,))
+            self.db.commit()
 
     def set_account_proxy(self, alias: str, proxy_id: Optional[str]) -> None:
         with self.db_lock:
             self.db.execute("UPDATE accounts SET proxy_id=?,updated_at=? WHERE alias=?",
                             (proxy_id, utc_now(), alias_value(alias)))
-            self.db.commit()
-
-    def deactivate_proxies(self) -> None:
-        with self.db_lock:
-            self.db.execute("UPDATE proxies SET active=0,updated_at=?", (utc_now(),))
             self.db.commit()
 
     def upsert_proxy(self, proxy_id: str, config: dict[str, Any], active: bool = True) -> None:
@@ -350,10 +365,8 @@ class Store:
                 VALUES(?,?,?,?,?,?,0,NULL,NULL,?,?)
                 ON CONFLICT(proxy_id) DO UPDATE SET name=excluded.name,scheme=excluded.scheme,
                   host=excluded.host,port=excluded.port,active=excluded.active,
-                  failure_count=CASE WHEN excluded.active=1 THEN 0 ELSE proxies.failure_count END,
-                  last_error=CASE WHEN excluded.active=1 THEN NULL ELSE proxies.last_error END,
                   updated_at=excluded.updated_at
-            """, (proxy_id, config["name"], config["scheme"], config["host"], config["port"],
+            """, (proxy_id, config.get("name", ""), config["scheme"], config["host"], config["port"],
                   1 if active else 0, stamp, stamp))
             self.db.commit()
 
@@ -366,23 +379,25 @@ class Store:
     def mark_proxy_success(self, proxy_id: str) -> None:
         with self.db_lock:
             self.db.execute(
-                "UPDATE proxies SET failure_count=0,last_error=NULL,last_checked=?,updated_at=? WHERE proxy_id=?",
+                "UPDATE proxies SET active=1,failure_count=0,last_error=NULL,last_checked=?,updated_at=? WHERE proxy_id=?",
                 (utc_now(), utc_now(), proxy_id))
             self.db.commit()
 
     def mark_proxy_failure(self, proxy_id: str, message: str) -> None:
         with self.db_lock:
             self.db.execute("""
-                UPDATE proxies SET failure_count=failure_count+1,last_error=?,last_checked=?,
-                  active=CASE WHEN failure_count+1>=? THEN 0 ELSE active END,updated_at=?
+                UPDATE proxies SET failure_count=failure_count+1,last_error=?,last_checked=?,updated_at=?
                 WHERE proxy_id=?
-            """, (message[:500], utc_now(), self.proxy_failure_threshold, utc_now(), proxy_id))
+            """, (message[:500], utc_now(), utc_now(), proxy_id))
             self.db.commit()
 
     def proxy_assignment_counts(self) -> dict[str, int]:
         with self.db_lock:
             rows = self.db.execute(
-                "SELECT proxy_id,COUNT(*) AS count FROM accounts WHERE proxy_id IS NOT NULL GROUP BY proxy_id")
+                # 'direct' is proxy.DIRECT: an account deliberately left
+                # unproxied. Spelled out because store must not import proxy.
+                "SELECT proxy_id,COUNT(*) AS count FROM accounts "
+                "WHERE proxy_id IS NOT NULL AND proxy_id NOT IN ('direct','') GROUP BY proxy_id")
             return {str(row[0]): int(row[1]) for row in rows}
 
     # --- usage log ----------------------------------------------------------
@@ -417,15 +432,17 @@ class Store:
 
     def usage_by_model_since(self, alias: str, since_epoch: float,
                              models: Sequence[str],
-                             account_generation: Optional[str] = None
+                             account_generation: Optional[str] = None,
+                             until_epoch: Optional[float] = None
                              ) -> dict[str, dict[str, int]]:
-        """Per-model token totals logged since ``since_epoch``.
+        """Base-model totals in [since_epoch, until_epoch), when an end is given.
 
         Used to split a shared upstream window (7d_fable covers every fable
         model at once) into per-model figures. Passing the window's own
         ``reset_at``-derived start is what makes the split reset with the
         window: rows older than the current window are simply not counted,
-        so nothing has to be deleted or zeroed on a reset.
+        so nothing has to be deleted or zeroed on a reset. The ``[1m]`` suffix
+        is folded only for this query; usage_log retains the canonical id.
         """
         if not models:
             return {}
@@ -446,15 +463,25 @@ class Store:
                 since_epoch, datetime.timezone.utc).isoformat()
         except (OverflowError, OSError, TypeError, ValueError) as exc:
             raise RelayError("invalid usage window start", 400) from exc
+        base_model = ("CASE WHEN model LIKE '%[1m]' THEN substr(model,1,length(model)-4) "
+                      "ELSE model END")
         placeholders = ",".join("?" for _ in models)
-        where = "alias=? AND created_at >= ? AND model IN (" + placeholders + ")"
+        where = f"alias=? AND created_at >= ? AND ({base_model}) IN ({placeholders})"
         params: list[Any] = [alias, since, *models]
+        if until_epoch is not None:
+            try:
+                until = datetime.datetime.fromtimestamp(
+                    until_epoch, datetime.timezone.utc).isoformat()
+            except (OverflowError, OSError, TypeError, ValueError) as exc:
+                raise RelayError("invalid usage window end", 400) from exc
+            where += " AND created_at < ?"
+            params.append(until)
         if account_generation is not None:
             where += " AND account_generation=?"
             params.append(account_generation)
         with self.db_lock:
             rows = self.db.execute(f"""
-                SELECT model,
+                SELECT {base_model} AS base_model,
                        COUNT(*) AS requests,
                        COALESCE(SUM(input_tokens),0) AS input_tokens,
                        COALESCE(SUM(output_tokens),0) AS output_tokens,
@@ -462,9 +489,9 @@ class Store:
                        COALESCE(SUM(cache_write_tokens),0) AS cache_write_tokens
                 FROM usage_log
                 WHERE {where}
-                GROUP BY model
+                GROUP BY base_model
             """, params).fetchall()
-        return {str(row["model"]): {
+        return {str(row["base_model"]): {
             "requests": int(row["requests"]),
             "input_tokens": int(row["input_tokens"]),
             "output_tokens": int(row["output_tokens"]),

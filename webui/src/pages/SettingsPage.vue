@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref } from "vue";
 import { store } from "../store";
-import type { PageId, ThemeMode } from "../main";
+import type { ThemeMode } from "../main";
 
 const props = defineProps<{
   theme: ThemeMode;
@@ -90,8 +90,8 @@ function curlExample(path: string): string {
         </dd>
         <dt v-if="store.health">版本</dt>
         <dd v-if="store.health" class="mono">v{{ store.health.version }}</dd>
-        <dt v-if="store.health">代理后端</dt>
-        <dd v-if="store.health">{{ store.health.proxy_backend }}</dd>
+        <dt>代理</dt>
+        <dd>手动维护 HTTP / HTTPS / SOCKS5，账号固定出口</dd>
         <dt v-if="store.health?.default_account">默认账号</dt>
         <dd v-if="store.health?.default_account" class="mono">
           {{ store.health.default_account }}

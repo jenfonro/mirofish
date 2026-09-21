@@ -1,20 +1,19 @@
 # Mirofish Relay — Docker + WebUI
 
 容器化运行 `mirofish/` Python 包：多账号管理、邮箱验证码登录、凭证加密持久化、
-按账号固定 Mihomo 节点（多槽位并发出口）、Anthropic-compatible `/v1/messages` 真流式中转、
+按账号固定 HTTP / HTTPS / SOCKS5 代理、Anthropic-compatible `/v1/messages` 真流式中转、
 OpenAI-compatible `/v1/chat/completions` 翻译（含 tool calls / 图片 / 流式）、Codex Responses
 透明代理，以及内置 Vue 管理 WebUI。
 
-relay 与 Mihomo 代理引擎打包在**同一个容器**里，由入口脚本先生成 Mihomo 配置并启动引擎，
-再启动 relay（未配置订阅时跳过 Mihomo，纯直连）；任一进程退出即整体重启。不再有独立的
-sidecar 与 init 容器。
+**单容器只运行 relay**，入口脚本直接启动 Python 服务。不再包含 Mihomo、订阅下载、
+节点轮换、behavior 回放、后台资料/额度/roster 探测或模型扫描。
+协议兼容不代表与官方客户端完全等价，也不能保证账号不被限制或封禁。
 
 ## 快速开始
 
     cd deploy/mirofish-relay
     cp .env.example .env
     # 编辑 .env，设置 MIROFISH_MASTER_KEY（至少 16 字符，可用 openssl rand -base64 32 生成）
-    # 设置 MIROFISH_PROXY_SUBSCRIPTION_URL；不要把带 token 的链接提交到仓库
     docker compose up -d --build
 
 打开管理页面：
@@ -26,11 +25,13 @@ sidecar 与 init 容器。
 
     docker compose exec mirofish cat /data/proxy.key
 
-在 WebUI 中输入密钥后即可：配置代理订阅、添加账号（发送邮箱验证码 → 输入验证码 → 完成登录）、
+在 WebUI 中输入密钥后即可：手动管理固定代理、添加账号（选择代理或明确 `direct` →
+发送邮箱验证码 → 输入验证码 → 完成登录）、
 查看每个账号绑定的节点、套餐资料（套餐层级徽章、到期日与剩余天数、持有人姓名；悬停徽章可见
-用户 ID、租户、邀请升级进度与各窗口预算，数据来自上游 `/auth/me` 与 `/auth/referral`，
-登录与「刷新」时读取，后台扫描每天自动补新）、配额利用率、**用量额度卡片**（来自上游 `/v1/limits` 的
-5 小时 / 7 天 / 7 天 Fable / 30 天窗口：已用百分比、匀速线平均参照、超前 / 落后、剩余额度、
+用户 ID、上游已返回的租户字段、邀请升级进度与各窗口预算，资料只来自 `/auth/me` 与
+`/auth/referral`，不请求 `/me/tenant`，不后台刷新）、配额利用率、**用量额度卡片**（展示已缓存的
+`/v1/limits` 窗口，包括 5 小时 / 7 天 / 7 天 Claude / 7 天 Fable，以及上游提供时的 30 天窗口：
+已用百分比、匀速线平均参照、超前 / 落后、剩余额度、
 重置倒计时；不消耗额度。其中 **7 天 Fable 窗口**由上游把所有 fable 模型合并计量、只给一个
 总数，卡片会在该窗口下额外列出 `fable-5` 与 `fable-5-1` 各自的请求数与 token 消耗——这份
 拆分来自本地用量日志，且只统计当前窗口区间内的记录，因此**跟着窗口重置一起归零**，不需要
@@ -40,18 +41,36 @@ sidecar 与 init 容器。
 把透明 PNG 角色图放进 `webui/public/miku/`（文件名与尺寸见该目录 README）并重新构建前端后，
 顶栏头像、登录页立绘与右下角看板娘才会显示；缺图时自动隐藏，不影响功能。
 
+### 日志持久化
+
+Compose 使用 Docker `journald` 驱动，tag 为 `mirofish-relay`。日志由宿主机管理，
+不在 `mirofish-data` 数据卷内；宿主机必须支持 systemd-journald。
+仅配置 Docker 日志驱动并不能保证日志跨宿主机重启保留，需要在**宿主机**启用持久化，例如：
+
+```bash
+sudo mkdir -p /etc/systemd/journald.conf.d /var/log/journal
+printf '[Journal]\nStorage=persistent\n' | sudo tee /etc/systemd/journald.conf.d/mirofish.conf >/dev/null
+sudo systemctl restart systemd-journald
+sudo journalctl --flush
+sudo journalctl CONTAINER_TAG=mirofish-relay -f
+```
+
+也可用 `docker compose logs -f mirofish` 查看当前服务日志。保留期和磁盘上限由宿主机
+journald 策略控制；重启后的历史可用 `journalctl --list-boots` 核查。日志中不要写入凭据。
+
 ## 凭证存储
 
 容器内没有 macOS Keychain，因此使用加密文件后端：
 
-- token 和 relay 设备私钥保存在 `/data/secrets.enc`，使用 `MIROFISH_MASTER_KEY` 经 scrypt 派生密钥、
+- token、每账号 relay 设备私钥及代理凭证保存在 `/data/secrets.enc`，使用 `MIROFISH_MASTER_KEY` 经 scrypt 派生密钥、
   AES-256-GCM 加密（v2 格式）；旧版单文件 relay 写入的 v1 格式（PBKDF2 + HMAC）
   首次读取时自动迁移为 v2，主密钥不变；
-- SQLite `/data/accounts.sqlite3` 只保存元数据（邮箱、plan、租户、用量日志）；
+- SQLite `/data/accounts.sqlite3` 只保存元数据（邮箱、plan、上游已返回的租户字段、固定代理绑定、
+  额度缓存、调度硬阈值、用量日志），本地代理密钥仍在 `/data/proxy.key`；
 - 丢失主密钥将无法解密已有账号凭证，需要重新登录。
 
-模型 relay 还要求设备签名：每个账号各自持久化一把 Ed25519 密钥（首次使用时创建，可经
-`POST /api/accounts/<alias>/reset-device` 轮换），并按「账号 × 出口」申请约 15 分钟的
+模型 relay 还要求设备签名：每个账号各自持久化一把 Ed25519 密钥，首次使用时创建；
+同一账号重新登录或更新凭据不自动轮换私钥。按「账号 × 出口」申请约 15 分钟的
 device ticket，再为每个请求生成 `mrs-sig-v2` 签名（覆盖 method、pathname、时间戳、nonce、
 设备 ID、客户端版本，以及凭证、relay 元数据与请求体的摘要）。机器层面的字段（arch/os、
 stainless 版本、locale）仍是全安装共用，看起来始终是同一台机器；分散的只有设备 ID。
@@ -63,7 +82,7 @@ stainless 版本、locale）仍是全安装共用，看起来始终是同一台�
 `MIROFISH_MIRASIM_CLIENT_VERSION` 固定在 0.0.272 以下时才保留旧的账号 token 降级（不发送伪签名）。
 ticket 恢复后自动继续。
 
-0.0.272 的模型请求还会把 relay 自己的 `x-mirasim-*` 元数据（明文保留的
+当前 0.0.303 的模型请求还会把 relay 自己的 `x-mirasim-*` 元数据（明文保留的
 `x-mirasim-client` 除外）封装到 `x-mirasim-enc`。封装使用临时 X25519 + HKDF-SHA256
 (`mrs-seal-v1`) + ChaCha20-Poly1305，并把上游 pathname 与 HTTP method 放进 AAD；因此
 session、账号、设备和签名字段不会在网络上明文出现。默认公钥内置于 relay，也可用
@@ -71,71 +90,45 @@ session、账号、设备和签名字段不会在网络上明文出现。默认�
 不会降级为明文；与旧的自托管端点联调时可显式设置 `MIROFISH_MIRASIM_SEAL_METADATA=0`。
 
 Anthropic 请求会保留 `?beta=true` 与白名单内的 Claude SDK 特征头；Codex 的 `/v1/responses`
-和 `/backend-api/codex/responses` 都映射到上游 `/v1/responses`，`/v1/alpha/search` 与
-`/backend-api/codex/alpha/search` 映射到上游 `/v1/alpha/search`；两组路径各自用自己的上游
+和 `/backend-api/codex/responses` 都映射到上游 `/v1/responses`；
+`/v1/responses/compact` 与 `/backend-api/codex/responses/compact` 映射到上游
+`/v1/responses/compact`，`/v1/alpha/search` 与
+`/backend-api/codex/alpha/search` 映射到上游 `/v1/alpha/search`；各组路径各自用自己的上游
 pathname 签名，保留查询串但签名只包含 pathname。
-压缩的 Codex 请求体先有界解压，再以最终精确字节计算长度、哈希和签名。调用方的
-`Authorization` / `X-Api-Key` 绝不会转发给上游。Codex 请求发出时与官方桌面端内置 Codex 的抓包
-一致：`user-agent` 改写为 `MIROFISH_CODEX_USER_AGENT`（默认为抓包值），`originator` 固定为
+压缩的 Codex 请求体先有界解压，必要时规范化模型并按账号改写会话元数据，
+再以最终精确字节计算长度、哈希和签名；无需改写时保留原始 JSON 字节。调用方的
+`Authorization` / `X-Api-Key` 绝不会转发给上游；`X-Mirofish-Account` 等
+`x-mirofish-*` 仅供 relay 本地使用。Codex 请求参考客户端协议：
+`user-agent` 改写为 `MIROFISH_CODEX_USER_AGENT`（默认为抓包值），`originator` 固定为
 `mirasim`，不转发 `openai-beta` 与 `accept-encoding`，调用方 cookie 丢弃，改为回传 relay 自己
 按「账号 × 出口」收到的 Cloudflare cookie。所有请求头的顺序与大小写按抓包写到线上（`Host`、
-`Connection` 在最后；签名的 `/v1/models` 用小写 `authorization`）。模型流量默认发往
+`Connection` 在最后；签名的 `/v1/model-roster` 用小写 `authorization`）。模型流量默认发往
 官方客户端当前使用的 `https://relay.mirasim.ai`；旧的 `mirasim-relay.mirofish.ai` 分发可能仍返回
 模型目录；当前观察到它可能对同一 Claude 请求返回 `no upstream available for model`。
 
-## 代理池
+## 固定代理
 
-容器内置的 Mihomo 引擎负责订阅的下载、解析和建立连接，因此 SS、VMess、VLESS、Trojan、
-Hysteria、TUIC 等 Mihomo 支持的节点都可以使用。配置与 provider 缓存保存在数据卷的
-`/data/mihomo/` 下，relay 通过容器内回环地址 `127.0.0.1:9090`（控制器）/ `127.0.0.1:7890`（代理）
-与引擎通信。
+只支持手动维护的 HTTP / HTTPS / SOCKS5 端点，可在 WebUI 添加、编辑、导入 URI、
+绑定账号或手动测试。导入与查看列表不探测网络；只有明确点击测试才访问网络，
+且代理连通成功不代表账号或模型可用。
 
-订阅地址由 `.env` 的 `MIROFISH_PROXY_SUBSCRIPTION_URL` 配置；它优先于 WebUI 曾保存的地址。
-服务会定期读取 Mihomo 的节点列表，并把每个账号选中的节点 ID 写入 SQLite，因此同一账号会持续
-使用同一个出口节点。以下情况会触发重新选择；只有传输层节点故障才累计全局失败次数（达到
-`MIROFISH_PROXY_FAILURE_THRESHOLD` 后停用）：
-
-- **节点网络失败**：连接超时、拒绝等传输层错误。
-- **上游不服务该账号的当前出口区域**：上游返回 429 `shared_quota_unavailable`（「云端中转未在
-  当前网络区域提供服务」）。可用性取决于账号套餐与出口的组合；服务按账号暂记该节点并尝试其他
-  出口，不会把节点全局停用。该账号被所有可用出口拒绝后会进入冷却，并自动换用其他账号。
-- **共享额度耗尽不是节点故障**：429 `credit_exhausted_shared` 表示该账号当前不能使用上游共享
-  额度。服务不会徒劳地轮换或停用代理节点；自动路由会冷却该账号并换用其他账号，显式指定账号
-  时则原样返回错误。需要等待额度恢复或按上游提示接入可用的自有账号。
-- **节点在订阅更新后消失**：Mihomo 的 provider 自动更新会重命名全部节点，此时切换选择器会被
-  控制器以 400 拒绝。服务会立即重新同步节点列表并重新绑定，不必等到下一次定时刷新。
-
-### 多槽位并发出口
-
-入口脚本为 Mihomo 生成 `MIROFISH_MIHOMO_SLOTS`（默认 8）个独立的槽位监听端口
-（从 `MIROFISH_MIHOMO_SLOT_BASE_PORT`，默认 7891 起），每个槽位有自己的选择器组。
-relay 把每个账号固定到一个槽位，不同账号的上游请求经由各自槽位并发出站，
-互不阻塞（旧版为全局选择器 + 全局锁，所有请求串行）。账号数超过槽位数时，
-共享同一槽位的账号会在切换节点时短暂串行，以保证账号与出口 IP 的对应关系。
-同一槽位切换节点时，relay 会按「槽位 + 节点」隔离 HTTP 连接池与 device ticket，避免复用
-旧节点建立的 HTTPS 隧道，造成看似轮换、实际仍从原出口重试。
-若引擎仍在运行不含槽位组的旧配置，relay 会自动退回单选择器兼容模式，
-重新 `docker compose up -d --build` 后即启用槽位。
-
-订阅请求默认使用 `mihomo/1.19.0` 的 User-Agent；如果你的订阅服务要求特定客户端标识，
-可在 `.env` 设置 `MIROFISH_PROXY_SUBSCRIPTION_USER_AGENT` 后重建容器。
-
-如果服务器无法访问订阅站，可改用静态文件：在能够下载订阅的机器保存原始订阅内容，上传到
-`deploy/mirofish-relay/mihomo-input/subscription.yaml`，然后在 `.env` 清空
-`MIROFISH_PROXY_SUBSCRIPTION_URL` 并设置 `MIROFISH_PROXY_SUBSCRIPTION_FILE=/input/subscription.yaml`。
-入口脚本会把它复制到 Mihomo 允许读取的 `/data/mihomo/` 下。该文件含节点凭据，应设置为仅自己
-可读且不要提交到版本库；静态文件模式需要手动更新该文件后重启容器。
+每个账号持久绑定一个 `proxy_id`，或明确绑定字符串 `direct`。空绑定、无效配置、
+已删除节点和旧 Mihomo 节点都不能视为直连：请求会 fail-closed，等待管理员修复。
+代理网络失败只记录诊断状态，不自动换出口、不选择其它节点、不回退直连；
+额度或区域 429 也不触发代理轮换。后续业务请求仍使用原绑定。
+节点编辑保留 ID 和账号绑定；被账号引用的节点必须先手动改绑才能删除。
 
 相关接口：
 
-    GET  /proxies                    # 立即返回缓存状态，不拉取网络
-    POST /api/proxies/subscription   # {"url":"https://..."}，保存并刷新（仅直连模式）
-    POST /api/proxies/refresh        # 请求 Mihomo 主动更新订阅并读取节点，失败会返回 502/503
+    GET    /proxies                         # 只读本地节点配置与诊断状态
+    POST   /api/proxies                     # {"scheme":"socks5","host":"proxy.example","port":1080}
+    POST   /api/proxies/import              # {"text":"socks5://proxy.example:1080\nhttp://proxy.example:8080"}
+    PATCH  /api/proxies/<id>                # 手动编辑端点
+    DELETE /api/proxies/<id>                # 已绑定节点返回 409，须先改绑
+    POST   /api/proxies/<id>/test           # 手动连通性测试，不扫描模型
+    PATCH  /api/accounts/<alias>            # {"proxy_id":"<id>"} 或明确 {"proxy_id":"direct"}
 
-如果该接口返回 `503 Mihomo controller request timed out`，说明 relay 到容器内 Mihomo
-引擎的控制端口 `127.0.0.1:9090` 无响应；执行 `docker compose logs mirofish` 检查订阅下载和
-配置错误（Mihomo 与 relay 的日志都汇入同一容器 stdout）。`MIROFISH_MIHOMO_CONTROLLER_TIMEOUT`
-默认 5 秒，可在 `.env` 中按需调整。
+订阅刷新接口和订阅/Mihomo 环境变量已经移除。代理凭证属于敏感数据，不要放入源码或日志。
 
 ## API
 
@@ -143,89 +136,92 @@ relay 把每个账号固定到一个槽位，不同账号的上游请求经由�
 `Authorization: Bearer <key>`。
 
     GET    /health
-    GET    /accounts
-    GET    /accounts/<alias>/status[?probe=1]   # probe=1 同时读取 /v1/limits，不产生模型调用
-    GET    /accounts/<alias>/limits    # 单账号用量额度窗口（上游 /v1/limits，不计费）
+    GET    /accounts                  # 只读本地资料、健康状态与额度缓存
+    GET    /accounts/<alias>/status   # 仅 /auth/me + /auth/referral；旧 probe=1 也不读额度
+    GET    /accounts/<alias>/limits    # 手动单账号 force 刷新上游 /v1/limits
                                        # 7d_fable 窗口附带 models[]：各 fable 模型本窗口用量
-    GET    /api/limits                 # 全部账号并发拉取用量额度（不计费）
+    GET    /api/limits                 # 只读所有账号的额度缓存
+    POST   /api/limits/refresh         # 手动批量 force 刷新，跳过 disabled/suspended
     GET    /proxies
-    GET    /v1/models                # 按账号缓存 5 分钟
+    GET    /v1/models                # 明确请求才按需读 signed /v1/model-roster；600 秒缓存
     POST   /v1/messages              # Anthropic Messages；"stream":true 为真 SSE 透传
                                      # max_tokens<=1 由 relay 本地作答，不转发（见下）
-    POST   /v1/messages/count_tokens # Anthropic token 计数（转发上游，不计费；失败则本地估算）
+    POST   /v1/messages/count_tokens # 额度门禁后转发；不支持/网络故障可本地估算，不能自愈健康
     POST   /v1/chat/completions      # OpenAI 兼容；支持 tools/图片/流式
                                      # 注意：上游以 thinking 模式服务，仅接受 temperature=1
                                      # 且不接受 top_p；其他采样参数会被自动丢弃而非转发
     POST   /v1/responses             # Codex Responses 原始字节/状态/响应头透传
     POST   /backend-api/codex/responses # Codex 原生路径，映射到 /v1/responses
+    POST   /v1/responses/compact     # Codex 上下文压缩
+    POST   /backend-api/codex/responses/compact # 映射到 /v1/responses/compact
     POST   /v1/alpha/search          # Codex 检索透传
     POST   /backend-api/codex/alpha/search # Codex 原生路径，映射到 /v1/alpha/search
-    POST   /api/login/start          # {"alias","email"} 发送验证码
+    POST   /api/login/start          # {"alias","email","proxy_id"} 发送验证码；明确选节点或 direct
     POST   /api/login/finish         # {"alias","code"} 完成登录
     POST   /api/accounts/<alias>/enabled # {"enabled":true|false} 面板启用/停用开关
     DELETE /api/accounts/<alias>     # 删除本地账号及凭证
     GET    /api/usage?hours=24       # 用量统计（按小时 × 账号聚合）
-    GET    /api/schedule             # 当前账号调度模式与用量上限
-    POST   /api/schedule             # {"mode":"balanced"|"reset_first"|"fable_first","max_utilization":0.98}
+    GET    /api/schedule             # 固定策略 reset_first_fable、硬阈值与 limits_ttl
+    POST   /api/schedule             # {"max_utilization":0.90}，允许 0.10–1.0，不触发上游刷新
 
-验证码一旦验证成功，access/refresh token 会先写入加密存储，再读取套餐、租户等展示资料。
-如果后续资料接口临时失败，`/api/login/finish` 仍返回成功并标记 `profile_pending=true`；这样不会因
-重复提交已经消费的验证码而出现先 502、后 401。稍后在账号列表点击「刷新」即可补齐资料。
+验证码一旦验证成功，access/refresh token 会先写入加密存储，再通过 `/auth/me` 与
+`/auth/referral` 读取资料，资料成功后才读取额度。后续资料或额度失败不会要求重复提交已消费的
+验证码；响应会带 `profile_error` 或 `limits_error`，资料尚未获得时保留 `profile_pending`。
+额度失败仍保留凭据、已获取的套餐、`disabled` 状态和代理绑定。资料刷新与额度刷新是独立操作。
 
-账号选择顺序：请求头 `X-Mirofish-Account` > `MIROFISH_DEFAULT_ACCOUNT` > **会话亲和** > 轮询
-（轮询会自动跳过 7 天配额利用率已达 100% 的账号）。响应头返回
-`X-Mirofish-Account` 与 `X-Mirofish-Quota-7d-Utilization` / `-Reset`。
+### 额度预检与固定调度
 
-**停用与账号级 429 冷却**：在 WebUI 停用的账号保留凭证但不参与任何自动分配；显式用
-`X-Mirofish-Account` 指定它会返回 403。上游对某个账号返回 429 时（属于出口的
-`shared_quota_unavailable` 区域拒绝除外），该请求会自动换一个账号重试（显式指定的账号
-不替换），被拒账号进入冷却期，期间自动分配会避开它，其活跃会话也会改派到其他账号——
-否则会话亲和会把客户端的重试一直送回刚刚 429 的那个账号。冷却时长按错误区分：
-`credit_exhausted_shared`（共享额度耗尽）要等窗口重置，冷却 10 分钟；其他 429 通常是
-短暂限速，只冷却 60 秒。Anthropic、OpenAI 兼容与 Codex Responses 三条路径行为一致。
-这些错误是账号属性而非出口属性，因此不会触发代理节点轮换。
+业务调用前按账号预检额度：成功和失败都默认缓存 **600 秒**（`MIROFISH_LIMITS_TTL`），
+singleflight 合并同账号并发读取。手动刷新及业务 429 可额外 `force` 刷新，并发强制刷新也合并。
+页面 GET 只展示缓存，不因打开页面或保存设置而扫描上游；无缓存、读取失败或缺少相关窗口时
+不能据此推断“还有额度”并放行。
 
-**按名称排除节点**：设置 `MIROFISH_PROXY_NODE_EXCLUDE`（正则，如 `香港|HK|🇭🇰`）后，
-命中的节点在 Mihomo provider（`exclude-filter`）和中转节点列表两层都被排除，完全不
-参与分配。正则同时交给 Python 和 Mihomo（Go RE2）使用，请保持简单的字面量/或写法。
-修改后需重建容器。
+硬阈值由 `MIROFISH_QUOTA_CEILING` 提供默认值 **90%**，可在面板保存，最大 **100%**。
+任一相关窗口达到阈值就停止分配，而非降低优先级：
 
-**订阅 DNS 直通**：生成 Mihomo 配置时会抓取订阅并把其中的顶层 `dns:` 段原样并入——
-部分机场的节点入口域名只有订阅指定的私有 DNS（`nameserver-policy`）能解析出真实地址，
-公共 DNS 返回占位 IP（如 `127.127.127.x`），没有这段配置节点会全部拨号失败。订阅没有
-`dns:` 段或启动时抓取失败则不写入，行为与旧版一致。更换订阅后需要重建容器让新的 DNS
-生效。
+| 模型 | 检查窗口 |
+| --- | --- |
+| Fable（`claude-fable-*`） | `5h`、`7d`、`7d_claude`、`7d_fable` |
+| 其它 Claude | `5h`、`7d`、`7d_claude` |
+| 其它模型 | `5h`、`7d` |
 
-**区域拒绝按账号记忆**：`shared_quota_unavailable`（区域不服务）取决于账号的上游套餐——
-plus 账号能用的节点，共享额度账号可能整池被拒。因此区域拒绝只记在「账号 × 节点」维度
-（30 分钟），不影响该节点对其他账号的可用性。一个账号被所有出口都拒绝时，按账号冷却
-处理并把请求转移到其他账号，而不是继续扫描节点池。
+自动分配、默认账号、会话亲和、`X-Mirofish-Account` 显式指定都不能穿透门禁。
+所有候选账号在相关窗口用尽时，本地返回 429，没有“全部用尽继续兜底”。
+额度缓存中跨过重置时间的旧窗口不再证明可用，发送业务请求前仍需有效预检。
 
-**会话亲和**：同一个对话（窗口）始终路由到同一个账号，不同对话才分配到不同账号——
-避免「一个会话被多账号轮流服务」这种明显的中转特征。会话标识按优先级取：请求头
-`X-Mirofish-Session` > 请求体 `metadata.user_id` > 首条 user 消息的哈希（对话追加轮次时保持不变，
-且刻意忽略 system 提示词，以免所有窗口共用同一提示词而挤到同一账号）。新会话按下方
-「账号调度模式」的规则分配，从而在账号间铺开。会话在 `MIROFISH_SESSION_TTL`（默认 1800 秒）无活动后过期。
-WebUI 账号表的「活跃会话」列可实时看到每个账号正在服务的窗口数。
+显式账号头优先；未指定时保留合格账号上的会话亲和，新会话优先考虑
+`MIROFISH_DEFAULT_ACCOUNT`，否则使用唯一固定策略：**48 小时内 `7d` 优先重置，按 1 小时
+分档 → 同档 `7d_fable` 已用比例更高 → 最久未分配**。更远或未知的重置时间不获重置优先。
+没有三种模式或活跃会话数权重，活跃会话数只用于展示。
 
-**账号调度模式**：WebUI「账号调度」卡片（或 `GET`/`POST /api/schedule`）可在三种模式间
-切换，设置持久化在数据卷的 SQLite 中。默认的**均衡分配**把新会话交给活跃会话最少的账号；
-**优先重置窗口**在同样的均衡排序上加一点倾斜——7 天窗口将在 48 小时内重置的账号被视为
-少扛最多 2 个会话，优先接下新会话，把快清零的额度先花掉，提前量用完就回到正常轮换，
-不会把并发都堆到一个账号上。**优先重置窗口 + Fable 已用最高**（`fable_first`）在此基础上，
-对非 fable 模型的请求把这点提前量按该账号 `7d_fable` 窗口的已用比例缩放：48 小时内要重置的
-账号里，Fable 已用最高的排最前——这些账号的 fable 额度本就用尽（发 fable 请求也会被拒），
-而通用额度即将清零，正好先花掉；fable 额度有余量的账号留给 fable 请求。fable 请求本身仍按
-「优先重置窗口」分配。用量约束在所有模式下都生效：claude-fable-5 请求同时考虑
-该模型独立的 7 天窗口（`7d_fable`），取两者中更满的一个；用量超过可配置上限（默认 98%）
-的账号排到所有有余量账号之后；相关窗口已用满（约 100%，上限配得更高时随之抬高）的账号
-被自动分配直接跳过，避免把窗口烧到 100% 以上——仅当所有账号都用满时才继续兜底服务，
-指定账号请求不受影响，上游 429 仍是最终裁决。额度数据来自后台每 5 分钟一次的
-`/v1/limits` 扫描（零模型开销，两种模式都保持刷新，跳过已停用账号，保存调度设置时
-立即刷新一次），不在请求路径上探测；已过重置时间的缓存窗口视为无数据，不会误伤刚刚
-重置的账号；数据略旧最多让一次请求多试一个账号——上游 429 加自动换号才是真正的兜底。
-已开始的对话仍固定在原账号上，不会中途切换（对话所在账号窗口用满时例外：下一轮换到
-有余量的账号）。
+会话优先使用 `X-Mirofish-Session` 等明确协议会话标识，其次是正文会话元数据，
+否则由首条 user 内容推导，忽略共用的 system 提示词。闲置超过 `MIROFISH_SESSION_TTL`
+（默认 1800 秒）过期。亲和账号不再满足门禁时，自动请求可改派到合格账号，
+显式指定账号则不替换。`X-Mirofish-Account` 是 relay 本地请求/响应头，绝不转发上游；
+响应还可包含 `X-Mirofish-Quota-7d-Utilization` / `-Reset`。
+
+### 冷却与健康恢复
+
+- 停用账号保留凭据，但不参与自动调度或手动批量额度刷新；显式业务请求返回 403。
+- 业务遇 429 后合并强制刷新额度，再按 `credit_exhausted_*` 的具体窗口冷却至重置；
+  不做每小时恢复探测。仅 `7d_fable` 用尽不连坐其它模型，仅 `7d_claude` 用尽不连坐
+  非 Claude 模型；`5h`/`7d` 是共同约束。普通短暂 429 冷却 60 秒。
+  可自动换合格账号，不能换该账号代理或回退直连。
+- 已记录的健康 401 必须重新登录。永久 403 标记 `suspended`，不自动调度或批量刷新；
+  临时 403 使用上游返回的真实恢复 deadline，不猜固定冷却时长。
+- 仅真正的 `overloaded_error` 503 记录账号级过载：一天后允许实际业务重试，不启动探针；
+  也可手动执行真实模型调用，成功完成后恢复健康。普通 edge/HTML 503 不记作额度耗尽
+  或账号级过载。
+- 资料、limits、model roster、`count_tokens` 成功均不能自愈模型健康，重新登录也不将
+  403/503 当作已恢复；打开 HTTP/SSE 流不算模型成功，必须成功完成真实模型响应。
+
+### 模型目录
+
+`GET /v1/models` 明确请求时，使用账号的 signed `/v1/model-roster`，按账号缓存 600 秒；
+没有后台 roster 轮询或模型 probe。返回 OpenAI `object: "list"`，
+`data` 是含 `id`、`object: "model"`、`created`、`owned_by` 的对象数组，不是字符串数组。
+能力只来自该账号的 roster；Claude 条目 `contextWindow >= 1_000_000` 才提供 `[1m]` 变体，
+不以静态列表虚构权限，读取失败不伪造成功目录。模型出现在目录里不代表当前有可用容量。
 
 调用模型示例（流式）：
 
@@ -244,17 +240,18 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
 
 ## 从旧版（单文件 relay）升级
 
-数据卷完全兼容：SQLite 结构自动迁移（新增用量日志表），`secrets.enc` v1 自动升级为 v2，
-每个账号首次使用时各自创建设备密钥，账号与节点绑定关系保留。直接
-`docker compose up -d --build` 即可。
+数据卷名 `mirofish-data` 与 `/data/secrets.enc`、`/data/accounts.sqlite3`、`/data/proxy.key`
+路径不变。SQLite 自动迁移，`secrets.enc` v1 自动升级为 v2；已存在的每账号设备密钥保留，
+缺失时首次使用创建。升级不会擅自修复代理绑定：旧 Mihomo 节点、空绑定或损坏配置会拒绝出站，
+需在 WebUI 手动配置有效端点并改绑，或明确选择 `direct`。
+保留主密钥与数据卷后执行 `docker compose up -d --build`，并在宿主机配置 journald 持久化。
 
 ## 注意
 
 - Docker 镜像使用仓库中的 `uv.lock` 做 `--locked --no-dev` 安装；修改
   `pyproject.toml` 依赖后必须同步更新并提交锁文件，否则镜像构建会直接失败。
-- compose 当前把 `8787` 绑定到 `0.0.0.0`（公网可达）。任何能访问该端口的人只需本地代理密钥即可调用；
-  公网部署强烈建议在前面加 TLS 与额外鉴权（反向代理 / Cloudflare Access）。改回仅本机：把 ports 设为
-  `127.0.0.1:8787:8787`。
+- Compose 默认端口映射为 `127.0.0.1:8787:8787`，容器内服务仍监听 `0.0.0.0`。
+  如主动改为公网监听，必须增加 TLS 与额外鉴权（反向代理 / Cloudflare Access）。
 - Mirofish 没有精确余额接口；WebUI 显示套餐层级与到期时间、用量日志与 relay 返回的
   7 天配额利用率。
 - `/v1/models` 和模型请求会先申请设备 ticket；如果升级上游协议，可通过
@@ -269,23 +266,24 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   避免出现 `lang: python` 与 `runtime: node` 并存这种任何真实客户端都不会发出的组合；
   只有 `anthropic-version` 和 `anthropic-beta` 这两个会改变请求语义的选项保留调用方的值。
   `MIROFISH_CLAUDE_CLI_USER_AGENT` 可覆盖 User-Agent。
-- 设备身份按账号隔离：每个 alias 有自己的 Ed25519 密钥（惰性创建，可经
-  `POST /api/accounts/<alias>/reset-device` 轮换）。机器层面的字段仍是全安装共用：
+- 设备身份按账号隔离：每个账号的 Ed25519 密钥惰性创建并持久保留，同一账号更新凭据
+  只使旧授权缓存失效，不擅自 rotate 设备。机器层面的字段仍是全安装共用：
   非 CLI 调用方统一补全为抓包中的
   `arm64 / MacOS` Claude CLI 组合；真实 `claude-cli/...` 调用方的 arch / os 原样保留。
   `x-mirasim-device` 是该账号公钥派生的 22 字符设备 ID，签名与（旧版标识下的）无签名降级发出的是同一个值；
   降级路径不会改用形状不同的替代标识，否则单看这个字段就能区分两条路径。
-- 桌面端后台整机行为由 `mirofish/behavior.py` 重放：gzipped `/events` 遥测、
-  `/v1/model-roster`、`cdn-assets` 更新检查，每账号一条带抖动的循环任务；面板关闭或
-  共享额度冷却时暂停。`MIROFISH_BEHAVIOR_REPLAY=0` 可关闭。
-- 仿真范围只到请求头与请求体。TLS ClientHello 出自 OpenSSL，官方客户端是 Electron 的
+- 没有桌面端后台行为回放、`/events` 遥测或更新检查；也没有后台资料、额度、roster 刷新。
+- `MIROFISH_TLS_IMPERSONATE=off` 为默认值，TLS ClientHello 出自 OpenSSL，官方客户端是 Electron 的
   BoringSSL：cipher 列表、扩展顺序与 GREASE 由 TLS 库决定，要对齐 JA3 得换掉 TLS 栈，
   配置 OpenSSL 做不到。因此 ALPN 扩展被刻意保留（官方也带这个扩展，去掉反而更显眼），
   只有在 Python 3.13+ 上会把 supported_groups 收窄成浏览器那三个曲线，去掉 OpenSSL 3.5
-  默认的 X25519MLKEM768 与 ffdhe。回环抓包测试固定了这些字段，依赖升级不会悄悄改掉。
+  默认的 X25519MLKEM768 与 ffdhe。回环抓包测试覆盖这些字段。
+  Docker 镜像包含 `tls-impersonate` extra，可显式设 `MIROFISH_TLS_IMPERSONATE=chrome136`
+  使用可选 Chromium/BoringSSL 风格 profile；这不改变固定代理绑定，也不保证与官方 TLS 完全等价。
 - 上游会话标识（`x-mirasim-session`）现在是裸 v4 UUID，不再带 `mirofish_` 前缀：该值同时用作
-  `x-claude-code-session-id`，官方客户端在这里发的一直是 UUID。对同一对话仍然是确定性的，
-  会话亲和行为不变。
+  `x-claude-code-session-id`。映射包含账号：同账号同会话确定，跨账号不同；
+  真实 CLI 的 session 头、Codex session/thread 头与正文会话元数据同样按账号改写。
+  消息内容、tool ID、`previous_response_id` 不改写；改写在最终序列化和签名前完成。
 - Claude 模型请求会自动补上官方客户端的 prompt cache 断点（Agent SDK 标记块、最后一个
   system 块、最后一个 user 轮次的末尾块，共 3 个，与抓包一致；`tools` 不打断点）。
   调用方自己带了任何 `cache_control` 时整体不改动，因为上游最多只接受 4 个断点。
@@ -294,14 +292,14 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   `MIROFISH_MAX_CONNECTIONS`（默认 100）和 `MIROFISH_MAX_KEEPALIVE_CONNECTIONS`
   （默认 20）控制连接复用，`MIROFISH_STREAM_READ_TIMEOUT`（默认 600 秒）控制流式读取超时。
   `MIROFISH_MAX_BODY_BYTES`（默认 8388608）同时限制压缩输入与解压后的正文，防止解压炸弹。
-- `status?probe=1` 使用 `/v1/limits`，不产生模型调用；显式模型扫描会发送最小工作请求，
-  可能消耗少量额度。
-- `max_tokens<=1` 的 Messages 请求按构造不可能产出有效内容，上游把它当作可用性探针直接
-  返回 400（并要求改用 `GET /v1/limits`）。relay 因此在本地作答：返回 `content` 为空、
-  `stop_reason` 为 `max_tokens` 的合法 Messages 信封，`usage.input_tokens` 取自不计费的上游
-  `/v1/messages/count_tokens`（不可用时退回本地估算），响应头带 `X-Mirofish-Probe:
-  short-circuit`，并记录调用方 `user-agent` 便于定位来源。这既不计费也不记入用量日志。
+- CLI `status <alias>` 只刷新资料，旧 `--probe`/`status?probe=1` 也不读额度。
+  `models <alias>` 是目录读取，不是模型探测；`--scan` 已删除。
+- `max_tokens<=1` 的 Messages 请求默认完全由本地合成：返回 `content` 为空、
+  `stop_reason` 为 `max_tokens` 的合法 Messages 信封，`usage.input_tokens` 只作本地估算。
+  不选账号、不做额度/roster 读取、不申请 ticket，也不调用上游 `count_tokens` 或模型。
+  响应头带 `X-Mirofish-Probe: short-circuit` 与 `X-Mirofish-Synthetic: true`，
+  并记录调用方 `user-agent` 便于定位来源；不计入用量日志，不改变健康状态。
   `/v1/chat/completions` 同理（`max_tokens` 为 0 或 1 都会被翻译成同一形状）。需要恢复原样
-  转发时设置 `MIROFISH_ONE_TOKEN_SHORT_CIRCUIT=0`。可用性请查 `GET /v1/limits`，数 token 请用
-  `POST /v1/messages/count_tokens`。
+  转发时设置 `MIROFISH_ONE_TOKEN_SHORT_CIRCUIT=0`。合成响应、额度读取、目录及 token 计数
+  都不证明模型可用；只有真实模型调用成功才是恢复依据。
 - 删除账号只清除本地凭证，不注销远端账号。

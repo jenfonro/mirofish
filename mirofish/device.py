@@ -207,6 +207,21 @@ class DeviceSigner:
             self._private_key = key
             return key
 
+    def rotate(self) -> str:
+        """Explicit operator reset; ordinary same-account login keeps its key."""
+        with self._lock:
+            key = Ed25519PrivateKey.generate()
+            pem = key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            ).decode("ascii")
+            self.store.vault.put(self.alias, DEVICE_KEY_KIND, pem)
+            self._private_key = key
+            self._device_id = None
+            self._public_key = None
+            return self.device_id
+
     @property
     def device_id(self) -> str:
         self._ensure_identity()

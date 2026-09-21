@@ -230,8 +230,33 @@ async def test_fetch_limits_attaches_and_caches_the_split(state, monkeypatch):
         ]}
 
     monkeypatch.setattr(state.upstream, "limits", fake_limits)
-    limits = await state.accounts.fetch_limits("work")
+    limits = await state.accounts.fetch_limits("work", force=True)
 
     assert _split(limits)["claude-fable-5-1"]["total_tokens"] == 12
     cached = json.loads(state.store.row("work")["metadata_json"])["limits"]
     assert _split(cached)["claude-fable-5-1"]["total_tokens"] == 12
+
+
+def test_split_resets_without_refreshing_upstream(state):
+    add_account(state, "work")
+    reset_at = time.time() - 1
+    _log(state.store, "work", "claude-fable-5", created_at=_iso(reset_at - 60),
+         inp=500, out=500)
+    limits = _limits(reset_at)
+    state.accounts._attach_fable_split("work", limits)
+    assert all(row["total_tokens"] == 0 for row in _window(limits)["models"])
+
+
+def test_split_includes_1m_variant_and_excludes_next_window(state):
+    add_account(state, "work")
+    reset_at = time.time() + WEEK / 2
+    _log(state.store, "work", "claude-fable-5[1m]",
+         created_at=_iso(reset_at - 60), inp=5, out=7)
+    _log(state.store, "work", "claude-fable-5-1[1m]",
+         created_at=_iso(reset_at - 60), inp=10, out=20)
+    _log(state.store, "work", "claude-fable-5[1m]",
+         created_at=_iso(reset_at + 1), inp=100, out=200)
+    limits = _limits(reset_at)
+    state.accounts._attach_fable_split("work", limits)
+    assert _split(limits)["claude-fable-5"]["total_tokens"] == 12
+    assert _split(limits)["claude-fable-5-1"]["total_tokens"] == 30

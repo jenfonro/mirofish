@@ -1,76 +1,61 @@
-"""Connection and ticket caches must follow the selected Mihomo node."""
+"""Fixed-exit transport identity is exactly (account, proxy URL)."""
 
 import time
 
-from mirofish.proxy.mihomo import SlotManager
+import pytest
+
 from mirofish.upstream import _DeviceTicket
 from tests.conftest import add_account
 
 
-class _FakeMihomo:
-    def __init__(self) -> None:
-        self.selected = []
-
-    async def has_group(self, _group: str) -> bool:
-        return True
-
-    async def set_selector(self, group: str, node: str) -> None:
-        self.selected.append((group, node))
+async def test_client_cache_is_scoped_to_account_and_fixed_exit(state):
+    first = await state.upstream.client("http://exit-a:8080", "acct")
+    assert await state.upstream.client("http://exit-a:8080", "acct") is first
+    assert await state.upstream.client("http://exit-b:8080", "acct") is not first
+    assert await state.upstream.client("http://exit-a:8080", "other") is not first
 
 
-async def _route(manager: SlotManager, node: str):
-    async with manager.route("acct", node) as proxy_url:
-        return proxy_url
+async def test_direct_never_uses_legacy_tls_proxy_or_environment(state, monkeypatch):
+    monkeypatch.setattr(state.settings, "tls_proxy", "http://unused:9999", raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://unused:9998")
+    direct = await state.upstream.client("direct", "acct")
+    assert await state.upstream.client(None, "acct") is direct
+    assert await state.upstream.client("", "acct") is direct
+    assert direct._mounts == {}
+    assert state.upstream._ticket_key("acct", "direct") == ("acct", "")
 
 
-async def test_client_cache_uses_node_identity_behind_same_slot(state):
-    manager = SlotManager(_FakeMihomo(), "http://mihomo:7890", 1, 7891,
-                          "MirofishPool")
-
-    node_a = await _route(manager, "node-a")
-    node_a_again = await _route(manager, "node-a")
-    node_b = await _route(manager, "node-b")
-
-    # The value passed to httpx remains the listener's actual URL.  Only the
-    # cache identity distinguishes which selector node owns its open tunnels.
-    assert str(node_a) == str(node_a_again) == str(node_b) == "http://mihomo:7891"
-    client_a = await state.upstream.client(node_a)
-    assert await state.upstream.client(node_a_again) is client_a
-    assert await state.upstream.client(node_b) is not client_a
-
-
-async def test_client_cache_is_scoped_to_account_alias(state):
-    """Two accounts on the same exit must never share a connection pool."""
-    manager = SlotManager(_FakeMihomo(), "http://mihomo:7890", 1, 7891,
-                          "MirofishPool")
-    node = await _route(manager, "node-a")
-
-    first = await state.upstream.client(node, "acct")
-    assert await state.upstream.client(node, "acct") is first
-    assert await state.upstream.client(node, "other") is not first
-    assert await state.upstream.client(node) is not first
-
-
-async def test_device_ticket_cache_is_scoped_to_node_route(state, monkeypatch):
+async def test_device_tickets_use_only_account_and_transport_url(state, monkeypatch):
     add_account(state, "acct")
-    manager = SlotManager(_FakeMihomo(), "http://mihomo:7890", 1, 7891,
-                          "MirofishPool")
-    node_a = await _route(manager, "node-a")
-    node_b = await _route(manager, "node-b")
     minted = []
 
     async def mint(alias, _access, proxy_url):
-        minted.append((alias, proxy_url.route_identity))
-        return _DeviceTicket(f"ticket-{len(minted)}", time.monotonic() + 900.0)
+        minted.append((alias, proxy_url))
+        return _DeviceTicket(f"ticket-{len(minted)}", time.monotonic() + 900)
 
     monkeypatch.setattr(state.upstream, "_mint_device_ticket", mint)
+    first = await state.upstream._device_ticket("acct", "http://exit-a:8080")
+    assert await state.upstream._device_ticket("acct", "http://exit-a:8080") == first
+    assert await state.upstream._device_ticket("acct", "http://exit-b:8080") != first
+    assert len(minted) == 2
 
-    first = await state.upstream._device_ticket("acct", node_a)
-    assert await state.upstream._device_ticket("acct", node_a) == first
-    second = await state.upstream._device_ticket("acct", node_b)
 
-    assert second != first
-    assert [route for _, route in minted] == [
-        "mihomo:MirofishSlot0:node-a",
-        "mihomo:MirofishSlot0:node-b",
-    ]
+@pytest.mark.parametrize("selected", [None, "", "direct", "http://exit:8080"])
+async def test_impersonation_preserves_explicit_route(state, monkeypatch, selected):
+    from mirofish import tls_impersonate
+
+    clients = []
+
+    class FakeClient:
+        def __init__(self, profile, proxy, timeout):
+            clients.append((profile, proxy))
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(tls_impersonate, "impersonation_available", lambda: True)
+    monkeypatch.setattr(tls_impersonate, "ImpersonatingClient", FakeClient)
+    state.settings.tls_impersonate = "chrome136"
+    monkeypatch.setattr(state.settings, "tls_proxy", "http://unused:9999", raising=False)
+    await state.upstream.client(selected, "acct")
+    assert clients == [("chrome136", None if selected in (None, "", "direct") else selected)]

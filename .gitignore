@@ -33,3 +33,7 @@ captures/
 
 # Mounted proxy subscription inputs often contain node credentials.
 /deploy/mirofish-relay/mihomo-input/
+
+data/
+**/docker-compose.override.yml
+.npm-cache/

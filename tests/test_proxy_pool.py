@@ -1,338 +1,234 @@
-"""Sticky-pool recovery when the Mihomo provider renames its nodes."""
+"""Manual pool management; all Google 204 requests are mocked."""
 
-import json
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
-import respx
 
-from mirofish.api.state import AppState
-from mirofish.config import Settings
 from mirofish.errors import RelayError
+from mirofish.proxy import DIRECT, ProxyPool, proxy_url
+from mirofish.proxy.pool import TEST_TIMEOUT, TEST_URL
+from mirofish.store import Store
+from mirofish.vault import make_credential_store
 
-from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
-
-CTRL = "http://ctrl.test"
-
-
-@pytest.fixture
-def mihomo_settings(tmp_path, monkeypatch):
-    monkeypatch.setenv("MIROFISH_MASTER_KEY", "unit-test-master-key")
-    monkeypatch.delenv("MIROFISH_PROXY_SUBSCRIPTION_URL", raising=False)
-    monkeypatch.delenv("MIROFISH_PROXY_SUBSCRIPTION_URL_FILE", raising=False)
-    return Settings(auth_base=AUTH_BASE, relay_base=RELAY_BASE,
-                    data_dir=tmp_path / "data", cred_backend="file", timeout=5.0,
-                    mihomo_controller=CTRL, mihomo_proxy="http://mihomo:7890",
-                    mihomo_slots=2)
+NODES = [
+    {"name": "", "scheme": "socks5", "host": "a.test", "port": 1080,
+     "username": "user", "password": "secret"},
+    {"name": "node-b", "scheme": "http", "host": "b.test", "port": 8080,
+     "username": "", "password": ""},
+]
 
 
 @pytest.fixture
-async def mihomo_state(mihomo_settings):
-    app_state = AppState(mihomo_settings)
-    yield app_state
-    await app_state.aclose()
+def pool(settings):
+    store = Store(settings.data_dir, make_credential_store(settings.data_dir, "file"))
+    pool = ProxyPool(store, settings)
+    yield pool
+    store.db.close()
 
 
-@respx.mock
-async def test_provider_rename_resyncs_and_rotates(mihomo_state):
-    state = mihomo_state
-    add_account(state, "acct")
+@pytest.fixture(autouse=True)
+def forbid_network(monkeypatch):
+    async def unexpected(*args, **kwargs):
+        pytest.fail("unexpected network request")
 
-    # The provider currently serves node-new; the pool still believes in
-    # node-old (stored below), as after a provider auto-update.
-    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
-        return_value=httpx.Response(200, json={"all": ["node-new"], "now": "node-new"}))
-    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
-        return_value=httpx.Response(200, json={"all": ["node-new"], "now": "node-new"}))
-
-    def selector_put(request):
-        name = json.loads(request.content).get("name")
-        if name == "node-new":
-            return httpx.Response(204)
-        return httpx.Response(400, json={"message": "proxy not exist"})
-
-    respx.put(f"{CTRL}/proxies/MirofishSlot0").mock(side_effect=selector_put)
-    respx.put(f"{CTRL}/proxies/MirofishSlot1").mock(side_effect=selector_put)
-
-    # Seed the store with the stale node set and pin the account to it.
-    stale = state.pool._configs_from_names(["node-old"])
-    state.pool._store_nodes(stale, skipped=0)
-    stale_id = next(iter(stale))
-    state.store.set_account_proxy("acct", stale_id)
-
-    used = []
-
-    async def op(proxy_url):
-        used.append(proxy_url)
-        return "ok"
-
-    # First attempt PUTs node-old -> Mihomo 400 -> resync + rotate -> node-new.
-    result = await state.with_proxy("acct", op)
-    assert result == "ok"
-    assert used and used[-1].startswith("http://mihomo:789")
-
-    row = state.store.row("acct")
-    assert str(row["proxy_id"]) != stale_id
-    active = {str(r["proxy_id"]) for r in state.store.proxy_rows(active_only=True)}
-    assert str(row["proxy_id"]) in active
+    monkeypatch.setattr(httpx.AsyncClient, "send", unexpected)
 
 
-@respx.mock
-async def test_region_blocked_node_is_rotated_away(mihomo_state):
-    """A 429 region refusal must retire the exit, not dead-end the account."""
-    state = mihomo_state
-    add_account(state, "acct")
-
-    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
-        return_value=httpx.Response(200, json={"all": ["node-a", "node-b"],
-                                               "now": "node-a"}))
-    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
-        return_value=httpx.Response(200, json={"all": ["node-a", "node-b"],
-                                               "now": "node-a"}))
-    respx.put(url__regex=rf"{CTRL}/proxies/MirofishSlot\d+").mock(
-        return_value=httpx.Response(204))
-
-    configs = state.pool._configs_from_names(["node-a", "node-b"])
-    state.pool._store_nodes(configs, skipped=0)
-    blocked_id = str(state.store.row("acct")["proxy_id"] or "")
-    if not blocked_id:
-        blocked_id = next(iter(configs))
-        state.store.set_account_proxy("acct", blocked_id)
-
-    region_error = RelayError(
-        "upstream does not serve this proxy exit region", 502,
-        {"region_blocked": True, "upstream": "shared_quota_unavailable: ..."})
-
-    attempts = []
-
-    async def op(proxy_url):
-        attempts.append(proxy_url)
-        # Only the first exit is region-blocked; the rotation target works.
-        if len(attempts) == 1:
-            raise region_error
-        return "ok"
-
-    assert await state.with_proxy("acct", op) == "ok"
-    assert len(attempts) == 2
-
-    # The account moved off the refused node, remembers the refusal, and the
-    # node's global health is untouched (other tiers may be served through it).
-    assert str(state.store.row("acct")["proxy_id"]) != blocked_id
-    assert blocked_id in state.pool._refused_ids("acct")
-    refused = next(r for r in state.store.proxy_rows()
-                   if str(r["proxy_id"]) == blocked_id)
-    assert int(refused["failure_count"]) == 0
+def test_add_list_reload_and_credential_storage(pool):
+    node = pool.add(NODES[0])
+    summary = pool.public_summary()
+    assert summary["configured"] is True
+    assert summary["total"] == summary["active"] == 1
+    assert summary["assigned"] == 0
+    assert summary["nodes"][0] == {
+        **node, "active": True, "status": "untested", "assigned": 0,
+        "failure_count": 0, "last_error": None, "last_checked": None,
+    }
+    assert ProxyPool(pool.store, pool.settings).by_id(node["id"]) == node
+    assert b"secret" not in pool.store.db_path.read_bytes()
+    assert b"secret" not in (pool.store.data_dir / "secrets.enc").read_bytes()
 
 
-@respx.mock
-async def test_tenant_profile_region_refusal_rotates_and_refreshes_status(mihomo_state):
-    """Generic /me/tenant 429s must carry the same rotatable region marker."""
-    state = mihomo_state
-    add_account(state, "acct")
-    names = ["node-a", "node-b"]
-
-    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.put(url__regex=rf"{CTRL}/proxies/MirofishSlot\d+").mock(
-        return_value=httpx.Response(204))
-
-    configs = state.pool._configs_from_names(names)
-    state.pool._store_nodes(configs, skipped=0)
-    blocked_id = next(iter(configs))
-    state.store.set_account_proxy("acct", blocked_id)
-
-    respx.get(AUTH_BASE + "/auth/me").mock(
-        return_value=httpx.Response(200, json={"id": "u-acct", "email": "acct@example.com"}))
-    respx.get(AUTH_BASE + "/auth/referral").mock(
-        return_value=httpx.Response(200, json={"current_plan": "pro"}))
-    tenant = respx.get(RELAY_BASE + "/me/tenant").mock(side_effect=[
-        httpx.Response(429, json={
-            "error": {
-                "type": "shared_quota_unavailable",
-                "message": "The cloud route is not served to this network region.",
-            },
-        }),
-        httpx.Response(200, json={"tenant": "tenant-ok"}),
-    ])
-
-    result = await state.with_proxy(
-        "acct", lambda url: state.accounts.fetch_status("acct", proxy_url=url))
-
-    assert result["tenant"] == "tenant-ok"
-    assert tenant.call_count == 2
-    assert str(state.store.row("acct")["proxy_id"]) != blocked_id
-    assert blocked_id in state.pool._refused_ids("acct")
-    refused = next(row for row in state.store.proxy_rows()
-                   if str(row["proxy_id"]) == blocked_id)
-    assert int(refused["failure_count"]) == 0
+def test_add_renames_existing_endpoint_without_duplicate(pool):
+    first = pool.add(NODES[0])
+    again = pool.add({**NODES[0], "name": "renamed"})
+    assert again["id"] == first["id"]
+    assert pool.public_summary()["total"] == 1
+    first["host"] = "mutated.test"
+    assert pool.by_id(again["id"])["host"] == "a.test"
 
 
-@respx.mock
-async def test_shared_credit_exhaustion_does_not_rotate_proxy(mihomo_state):
-    """Account/shared quota errors are not properties of the proxy exit."""
-    state = mihomo_state
-    add_account(state, "acct")
-    names = ["node-a", "node-b"]
+def test_edit_endpoint_retains_id_binding_and_failure_status(pool):
+    node = pool.add(NODES[0])
+    pool.store.save("acct", "a@test.com", "access", "refresh", {}, proxy_id=node["id"])
+    pool.fail(node, "unreachable")
 
-    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.put(url__regex=rf"{CTRL}/proxies/MirofishSlot\d+").mock(
-        return_value=httpx.Response(204))
+    updated = pool.update(node["id"], {"name": "new", "host": "new.test", "port": 444})
 
-    configs = state.pool._configs_from_names(names)
-    state.pool._store_nodes(configs, skipped=0)
-    original_id = next(iter(configs))
-    state.store.set_account_proxy("acct", original_id)
+    assert updated["id"] == node["id"]
+    assert pool.store.row("acct")["proxy_id"] == node["id"]
+    assert pool.for_account("acct") == updated
+    assert pool.public_summary()["nodes"][0]["last_error"] == "unreachable"
+    assert pool.add({**updated, "name": "re-added"})["id"] == node["id"]
+    # Re-adding the old endpoint must not overwrite the edited stable id.
+    old_endpoint = pool.add(NODES[0])
+    assert old_endpoint["id"] != node["id"]
+    assert pool.for_account("acct")["host"] == "new.test"
 
-    respx.get(AUTH_BASE + "/auth/me").mock(
-        return_value=httpx.Response(200, json={"id": "u-acct", "email": "acct@example.com"}))
-    respx.get(AUTH_BASE + "/auth/referral").mock(
-        return_value=httpx.Response(200, json={"current_plan": "free"}))
-    tenant = respx.get(RELAY_BASE + "/me/tenant").mock(
-        return_value=httpx.Response(429, json={
-            "error": {
-                "type": "credit_exhausted_shared",
-                "message": "The relay's shared quota is used up.",
-            },
-        }))
 
+def test_duplicate_endpoint_edit_is_conflict(pool):
+    first, second = (pool.add(node) for node in NODES)
     with pytest.raises(RelayError) as raised:
-        await state.with_proxy(
-            "acct", lambda url: state.accounts.fetch_status("acct", proxy_url=url))
-
-    assert raised.value.status == 429
-    assert raised.value.data["error"]["type"] == "credit_exhausted_shared"
-    assert tenant.call_count == 1
-    assert str(state.store.row("acct")["proxy_id"]) == original_id
-    original = next(row for row in state.store.proxy_rows()
-                    if str(row["proxy_id"]) == original_id)
-    assert int(original["failure_count"]) == 0
+        pool.update(first["id"], second)
+    assert raised.value.status == 409
+    assert pool.by_id(first["id"]) == first
 
 
-@respx.mock
-async def test_region_rotation_walks_past_four_nodes(mihomo_state):
-    """The old four-attempt cap could miss a served exit later in the pool."""
-    state = mihomo_state
-    add_account(state, "acct")
-    names = [f"node-{index}" for index in range(5)]
-
-    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.put(url__regex=rf"{CTRL}/proxies/MirofishSlot\d+").mock(
-        return_value=httpx.Response(204))
-
-    configs = state.pool._configs_from_names(names)
-    state.pool._store_nodes(configs, skipped=0)
-    region_error = RelayError(
-        "upstream does not serve this proxy exit region", 502,
-        {"region_blocked": True, "upstream": "shared_quota_unavailable: ..."})
-    attempts = []
-
-    async def op(proxy_url):
-        attempts.append(proxy_url)
-        if len(attempts) < 5:
-            raise region_error
-        return "ok"
-
-    assert await state.with_proxy("acct", op) == "ok"
-    assert len(attempts) == 5
-    # The four refusals stay per-account memory; the pool itself is untouched.
-    assert all(int(row["failure_count"]) == 0 for row in state.store.proxy_rows())
-    assert len(state.pool._refused_ids("acct")) == 4
+def test_edit_omitted_credentials_are_preserved_and_empty_credentials_are_cleared(pool):
+    node = pool.add(NODES[0])
+    renamed = pool.update(node["id"], {"name": "renamed"})
+    assert renamed["username"] == "user" and renamed["password"] == "secret"
+    cleared = pool.update(node["id"], {"username": "", "password": ""})
+    assert cleared["username"] == cleared["password"] == ""
+    assert cleared["id"] == node["id"]
+    assert pool.by_id(node["id"]) == cleared
 
 
-@respx.mock
-async def test_region_refused_everywhere_cools_account_not_pool(mihomo_state):
-    """When every exit region refuses one account, the account (not the pool)
-    is taken out of service: other accounts keep their nodes, the refused
-    account cools down, and its immediate retries fail fast without another
-    node sweep."""
-    state = mihomo_state
-    add_account(state, "acct")
-    add_account(state, "other")
-    names = ["node-a", "node-b"]
-
-    respx.get(f"{CTRL}/proxies/MirofishSlot0").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.get(f"{CTRL}/proxies/MirofishPool").mock(
-        return_value=httpx.Response(200, json={"all": names, "now": names[0]}))
-    respx.put(url__regex=rf"{CTRL}/proxies/MirofishSlot\d+").mock(
-        return_value=httpx.Response(204))
-
-    configs = state.pool._configs_from_names(names)
-    state.pool._store_nodes(configs, skipped=0)
-    region_error = RelayError(
-        "upstream does not serve this proxy exit region", 502,
-        {"region_blocked": True, "upstream": "shared_quota_unavailable: ..."})
-    attempts = []
-
-    async def op(_proxy_url):
-        attempts.append(_proxy_url)
-        raise region_error
-
+def test_remove_requires_explicit_unbinding_and_preserves_vault_on_conflict(pool):
+    first, second = (pool.add(node) for node in NODES)
+    pool.store.save("acct", "a@test.com", "access", "refresh", {}, proxy_id=first["id"])
+    before = pool.store.proxy_configs()
     with pytest.raises(RelayError) as raised:
-        await state.with_proxy("acct", op)
-    assert raised.value.data["region_blocked"] is True
-    assert raised.value.data["region_refused_everywhere"] is True
-    assert len(attempts) == 2  # one sweep: each exit tried exactly once
-    assert state.store.row("acct")["proxy_id"] is None
+        pool.remove(first["id"])
+    assert raised.value.status == 409
+    assert pool.store.proxy_configs() == before
+    assert pool.store.row("acct")["proxy_id"] == first["id"]
+    with pytest.raises(RelayError) as raised:
+        pool.store.delete_proxy(first["id"])
+    assert raised.value.status == 409
 
-    # The pool stays healthy for everyone else.
-    assert all(int(row["failure_count"]) == 0 for row in state.store.proxy_rows())
-    assert await state.pool.for_account("other") is not None
-
-    # The error is account-scoped: selection cools the account down.
-    assert state.note_account_unserviceable("acct", raised.value) is True
-    assert state.exhausted_cooldown("acct") > 0
-
-    # An immediate retry fails fast instead of sweeping the pool again.
-    attempts.clear()
-    with pytest.raises(RelayError) as retried:
-        await state.with_proxy("acct", op)
-    assert retried.value.status == 503
-    assert attempts == []
+    pool.store.set_account_proxy("acct", DIRECT)
+    pool.remove(first["id"])
+    assert pool.store.row("acct")["proxy_id"] == DIRECT
+    assert set(pool.store.proxy_configs()) == {second["id"]}
+    assert [row["proxy_id"] for row in pool.store.proxy_rows()] == [second["id"]]
+    with pytest.raises(RelayError) as raised:
+        pool.remove(first["id"])
+    assert raised.value.status == 404
 
 
-def test_node_exclude_filters_mihomo_group_names(mihomo_state):
-    from mirofish.validate import node_exclude_pattern
+def test_import_reports_bad_lines_and_does_not_probe(pool):
+    result = pool.import_uris("""
+        socks5://user:secret@a.test:1080
+        https://b.test:443#HTTPS
+        # ignored
+        vmess://unsupported
+        b.test:8080
+        http://c.test:8080
+    """)
+    assert result["added"] == 3
+    assert result["failed"] == ["line 5: invalid proxy URI", "line 6: invalid proxy URI"]
+    assert result["pool"]["total"] == 3
+    assert all(node["last_checked"] is None for node in result["pool"]["nodes"])
+    assert pool.import_uris("socks5://user:secret@a.test:1080#rename")["pool"]["total"] == 3
 
-    state = mihomo_state
-    state.pool.node_exclude = node_exclude_pattern("香港|HK|🇭🇰")
-    configs = state.pool._configs_from_names(
-        ["🇭🇰 香港-01", "HK-Central-02", "🇯🇵 日本-01", "SG-Marina-03"])
-    names = {config["name"] for config in configs.values()}
-    assert names == {"🇯🇵 日本-01", "SG-Marina-03"}
+
+def test_import_invalid_uri_does_not_return_credentials(pool):
+    result = pool.import_uris("\nhttp://sensitive-user:secret-password@proxy.test:bad\n")
+    assert result["added"] == 0
+    assert result["failed"] == ["line 2: invalid proxy URI"]
+    assert "secret-password" not in str(result)
+    assert "sensitive-user" not in str(result)
 
 
-def test_store_nodes_prunes_stale_rows_but_keeps_pinned(mihomo_state):
-    """Provider renames and subscription switches must not accumulate dead
-    rows forever; a node an account is still pinned to survives the prune."""
-    state = mihomo_state
-    add_account(state, "acct")
+def test_invalid_add_or_edit_does_not_write(pool):
+    node = pool.add(NODES[0])
+    for write in (lambda: pool.add({"scheme": "vmess"}),
+                  lambda: pool.update(node["id"], {"port": -1})):
+        with pytest.raises(RelayError) as raised:
+            write()
+        assert raised.value.status == 400
+    assert pool.by_id(node["id"]) == node
 
-    old = state.pool._configs_from_names(["old-a", "old-b", "old-c"])
-    state.pool._store_nodes(old, skipped=0)
-    pinned_id = next(iter(old))
-    state.store.set_account_proxy("acct", pinned_id)
 
-    new = state.pool._configs_from_names(["new-a", "new-b"])
-    state.pool._store_nodes(new, skipped=0)
+def test_network_errors_are_status_not_disablement(pool):
+    node = pool.add(NODES[0])
+    pool.store.save("acct", "a@test.com", "access", "refresh", {}, proxy_id=node["id"])
+    for _ in range(5):
+        pool.fail(node, "refused")
+        assert pool.for_account("acct") == node
+    row = pool.store.proxy_rows()[0]
+    assert row["active"] == 1 and row["failure_count"] == 5
+    assert pool.public_summary()["nodes"][0]["status"] == "error"
+    assert pool.active_count() == 1
+    assert pool.store.row("acct")["proxy_id"] == node["id"]
 
-    rows = {str(row["proxy_id"]): row for row in state.store.proxy_rows()}
-    # Current set active, pinned old node kept (inactive), the rest deleted.
-    assert set(rows) == set(new) | {pinned_id}
-    assert all(bool(rows[proxy_id]["active"]) for proxy_id in new)
-    assert not bool(rows[pinned_id]["active"])
-    assert set(state.pool.configs) == set(new) | {pinned_id}
 
-    # Once the account moves on, the next refresh drops the leftover too.
-    state.store.set_account_proxy("acct", next(iter(new)))
-    state.pool._store_nodes(new, skipped=0)
-    assert {str(row["proxy_id"]) for row in state.store.proxy_rows()} == set(new)
-    assert set(state.pool.configs) == set(new)
+def test_public_account_redacts_credentials_and_direct_is_not_an_assignment(pool):
+    node = pool.add(NODES[0])
+    for alias, binding in (("acct", node["id"]), ("direct", DIRECT), ("unbound", None)):
+        pool.store.save(alias, f"{alias}@test.com", "access", "refresh", {}, proxy_id=binding)
+    public = pool.account_public("acct")
+    assert public["id"] == node["id"]
+    assert "username" not in public and "password" not in public
+    assert pool.account_public("direct") is None
+    assert pool.account_public("unbound")["status"] == "unbound"
+    assert pool.store.proxy_assignment_counts() == {node["id"]: 1}
+
+
+def mock_test_client(monkeypatch, *, status=204, error=None):
+    client = MagicMock()
+    client.get = AsyncMock(return_value=httpx.Response(status), side_effect=error)
+    context = MagicMock()
+    context.__aenter__ = AsyncMock(return_value=client)
+    context.__aexit__ = AsyncMock(return_value=False)
+    constructor = MagicMock(return_value=context)
+    monkeypatch.setattr("mirofish.proxy.pool.httpx.AsyncClient", constructor)
+    return constructor, client
+
+
+@pytest.mark.parametrize("scheme", ["http", "https", "socks5"])
+async def test_manual_204_success_clears_errors_without_rebinding(pool, monkeypatch, scheme):
+    node = pool.add({**NODES[0], "scheme": scheme})
+    pool.store.save("acct", "a@test.com", "access", "refresh", {}, proxy_id=node["id"])
+    pool.fail(node, "broken")
+    constructor, client = mock_test_client(monkeypatch)
+
+    result = await pool.test(node["id"])
+
+    assert result["ok"] is True and result["latency_ms"] >= 0
+    constructor.assert_called_once_with(proxy=proxy_url(node), trust_env=False,
+                                        timeout=TEST_TIMEOUT, follow_redirects=False)
+    client.get.assert_awaited_once_with(TEST_URL)
+    public = pool.public_summary()["nodes"][0]
+    assert public["failure_count"] == 0 and public["last_error"] is None
+    assert public["status"] == "ok" and public["last_checked"]
+    assert pool.store.row("acct")["proxy_id"] == node["id"]
+
+
+@pytest.mark.parametrize("status", [200, 301, 403, 407, 500])
+async def test_manual_non_204_status_never_follows_or_falls_back(pool, monkeypatch, status):
+    node = pool.add(NODES[0])
+    constructor, client = mock_test_client(monkeypatch, status=status)
+    result = await pool.test(node["id"])
+    assert result["ok"] is False and str(status) in result["error"]
+    assert pool.public_summary()["nodes"][0]["status"] == "error"
+    assert pool.by_id(node["id"]) == node
+    assert constructor.call_count == client.get.await_count == 1
+
+
+async def test_manual_network_failure_is_recorded_once(pool, monkeypatch):
+    node = pool.add(NODES[0])
+    constructor, client = mock_test_client(monkeypatch, error=httpx.ConnectError("refused"))
+    result = await pool.test(node["id"])
+    assert result == {"id": node["id"], "ok": False, "error": "refused"}
+    assert pool.store.proxy_rows()[0]["active"] == 1
+    assert constructor.call_count == client.get.await_count == 1
+
+
+@pytest.mark.parametrize("proxy_id,status", [(DIRECT, 400), ("missing", 404)])
+async def test_manual_test_rejects_non_nodes(pool, proxy_id, status):
+    with pytest.raises(RelayError) as raised:
+        await pool.test(proxy_id)
+    assert raised.value.status == status

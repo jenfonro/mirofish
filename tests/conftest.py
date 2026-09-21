@@ -1,3 +1,5 @@
+import time
+
 import httpx
 import pytest
 
@@ -5,6 +7,7 @@ from mirofish.api import create_app
 from mirofish.api.state import AppState
 from mirofish.config import Settings
 from mirofish.store import utc_now
+from mirofish.proxy import DIRECT
 from tests.mirasim_protocol import SEAL_PUBLIC_KEY
 
 AUTH_BASE = "https://auth.test"
@@ -47,4 +50,15 @@ def add_account(state, alias: str, email: str | None = None) -> None:
     state.store.save(alias, email or f"{alias}@example.com",
                      f"access-{alias}", f"refresh-{alias}",
                      {"user_id": "u-" + alias, "plan": "pro", "tenant": "t1",
-                      "quota": {}, "last_usage": {}, "checked_at": utc_now()})
+                      "quota": {}, "last_usage": {}, "checked_at": utc_now(),
+                      "model_roster": {"version": "test-fixture", "fetched_epoch": time.time(),
+                          "agents": {"claude": [{"id": model, "contextWindow": 200000}
+                              for model in ("claude-haiku-4-5", "claude-opus-4-6", "claude-opus-4-7", "claude-opus-5",
+                                            "claude-sonnet-5", "claude-fable-5", "claude-fable-5-1")],
+                              "codex": [{"id": model, "contextWindow": 200000}
+                                  for model in ("gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5", "gpt-6", "gpt-5.4", "kimi-k3")]}},
+                      "limits": {"fetched_epoch": time.time(), "unmetered": False,
+                                 "windows": [{"name": name, "used": 0, "budget": 100,
+                                              "reset_at": time.time() + 7200}
+                                             for name in ("5h", "7d", "7d_claude", "7d_fable")]}},
+                     proxy_id=DIRECT)

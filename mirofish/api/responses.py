@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any, AsyncIterator
 
 from fastapi import APIRouter, Depends, Request
 
 from ..errors import RelayError
 from ..upstream import (ALPHA_SEARCH_PATH, RESPONSES_COMPACT_PATH,
-                        RESPONSES_PATH, forwarded_response_headers)
+                        RESPONSES_PATH, _json_bytes, forwarded_response_headers,
+                        relay_session_identity)
 from ..validate import model_value
 from .deps import get_state, read_json_body_bytes, require_auth
 from .relay import (_finalize_upstream_stream, _ManagedStreamingResponse,
-                    _ResponsesUsageWatcher)
+                    _ResponsesUsageWatcher, _stream_refusal)
 from .state import ACCOUNT_GENERATION_EXTENSION
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -32,7 +34,7 @@ def _session_hint(request: Request) -> str:
     # protocol itself.
     for name in (
         "x-mirofish-session", "session-id", "x-codex-session-id",
-        "x-codex-window-id", "x-openai-session-id",
+        "thread-id", "x-codex-thread-id", "x-codex-window-id", "x-openai-session-id",
     ):
         value = _safe_metadata(request.headers.get(name), 128)
         if value:
@@ -47,8 +49,8 @@ async def _codex_relay(request: Request, path: str) -> Any:
     if model is not None and not isinstance(model, str):
         raise RelayError("invalid model name", 400)
     if model:
-        # Validate only.  Unlike the Anthropic compatibility endpoint, this is a
-        # transparent MITM path and therefore never reserializes Codex's JSON.
+        # Keep original bytes unless account capability/session isolation
+        # requires a change. Signing always sees the final serialized body.
         model_value(model)
     # A Responses body may name a stored prompt instead of a model, so an absent
     # model is not a local error: upstream decides, and its protocol rejection
@@ -56,23 +58,28 @@ async def _codex_relay(request: Request, path: str) -> Any:
 
     requested = request.headers.get("X-Mirofish-Account", "")
     hint = _session_hint(request)
-    relay_session = state.relay_session_id("", hint, payload)
     try:
         query_string = request.scope.get("query_string", b"").decode("ascii")
     except UnicodeDecodeError as exc:
         raise RelayError("invalid URL query encoding", 400) from exc
 
     async def run(account: str):
+        relay_session, headers, prepared = relay_session_identity(
+            state.relay_session_id, account, request.headers, payload,
+            session_hint=hint)
         row = state.store.row(account)
         account_id = _safe_metadata(
             str(row["user_id"]) if row["user_id"] is not None else "")
         return await state.open_responses_stream(
-            account, body, request_headers=request.headers,
+            account, (body if prepared is payload and payload.get("model") == model
+                      else _json_bytes(prepared)),
+            request_headers=headers,
             session_id=relay_session, account_id=account_id,
             query_string=query_string, path=path)
 
     account, (response, stack) = await state.with_account_failover(
         requested, hint, payload, run)
+    model = payload.get("model")
     account_generation = response.extensions.get(ACCOUNT_GENERATION_EXTENSION)
     if not isinstance(account_generation, str):
         account_generation = None
@@ -85,10 +92,39 @@ async def _codex_relay(request: Request, path: str) -> Any:
                 observer.feed_bytes(response.content)
                 yield response.content
             return
+        json_body = bytearray()
+        is_json = "application/json" in response.headers.get("content-type", "")
+        # Decode only the private observation copy; raw compressed bytes and
+        # Content-Encoding still pass through unchanged to the caller.
+        decoder = response._get_content_decoder()
         async for chunk in response.aiter_raw():
-            # Observed from a private buffer; the relayed bytes are unchanged.
-            observer.feed_bytes(chunk)
+            decoded = decoder.decode(chunk)
+            observer.feed_bytes(decoded)
+            if is_json:
+                if len(json_body) + len(decoded) <= 256 * 1024:
+                    json_body.extend(decoded)
+                else:
+                    is_json = False
             yield chunk
+        tail = decoder.flush()
+        observer.feed_bytes(tail)
+        if is_json:
+            json_body.extend(tail)
+        observer.exhausted = True
+        if is_json and 200 <= response.status_code < 300:
+            try:
+                data = json.loads(json_body)
+            except ValueError:
+                return
+            if isinstance(data, dict):
+                if data.get("error"):
+                    observer.failed = True
+                    observer.refusal = _stream_refusal(data)
+                observer.successful = not data.get("error") and (
+                    (data.get("object") == "response" and data.get("status") == "completed")
+                    or data.get("object") == "response.compaction")
+                if isinstance(data.get("usage"), dict):
+                    observer.usage.update(data["usage"])
 
     upstream_headers = dict(response.headers)
 

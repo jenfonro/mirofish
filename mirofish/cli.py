@@ -1,7 +1,7 @@
-"""CLI: account management, sidecar config generation, and the relay server.
+"""CLI: account management, the relay server.
 
 Subcommands match the legacy single-file relay so existing docs and muscle
-memory keep working: add / list / status / models / remove / mihomo-config /
+memory keep working: add / list / status / models / remove /
 serve.
 """
 
@@ -22,7 +22,7 @@ from .api import create_app
 from .api.state import AppState
 from .config import DEFAULT_DATA_DIR, Settings
 from .errors import RelayError
-from .mihomo_config import write_mihomo_config
+from .proxy import DIRECT
 
 
 def make_parser() -> argparse.ArgumentParser:
@@ -35,20 +35,13 @@ def make_parser() -> argparse.ArgumentParser:
     add.add_argument("alias")
     add.add_argument("--email")
     commands.add_parser("list", help="列出本地账号状态")
-    status = commands.add_parser("status", help="刷新账号套餐和配额状态")
+    status = commands.add_parser("status", help="仅刷新账号套餐资料")
     status.add_argument("alias")
-    status.add_argument("--probe", action="store_true",
-                        help="同时读取 /v1/limits 用量额度，不产生模型调用")
-    models = commands.add_parser("models", help="探测 relay 支持的模型列表")
+    status.add_argument("--probe", action="store_true", help=argparse.SUPPRESS)
+    models = commands.add_parser("models", help="读取账号模型目录，不发送模型调用")
     models.add_argument("alias")
-    models.add_argument("--scan", action="store_true",
-                        help="额外用最小工作请求扫描候选模型；会产生少量模型调用费用")
-    models.add_argument("--max-scan", type=int, default=0,
-                        help="--scan 时最多探测的候选模型数（默认全部）")
     remove = commands.add_parser("remove", help="删除本地账号及凭证")
     remove.add_argument("alias")
-    mihomo = commands.add_parser("mihomo-config", help="生成 Docker Mihomo sidecar 配置")
-    mihomo.add_argument("--output", type=pathlib.Path, required=True)
     serve = commands.add_parser("serve", help="启动仅监听 localhost 的中转")
     serve.add_argument("--host", default="127.0.0.1")
     serve.add_argument("--port", type=int, default=8787)
@@ -69,16 +62,30 @@ def _proxy_key_notice(state: AppState) -> str:
 
 
 async def _cmd_add(state: AppState, alias: str, email: str) -> None:
-    proxy, _ = await state.with_pending_proxy(
-        alias, lambda url: state.accounts.start_login(alias, email, proxy_url=url))
+    try:
+        proxy_id = state.store.row(alias)["proxy_id"]
+    except RelayError as exc:
+        if exc.status != 404:
+            raise
+        proxy_id = DIRECT
+    proxy = state.pool.by_id(proxy_id)
+    await state.with_fixed_proxy(
+        alias, proxy, lambda url: state.accounts.start_login(alias, email, proxy_url=url))
     print("验证码已发送。")
     code = getpass.getpass("输入 6 位验证码（不会回显）：").strip()
     result = await state.with_fixed_proxy(
         alias, proxy,
         lambda url: state.accounts.finish_login(
             alias, email, code, proxy_url=url,
-            proxy_id=str(proxy["id"]) if proxy and proxy.get("id") else None))
+            proxy_id=proxy_id))
     state.reset_account_runtime(alias)
+    for kind in ("profile_refusal", "limits_refusal"):
+        refusal = result.pop(kind, None)
+        if refusal is not None:
+            status, body = refusal
+            state.note_account_error(alias, RelayError(kind, status, body))
+            result[kind.replace("refusal", "error")] = {"status": status}
+    result.update(public_status(state.store.row(alias), proxy=state.pool.account_public(alias)))
     _print(result)
 
 
@@ -88,18 +95,19 @@ def _cmd_remove(state: AppState, alias: str) -> None:
 
 
 async def _cmd_status(state: AppState, alias: str, probe: bool) -> None:
-    result = await state.with_proxy(
-        alias, lambda url: state.accounts.fetch_status(alias, probe, proxy_url=url))
+    try:
+        result = await state.with_proxy(
+            alias, lambda url: state.accounts.fetch_status(alias, proxy_url=url))
+    except RelayError as exc:
+        state.note_account_error(alias, exc)
+        raise
     result["proxy"] = state.pool.account_public(alias)
     _print(result)
 
 
-async def _cmd_models(state: AppState, alias: str, scan: bool, max_scan: int) -> None:
+async def _cmd_models(state: AppState, alias: str) -> None:
     result = await state.with_proxy(
         alias, lambda url: state.accounts.model_list(alias, proxy_url=url))
-    if scan:
-        result["probe_scan"] = await state.with_proxy(
-            alias, lambda url: state.accounts.scan_models(alias, max_scan, proxy_url=url))
     _print(result)
 
 
@@ -136,10 +144,6 @@ def main() -> int:
         settings = Settings.from_env()
         settings.data_dir = args.data_dir
         settings.timeout = args.timeout
-        if args.command == "mihomo-config":
-            write_mihomo_config(args.output, settings)
-            print("已生成 Mihomo 配置：" + str(args.output))
-            return 0
         if args.command == "serve" and args.default_account:
             settings.default_account = args.default_account
         state = AppState(settings,
@@ -155,7 +159,7 @@ def main() -> int:
             elif args.command == "status":
                 _run(_cmd_status(state, args.alias, args.probe))
             elif args.command == "models":
-                _run(_cmd_models(state, args.alias, args.scan, args.max_scan))
+                _run(_cmd_models(state, args.alias))
             elif args.command == "remove":
                 if input("确认删除本地账号和凭证？输入 DELETE：") == "DELETE":
                     _cmd_remove(state, args.alias)

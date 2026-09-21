@@ -1,5 +1,6 @@
 import gzip
 import json
+import time
 import uuid
 from typing import Any
 
@@ -42,7 +43,7 @@ async def test_codex_compressed_body_is_decompressed_then_signed_verbatim(
                 ],
             ))
     raw = (
-        b'{\n  "model": "gpt-5.6-codex",\n  "stream": true, '
+        b'{\n  "model": "gpt-5.6-sol",\n  "stream": true, '
         b'"input": [{"role":"user","content":"hello"}]\n}'
     )
 
@@ -127,7 +128,7 @@ async def test_codex_stream_records_usage_and_leaves_bytes_untouched(
 
     response = await client.post(
         "/v1/responses", headers=auth_headers,
-        content=b'{"model":"gpt-5.6-codex","stream":true,"input":"hi"}')
+        content=b'{"model":"gpt-5.6-sol","stream":true,"input":"hi"}')
 
     assert response.status_code == 200
     assert response.content == stream
@@ -146,6 +147,10 @@ async def test_codex_account_scoped_429_fails_over_to_another_account(
     add_account(state, "first")
     add_account(state, "second")
     _device_session()
+    respx.get(RELAY_BASE + "/v1/limits").mock(return_value=httpx.Response(
+        200, json={"windows": [{"name": name, "used": 0, "budget": 100,
+                               "reset_at": time.time() + 7200}
+                              for name in ("5h", "7d", "7d_claude", "7d_fable")]}))
     route = respx.post(RELAY_BASE + RESPONSES_PATH).mock(side_effect=[
         httpx.Response(429, json={"error": {"type": "usage_limit_reached"}}),
         httpx.Response(200, content=b'event: response.completed\ndata: {}\n\n',
@@ -154,7 +159,7 @@ async def test_codex_account_scoped_429_fails_over_to_another_account(
 
     response = await client.post(
         "/v1/responses", headers=auth_headers,
-        content=b'{"model":"gpt-5.6-codex","stream":true,"input":"hi"}')
+        content=b'{"model":"gpt-5.6-sol","stream":true,"input":"hi"}')
 
     assert response.status_code == 200
     assert response.headers["x-mirofish-account"] == "second"
@@ -194,7 +199,7 @@ async def test_responses_compact_relays_under_both_local_paths(
     _device_session()
     route = respx.post(RELAY_BASE + RESPONSES_COMPACT_PATH).mock(
         return_value=httpx.Response(200, json={"id": "response"}))
-    raw = b'{"model":"gpt-5.6-codex","input":"hi"}'
+    raw = b'{"model":"gpt-5.6-sol","input":"hi"}'
 
     first = await client.post(
         "/v1/responses/compact", headers=auth_headers, content=raw)
@@ -230,7 +235,7 @@ async def test_responses_body_may_name_a_stored_prompt_instead_of_a_model(
 
 
 @respx.mock
-async def test_responses_upstream_rejection_does_not_credit_the_exit(
+async def test_responses_upstream_rejection_does_not_heal_account(
         client, state, auth_headers):
     add_account(state, "work")
     _device_session()
@@ -238,14 +243,14 @@ async def test_responses_upstream_rejection_does_not_credit_the_exit(
         return_value=httpx.Response(
             503, json={"error": {"type": "upstream_unavailable"}}))
     credited: list[Any] = []
-    state.pool.success = credited.append  # type: ignore[method-assign]
+    state.note_account_healthy = lambda *args, **kwargs: credited.append(args)
 
     response = await client.post(
         "/v1/responses", headers=auth_headers,
-        content=b'{"model":"gpt-5.6-codex","input":"hi"}')
+        content=b'{"model":"gpt-5.6-sol","input":"hi"}')
 
-    # The rejection reaches the caller verbatim, but a node that never served
-    # the request must not have its failure counter cleared.
+    # Successful control-plane preflight and opening a rejected response
+    # never prove that this account can serve model work.
     assert response.status_code == 503
     assert credited == []
 
@@ -266,7 +271,7 @@ async def test_responses_unsupported_model_422_is_not_a_signature_error(
 
     response = await client.post(
         "/v1/responses", headers=auth_headers,
-        content=b'{"model":"missing-codex-model","input":"hi"}')
+        content=b'{"model":"gpt-5.6-sol","input":"hi"}')
 
     assert response.status_code == 422
     assert response.content == upstream_body
@@ -288,7 +293,7 @@ async def test_device_session_unsupported_fails_closed_for_current_client(
         404, json={"error": {"type": "not_found"}}))
     route = respx.post(RELAY_BASE + RESPONSES_PATH).mock(
         return_value=httpx.Response(200, json={"id": "response"}))
-    raw = b'{"model":"gpt-5.6-codex","input":"hi"}'
+    raw = b'{"model":"gpt-5.6-sol","input":"hi"}'
 
     first = await client.post("/v1/responses", headers=auth_headers, content=raw)
     second = await client.post("/v1/responses", headers=auth_headers, content=raw)
@@ -311,7 +316,7 @@ async def test_device_session_unsupported_falls_back_to_unsigned_account_token(
         404, json={"error": {"type": "not_found"}}))
     route = respx.post(RELAY_BASE + RESPONSES_PATH).mock(
         return_value=httpx.Response(200, json={"id": "response"}))
-    raw = b'{"model":"gpt-5.6-codex","input":"hi"}'
+    raw = b'{"model":"gpt-5.6-sol","input":"hi"}'
 
     first = await client.post("/v1/responses", headers=auth_headers, content=raw)
     second = await client.post("/v1/responses", headers=auth_headers, content=raw)
@@ -351,7 +356,7 @@ async def test_unsigned_fallback_refreshes_account_token_on_401(
 
     response = await client.post(
         "/v1/responses", headers=auth_headers,
-        content=b'{"model":"gpt-5.6-codex","input":"hi"}')
+        content=b'{"model":"gpt-5.6-sol","input":"hi"}')
 
     assert response.status_code == 200
     assert refresh.call_count == 1
@@ -404,7 +409,7 @@ async def test_invalid_or_oversized_compression_is_rejected_before_forwarding(
 
     state.settings.max_body_bytes = 128
     oversized_raw = json.dumps({
-        "model": "gpt-5.6-codex", "input": "a" * 400,
+        "model": "gpt-5.6-sol", "input": "a" * 400,
     }).encode("utf-8")
     oversized = await client.post(
         "/v1/responses", content=gzip.compress(oversized_raw),
@@ -435,7 +440,7 @@ async def test_cloudflare_cookies_are_replayed_per_account_and_exit_only(
             ("set-cookie", "__cflb=lb; Path=/; Secure; HttpOnly")]),
         httpx.Response(200, json={"content": [], "usage": {}}),
     ])
-    raw = b'{"model":"gpt-5.6-codex","input":"hi"}'
+    raw = b'{"model":"gpt-5.6-sol","input":"hi"}'
     pinned = {**auth_headers, "X-Mirofish-Account": "work"}
 
     await client.post("/v1/responses", headers=pinned, content=raw)

@@ -58,6 +58,11 @@ export async function streamChat(body: Record<string, unknown>, account: string,
     const data = await response.json().catch(() => ({}));
     throw new ApiError(data?.error?.message || `HTTP ${response.status}`, response.status);
   }
+  if (response.headers.get("X-Mirofish-Synthetic") === "true"
+      || response.headers.get("X-Mirofish-Probe") === "short-circuit") {
+    await response.body.cancel();
+    throw new ApiError("收到合成探测响应，未执行真实模型对话", 502);
+  }
   const reader = response.body.getReader();
   const decoder = new TextDecoder();
   let buffer = "";

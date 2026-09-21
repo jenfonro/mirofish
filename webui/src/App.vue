@@ -6,7 +6,7 @@ import {
   savePage, saveSkin, saveTheme, storedPage, storedSkin, storedTheme,
   type PageId, type ThemeMode,
 } from "./main";
-import { connect, loadAccounts, store } from "./store";
+import { connect, store } from "./store";
 import OverviewPage from "./pages/OverviewPage.vue";
 import AccountsPage from "./pages/AccountsPage.vue";
 import UsagePage from "./pages/UsagePage.vue";
@@ -158,7 +158,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
           </button>
         </div>
         <div v-if="store.health" class="nav-ver">
-          v{{ store.health.version }} · {{ store.health.proxy_backend }}
+          v{{ store.health.version }}
         </div>
       </div>
     </aside>
@@ -173,9 +173,8 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
         <template v-if="store.health">
           <span class="chip ok">
             <span class="dot ok"></span>
-            {{ store.health.accounts }} 账号
+            {{ store.accounts.length }} 账号
           </span>
-          <span class="chip">{{ store.health.proxy_backend }}</span>
         </template>
         <button class="btn ghost sm" @click="editKey">更换密钥</button>
       </header>

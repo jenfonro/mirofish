@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import time
 
 import pytest
 from cryptography.hazmat.primitives import serialization
@@ -9,6 +10,8 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import (
 
 from mirofish.device import DEVICE_KEY_KIND, DeviceSigner
 from mirofish.errors import RelayError
+from mirofish.upstream import _DeviceTicket
+from tests.conftest import add_account
 
 
 def test_device_signer_persists_identity_and_verifiable_signature(state):
@@ -89,3 +92,56 @@ def test_device_id_shape_is_identical_signed_and_unsigned(state):
 def test_device_signer_rejects_empty_alias(state):
     with pytest.raises(RelayError):
         state.upstream._signer("")
+
+
+def test_old_per_alias_vault_key_is_used_without_rotation(state):
+    key = Ed25519PrivateKey.generate()
+    pem = key.private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption()).decode("ascii")
+    state.store.vault.put("work", DEVICE_KEY_KIND, pem)
+    # The old shared slot must never override an already-isolated alias.
+    state.store.vault.put("mirasim-installation", DEVICE_KEY_KIND, "not-this-key")
+    signer = state.upstream._signer("work")
+    assert base64.b64decode(signer.public_key) == key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
+    signer.set_client_version("0.0.303")
+    state.upstream.credentials_changed("work")
+    assert state.store.vault.get("work", DEVICE_KEY_KIND) == pem
+    assert DeviceSigner(state.store, "0.0.303", "work").device_id == signer.device_id
+
+
+@pytest.mark.parametrize("operation", ["reset_device_identity", "rotate_device_identity",
+                                       "drop_device_identity"])
+def test_explicit_device_reset_or_drop_invalidates_all_authorization(state, operation):
+    add_account(state, "work")
+    before = state.upstream._signer("work").device_id
+    other = state.upstream._signer("other").device_id
+    key = state.upstream._ticket_key("work", None)
+    state.upstream._ticket_cache[key] = _DeviceTicket("old", time.monotonic() + 900)
+    state.upstream._device_sessions.add(key)
+    state.upstream._signing_unsupported_until[key] = time.monotonic() + 900
+    state.upstream._cookie_jar("work", None).set("old", "cookie")
+    result = getattr(state.upstream, operation)("work")
+    assert key not in state.upstream._ticket_cache
+    assert key not in state.upstream._device_sessions
+    assert key not in state.upstream._signing_unsupported_until
+    assert key not in state.upstream._cookie_jars
+    assert state.upstream._credential_generations["work"] == 1
+    if operation == "drop_device_identity":
+        assert "work" not in state.upstream._device_signers
+        with pytest.raises(RelayError):
+            state.store.vault.get("work", DEVICE_KEY_KIND)
+    else:
+        assert result == state.upstream._signer("work").device_id
+    assert state.upstream._signer("work").device_id != before
+    assert state.upstream._signer("other").device_id == other
+
+
+def test_deleted_alias_never_retains_an_in_memory_signer(state):
+    add_account(state, "work")
+    before = state.upstream._signer("work").device_id
+    state.upstream.forget_account("work")
+    state.store.remove("work")
+    add_account(state, "work", "replacement@example.com")
+    assert state.upstream._signer("work").device_id != before

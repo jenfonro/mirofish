@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import time
 import uuid
 from typing import Any, AsyncIterator, Awaitable, Callable
 
@@ -13,7 +12,9 @@ import anyio
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from ..upstream import _claude_compatible_payload, quota_headers
+from ..errors import RelayError
+from ..upstream import (_claude_compatible_payload, quota_headers,
+                        relay_session_identity)
 from ..validate import model_value
 from .deps import get_state, read_json_body, read_json_body_bytes, require_auth
 from .state import ACCOUNT_GENERATION_EXTENSION
@@ -27,6 +28,33 @@ logger = logging.getLogger("mirofish.relay")
 _MAX_USAGE_LINE_BYTES = 256 * 1024
 
 
+def _stream_refusal(data: dict[str, Any]) -> RelayError | None:
+    """Translate HTTP-200 error events into the normal account error envelope."""
+    response = data.get("response")
+    body = response if isinstance(response, dict) else data
+    error = body.get("error", body)
+    if not isinstance(error, dict):
+        return None
+    kind = error.get("type") or error.get("code")
+    code = str(error.get("code") or "")
+    status = (error.get("status_code") or error.get("status")
+              or data.get("status_code") or data.get("status"))
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = {
+            "rate_limit_error": 429, "rate_limit_exceeded": 429,
+            "usage_limit_reached": 429, "shared_quota_unavailable": 429,
+            "permission_error": 403, "overloaded_error": 503,
+            "authentication_error": 401,
+        }.get(kind)
+        if code.startswith("credit_exhausted") or str(kind).startswith("credit_exhausted"):
+            status = 429
+    if status not in (401, 403, 429, 503):
+        return None
+    if not error.get("type") and kind:
+        error = {**error, "type": kind}
+    return RelayError("upstream stream rejected", status, {"error": error})
+
+
 def _beta_enabled(request: Request) -> bool:
     return request.query_params.get("beta", "").strip().lower() == "true"
 
@@ -38,6 +66,11 @@ class _UsageWatcher:
         self.usage: dict[str, Any] = {}
         self._buffer = bytearray()
         self._discard_until_newline = False
+        self.started = False
+        self.successful = False
+        self.failed = False
+        self.exhausted = False
+        self.refusal: RelayError | None = None
 
     def feed_bytes(self, chunk: bytes) -> None:
         """Observe complete SSE lines without changing the relayed bytes.
@@ -110,12 +143,19 @@ class _UsageWatcher:
             return
         kind = data.get("type")
         if kind == "message_start":
+            self.started = True
             message = data.get("message") if isinstance(data.get("message"), dict) else {}
             usage = message.get("usage") if isinstance(message.get("usage"), dict) else {}
             self.usage.update(usage)
         elif kind == "message_delta":
             usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
             self.usage.update(usage)
+        elif kind == "message_stop":
+            self.successful = self.started and not self.failed
+        elif kind == "error":
+            self.failed = True
+            self.successful = False
+            self.refusal = self.refusal or _stream_refusal(data)
 
 
 class _ResponsesUsageWatcher(_UsageWatcher):
@@ -127,7 +167,7 @@ class _ResponsesUsageWatcher(_UsageWatcher):
     """
 
     _TERMINAL_EVENTS = {"response.completed", "response.incomplete",
-                        "response.failed"}
+                        "response.failed", "error"}
 
     def feed_line(self, line: str) -> None:
         if not line.startswith("data:"):
@@ -145,6 +185,12 @@ class _ResponsesUsageWatcher(_UsageWatcher):
         usage = response.get("usage") if isinstance(response, dict) else None
         if isinstance(usage, dict):
             self.usage.update(usage)
+        if data.get("type") == "response.completed":
+            self.successful = isinstance(response, dict) and not response.get("error")
+        else:
+            self.failed = True
+            self.successful = False
+            self.refusal = self.refusal or _stream_refusal(data)
 
 
 class _ManagedStreamingResponse(StreamingResponse):
@@ -192,11 +238,28 @@ async def _finalize_upstream_stream(
     except Exception:  # noqa: BLE001 - cleanup continues without leaking details
         logger.warning("could not fully close upstream stream: account=%s", account)
     try:
+        if observer.refusal is not None and (
+                account_generation is None
+                or state.store.account_generation(account) == account_generation):
+            # The stream is already visible to the caller: update health/quota
+            # exactly once, but never retry its model work on another account.
+            if observer.refusal.status == 429:
+                try:
+                    await state.refresh_limits_if_stale(account, force=True)
+                except RelayError:
+                    pass
+            # Refresh is an await point and may race alias replacement too.
+            if (account_generation is None
+                    or state.store.account_generation(account) == account_generation):
+                state.note_account_unserviceable(account, observer.refusal)
         if account_generation is None:
             state.record_usage(account, model, observer.usage, upstream_headers)
         else:
             state.record_usage(account, model, observer.usage, upstream_headers,
                                account_generation=account_generation)
+        if observer.exhausted and observer.successful and not observer.failed:
+            state.note_account_healthy(
+                account, account_generation=account_generation)
     except Exception:  # noqa: BLE001 - response cleanup must never be undone
         logger.warning("could not persist streamed usage: account=%s", account)
 
@@ -213,8 +276,7 @@ async def messages(request: Request) -> Any:
     payload["model"] = validated_model
     session_hint = request.headers.get("X-Mirofish-Session", "")
     requested = request.headers.get("X-Mirofish-Account", "")
-    relay_session = state.relay_session_id(
-        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
+    claude_session = request.headers.get("X-Claude-Code-Session-Id", "")
     beta = _beta_enabled(request)
     model = payload.get("model") if isinstance(payload.get("model"), str) else None
 
@@ -235,26 +297,42 @@ async def messages(request: Request) -> Any:
     if not payload.get("stream"):
         async def run(account: str):
             generation = state.store.account_generation(account)
+            relay_session, headers, prepared = relay_session_identity(
+                state.relay_session_id, account, request.headers, payload,
+                claude_session=claude_session, session_hint=session_hint)
             result = await state.with_proxy(
                 account,
                 lambda proxy_url: state.upstream.messages(
-                    account, payload, proxy_url, request_headers=request.headers,
-                    session_id=relay_session, beta=beta, raw_body=raw_body))
+                    account, prepared, proxy_url, request_headers=headers,
+                    session_id=relay_session, beta=beta,
+                    raw_body=(raw_body if prepared is payload
+                              and payload.get("model") == validated_model else None)))
             return result, generation
         account, (upstream_result, account_generation) = await state.with_account_failover(
             requested, session_hint, payload, run)
         result, headers = upstream_result
+        model = payload.get("model")
         usage = result.get("usage", {}) if isinstance(result, dict) else {}
         outgoing = state.record_usage(account, model, usage, headers,
                                       account_generation=account_generation)
+        if (isinstance(result, dict) and result.get("type") == "message"
+                and result.get("stop_reason") and not result.get("error")):
+            state.note_account_healthy(
+                account, account_generation=account_generation)
         return JSONResponse(result, headers=outgoing)
 
     async def run_stream(account: str):
+        relay_session, headers, prepared = relay_session_identity(
+            state.relay_session_id, account, request.headers, payload,
+            claude_session=claude_session, session_hint=session_hint)
         return await state.open_messages_stream(
-            account, payload, request_headers=request.headers,
-            session_id=relay_session, beta=beta, raw_body=raw_body)
+            account, prepared, request_headers=headers,
+            session_id=relay_session, beta=beta,
+            raw_body=(raw_body if prepared is payload
+                      and payload.get("model") == validated_model else None))
     account, (response, stack) = await state.with_account_failover(
         requested, session_hint, payload, run_stream)
+    model = payload.get("model")
     account_generation = response.extensions.get(ACCOUNT_GENERATION_EXTENSION)
     if not isinstance(account_generation, str):
         account_generation = None
@@ -272,6 +350,7 @@ async def messages(request: Request) -> Any:
         async for chunk in response.aiter_bytes():
             watcher.feed_bytes(chunk)
             yield chunk
+        watcher.exhausted = True
 
     async def finalize() -> None:
         await _finalize_upstream_stream(
@@ -311,29 +390,37 @@ async def _input_token_count(state: Any, request: Request,
                              payload: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Route an account and count a payload's input tokens.
 
-    The upstream count endpoint is device-signed and not billable, so this is
-    free. Any failure (endpoint missing, proxy hop down) falls back to the
-    local estimate, so a caller always gets a number. ``payload`` must already
-    be model-validated and Claude-normalized: the count has to describe the
-    same body generation would send.
+    Counts obey the same quota gate as generation, but cannot prove an account
+    healthy. Missing endpoints/network failures retain the local estimate.
     """
     session_hint = request.headers.get("X-Mirofish-Session", "")
-    account = state.route_account(request.headers.get("X-Mirofish-Account", ""),
-                                  session_hint, payload)
-    relay_session = state.relay_session_id(
-        request.headers.get("X-Claude-Code-Session-Id", ""), session_hint, payload)
-    try:
+    async def run(account: str):
+        relay_session, headers, prepared = relay_session_identity(
+            state.relay_session_id, account, request.headers, payload,
+            claude_session=request.headers.get("X-Claude-Code-Session-Id", ""),
+            session_hint=session_hint)
+
         async def op(proxy_url):
             return await state.upstream.signed_json(
-                account, "POST", "/v1/messages/count_tokens", payload, proxy_url,
-                request_headers=request.headers, session_id=relay_session,
+                account, "POST", "/v1/messages/count_tokens", prepared, proxy_url,
+                request_headers=headers, session_id=relay_session,
                 beta=_beta_enabled(request))
-        status, _, data = await state.with_proxy(account, op)
-        if 200 <= status < 300 and isinstance(data, dict) and "input_tokens" in data:
-            return account, data
-    except Exception:  # noqa: BLE001 - any failure falls back to the estimate
-        pass
-    return account, {"input_tokens": _estimate_input_tokens(payload)}
+        try:
+            status, _, data = await state.with_proxy(account, op)
+            if 200 <= status < 300 and isinstance(data, dict) and "input_tokens" in data:
+                return data
+            if status >= 400:
+                raise RelayError("token count rejected", status, data)
+        except RelayError as exc:
+            # Account refusals belong to failover/health handling, not a
+            # successful local count that would hide the quota gate.
+            if exc.status not in (404, 501, 502):
+                raise
+        return {"input_tokens": _estimate_input_tokens(payload)}
+
+    return await state.with_account_failover(
+        request.headers.get("X-Mirofish-Account", ""), session_hint, payload,
+        run, model_only=False)
 
 
 def _is_one_token_probe(payload: dict[str, Any]) -> bool:
@@ -393,23 +480,21 @@ def _sse_frame(event: str, data: dict[str, Any]) -> bytes:
 async def _answer_one_token_probe(
         state: Any, request: Request, payload: dict[str, Any],
         model: str | None, *, stream: bool) -> tuple[dict[str, Any], dict[str, str]]:
-    """Answer a one-token availability probe without touching generation.
+    """Answer synthetically with zero upstream work, including account routing.
 
     Returns the Messages envelope and the relay's response headers. The caller's
     user agent is logged because the access log only carries the source address,
     which is the Docker bridge for anything reaching a published port.
     """
-    account, counted = await _input_token_count(
-        state, request, _claude_compatible_payload(payload))
     logger.info(
-        "answered one-token probe locally: account=%s model=%s max_tokens=%s "
+        "answered synthetic one-token probe locally: model=%s max_tokens=%s "
         "tools=%s stream=%s user_agent=%s",
-        account, model, payload.get("max_tokens"),
+        model, payload.get("max_tokens"),
         len(payload["tools"]) if isinstance(payload.get("tools"), list) else 0,
         stream, request.headers.get("user-agent", "-"))
-    envelope = _probe_envelope(model, int(counted.get("input_tokens") or 0))
-    return envelope, {"X-Mirofish-Account": account,
-                      "X-Mirofish-Probe": "short-circuit"}
+    envelope = _probe_envelope(model, _estimate_input_tokens(payload))
+    return envelope, {"X-Mirofish-Probe": "short-circuit",
+                      "X-Mirofish-Synthetic": "true"}
 
 
 @router.post("/v1/messages/count_tokens")
@@ -429,12 +514,15 @@ async def count_tokens(request: Request) -> Any:
 async def models(request: Request) -> Any:
     state = get_state(request)
     requested = request.headers.get("X-Mirofish-Account", "").strip()
-    account = state.pick_account(requested)
-    cached = state.model_cache.get(account)
-    if cached and time.time() - cached[0] < state.settings.model_catalog_ttl:
-        return {**cached[1], "default_model": state.settings.default_model}
-    payload = await state.with_proxy(
-        account, lambda url: state.accounts.model_list(account, proxy_url=url))
-    payload["default_model"] = state.settings.default_model
-    state.model_cache[account] = (time.time(), payload)
-    return payload
+    account = state.pick_catalog_account(requested)
+    generation = state.store.account_generation(account)
+    try:
+        return await state.with_proxy(
+            account, lambda url: state.accounts.model_list(account, proxy_url=url))
+    except RelayError as exc:
+        try:
+            if generation == state.store.account_generation(account):
+                state.note_account_error(account, exc)
+        except RelayError:
+            pass  # Deletion raced the catalog response.
+        raise

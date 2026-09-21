@@ -5,11 +5,13 @@ import time
 import uuid
 
 import httpx
+import pytest
 import respx
 
 from mirofish.errors import RelayError
-from mirofish.proxy.mihomo import RoutedProxyURL
-from mirofish.upstream import LIMITS_PATH, MESSAGES_PATH, _DeviceTicket
+from mirofish.upstream import (LIMITS_PATH, MESSAGES_PATH, _DeviceTicket,
+                               account_overloaded_503, account_scoped_429,
+                               account_suspension_403, credit_exhausted_429)
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 from tests.mirasim_protocol import relay_metadata
 
@@ -240,17 +242,17 @@ async def test_401_retry_keeps_the_session_but_renews_the_call(state):
     assert first.content == second.content
 
 
-async def test_route_identity_scopes_session_and_401_invalidation(
+async def test_fixed_exit_scopes_session_and_401_invalidation(
         state, monkeypatch):
     add_account(state, "work")
-    route_a = RoutedProxyURL("http://mihomo:7891", "route-a")
-    route_b = RoutedProxyURL("http://mihomo:7891", "route-b")
+    route_a = "http://exit-a:8080"
+    route_b = "http://exit-b:8080"
     minted: list[str] = []
 
     async def mint(_alias, _access, proxy_url=None):
-        minted.append(proxy_url.route_identity)
+        minted.append(proxy_url)
         return _DeviceTicket(
-            "ticket-" + proxy_url.route_identity + f"-{len(minted)}",
+            "ticket-" + proxy_url + f"-{len(minted)}",
             time.monotonic() + 900.0,
         )
 
@@ -269,4 +271,73 @@ async def test_route_identity_scopes_session_and_401_invalidation(
     replacement_a = await state.upstream._device_ticket("work", route_a)
     assert replacement_a != ticket_a
     assert await state.upstream._device_ticket("work", route_b) == ticket_b
-    assert minted == ["route-a", "route-b", "route-a"]
+    assert minted == [route_a, route_b, route_a]
+
+
+@pytest.mark.parametrize("status,error", [
+    (429, {"type": "shared_quota_unavailable"}),
+    (503, {"type": "overloaded_error"}),
+    (403, {"type": "permission_error", "message": "this account is suspended; contact support"}),
+])
+@pytest.mark.parametrize("path", ["/v1/messages", "/v1/responses", "/v1/responses/compact"])
+@respx.mock
+async def test_fixed_exit_refusals_keep_account_error_envelope(state, status, error, path):
+    add_account(state, "work")
+    respx.post(RELAY_BASE + "/v1/device/session").mock(
+        return_value=_device_response("ticket"))
+    respx.post(RELAY_BASE + path).mock(return_value=httpx.Response( status, json={"error": error}))
+    with pytest.raises(RelayError) as failure:
+        if path == "/v1/messages":
+            await state.upstream.messages("work", {"model": "test", "max_tokens": 8},
+                                          "http://fixed:8080")
+        else:
+            await state.upstream.stream_responses("work", b"{}", "http://fixed:8080", path=path)
+    assert failure.value.status == status
+    assert failure.value.data == {"error": error}
+
+
+def test_health_classifiers_distinguish_quota_capacity_and_suspension():
+    assert account_scoped_429(429, {"error": {"type": "shared_quota_unavailable"}})
+    assert not account_overloaded_503(503, {"_raw": "edge unavailable"})
+    assert account_overloaded_503(503, {"error": {"type": "overloaded_error"}})
+    assert credit_exhausted_429(429, {"error": {"type": "rate_limit_error",
+                                               "code": "credit_exhausted_5h"}})
+    assert not credit_exhausted_429(429, {"error": {"type": "rate_limit_error"}})
+    assert account_suspension_403(403, {"error": {"type": "permission_error",
+        "message": "temporarily suspended; access resumes at 2026-09-22T00:00:00Z."}}) \
+        == (False, 1790035200.0)
+    assert account_suspension_403(403, {"error": {"type": "permission_error",
+        "message": "this account is suspended; contact support"}}) == (True, None)
+    assert account_suspension_403(403, {"error": {"type": "permission_error",
+                                                "message": "not allowed"}}) is None
+
+
+async def test_alias_replacement_cannot_reuse_old_connections(state):
+    first = await state.upstream.client("direct", "work")
+    state.upstream.forget_account("work")
+    second = await state.upstream.client("direct", "work")
+    assert first is not second
+    assert first.is_closed
+
+
+async def test_reset_during_mint_discards_old_key_ticket(state, monkeypatch):
+    add_account(state, "work")
+    before = state.upstream._signer("work").device_id
+    started, released = asyncio.Event(), asyncio.Event()
+    devices = []
+
+    async def mint(alias, access, proxy_url):
+        device = state.upstream._signer(alias).device_id
+        devices.append(device)
+        if len(devices) == 1:
+            started.set()
+            await released.wait()
+        return _DeviceTicket(device, time.monotonic() + 900)
+
+    monkeypatch.setattr(state.upstream, "_mint_device_ticket", mint)
+    task = asyncio.create_task(state.upstream._device_ticket("work"))
+    await started.wait()
+    after = state.upstream.reset_device_identity("work")
+    released.set()
+    assert await task == after != before
+    assert devices == [before, after]

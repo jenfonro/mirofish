@@ -1,13 +1,18 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from "vue";
 import { compact, deriveAll } from "../limits";
-import { loadLimits, loadUsage, store, toast } from "../store";
+import { api } from "../api";
+import { accountName } from "../accounts";
+import { loadAccounts, refreshLimits, loadUsage, store, toast } from "../store";
+import AccountStatus from "../components/AccountStatus.vue";
+import WindowTokens from "../components/WindowTokens.vue";
 
 const metric = ref<"tokens" | "requests">("tokens");
 const showTable = ref(false);
 const hoverIndex = ref<number | null>(null);
 const hours = ref(24);
-const limitsTab = ref(true);
+const limitsBusy = ref("");
+const limitsErrors = ref<Record<string, string>>({});
 
 const SERIES = ["--s1", "--s2", "--s3", "--s4", "--s5", "--s6"];
 const MAX_SERIES = 5;
@@ -115,23 +120,15 @@ const accountTotals = computed(() => {
   return totals;
 });
 
-interface LimitsView {
-  alias: string;
-  ok: boolean;
-  error?: string;
-  flags: string[];
-  windows: ReturnType<typeof deriveAll>;
-}
-
-const limitsViews = computed<LimitsView[]>(() =>
-  (store.limits?.accounts ?? []).map((e) => {
+const limitsViews = computed(() =>
+  store.accounts.map((account) => {
     const flags: string[] = [];
-    if (e.limits?.suspended) flags.push("已暂停");
-    if (e.limits?.degraded) flags.push("降级中");
-    if (e.limits?.unmetered) flags.push("不计量");
+    if (account.limits?.suspended) flags.push("已暂停");
+    if (account.limits?.degraded) flags.push("降级中");
+    if (account.limits?.unmetered) flags.push("不计量");
     return {
-      alias: e.alias, ok: e.ok, error: e.error, flags,
-      windows: e.limits ? deriveAll(e.limits) : [],
+      account, flags, error: limitsErrors.value[account.alias],
+      windows: account.limits ? deriveAll(account.limits) : [],
     };
   }));
 
@@ -151,9 +148,28 @@ async function reloadUsage() {
 
 async function reloadLimits() {
   try {
-    await loadLimits();
+    limitsErrors.value = {};
+    await refreshLimits();
+    for (const result of store.limits?.accounts ?? []) {
+      if (!result.ok) limitsErrors.value[result.alias] = result.error || "额度查询失败";
+    }
   } catch (e: any) {
     toast(`刷新额度失败：${e.message}`, "error");
+  }
+}
+
+async function reloadAccountLimits(alias: string) {
+  limitsBusy.value = alias;
+  delete limitsErrors.value[alias];
+  try {
+    await api(`/accounts/${encodeURIComponent(alias)}/limits`);
+    toast(`已刷新 ${alias} 的额度`, "ok");
+  } catch (e: any) {
+    limitsErrors.value[alias] = e.message;
+    toast(`刷新额度失败：${e.message}`, "error");
+  } finally {
+    await loadAccounts().catch(() => toast("加载账号失败", "error"));
+    limitsBusy.value = "";
   }
 }
 
@@ -164,7 +180,7 @@ function setHours(h: number) {
 
 onMounted(() => {
   loadUsage(hours.value).catch(() => undefined);
-  loadLimits().catch(() => undefined);
+  loadAccounts().catch(() => toast("加载账号失败", "error"));
 });
 </script>
 
@@ -280,10 +296,10 @@ onMounted(() => {
   <div class="panel">
     <div class="panel-head">
       <h3>用量额度</h3>
-      <span class="chip">上游 /v1/limits · 零消耗</span>
+      <span class="chip">缓存 · 手动刷新</span>
       <span class="spacer"></span>
-      <button class="btn ghost sm" :disabled="store.limitsLoading" @click="reloadLimits">
-        {{ store.limitsLoading ? "读取中…" : "刷新" }}
+      <button class="btn ghost sm" :disabled="store.limitsLoading || !!limitsBusy" @click="reloadLimits">
+        {{ store.limitsLoading ? "读取中…" : "批量刷新额度" }}
       </button>
     </div>
     <div class="panel-body">
@@ -291,19 +307,21 @@ onMounted(() => {
         <b style="color:var(--ink-2)">匀速线</b> 是按窗口时长匀速消耗的参照；
         实际用量在它左侧为落后（省），右侧为超前（费）。
       </p>
-      <p v-if="!store.limits" class="muted">尚未读取。点「刷新」获取各账号额度。</p>
-      <p v-else-if="!limitsViews.length" class="muted">还没有账号。</p>
+      <p v-if="!limitsViews.length" class="muted">还没有账号。</p>
 
-      <div v-for="view in limitsViews" :key="view.alias" class="mb-3"
+      <div v-for="view in limitsViews" :key="view.account.alias" class="mb-3"
            style="padding-top:12px;border-top:1px solid var(--border)">
         <div class="row mb-2">
-          <span class="mono" style="font-weight:600">{{ view.alias }}</span>
+          <span style="font-weight:600" :title="view.account.alias">{{ accountName(view.account) }}</span>
+          <AccountStatus :account="view.account" />
           <span v-for="flag in view.flags" :key="flag" class="chip warn">{{ flag }}</span>
-          <span v-if="!view.ok" class="chip danger">读取失败</span>
+          <span v-if="view.error" class="chip danger" :title="view.error">读取失败</span>
+          <span class="spacer"></span>
+          <button class="btn ghost sm" :disabled="store.limitsLoading || !!limitsBusy"
+                  @click="reloadAccountLimits(view.account.alias)">刷新额度</button>
         </div>
-        <p v-if="!view.ok" class="muted">{{ view.error || "上游拒绝了额度查询" }}</p>
-        <p v-else-if="!view.windows.length" class="muted">该账号无窗口数据。</p>
-        <div v-else class="grid-2" style="gap:12px">
+        <p v-if="!view.windows.length" class="muted">暂无窗口缓存；可手动刷新额度。</p>
+        <div v-else class="limits-windows">
           <div v-for="w in view.windows" :key="w.name">
             <div class="row" style="justify-content:space-between; margin-bottom:5px">
               <span class="muted" style="font-size:12px">{{ w.label }}</span>
@@ -322,16 +340,17 @@ onMounted(() => {
               <span class="muted">剩 {{ compact(w.remaining) }}</span>
             </div>
             <div class="muted" style="font-size:11px;margin-top:2px">{{ w.resetText }}</div>
-            <div v-if="w.models.length" style="margin-top:6px">
-              <div v-for="m in w.models" :key="m.model" class="row muted"
-                   style="font-size:11px;justify-content:space-between">
-                <span class="mono">{{ m.model.replace("claude-", "") }}</span>
-                <span class="tnum">{{ m.requests }} 次 · {{ compact(m.total_tokens) }}</span>
-              </div>
-            </div>
+            <WindowTokens :models="w.models" />
           </div>
         </div>
       </div>
     </div>
   </div>
 </template>
+
+<style scoped>
+.limits-windows {
+  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(210px, 1fr);
+  gap: 14px; overflow-x: auto; padding-bottom: 8px;
+}
+</style>

@@ -1,6 +1,6 @@
 """Async upstream HTTP layer: auth endpoints, token refresh, model relay.
 
-- One httpx.AsyncClient per (alias, proxy URL, route identity) (connection pooling per account and exit).
+- One httpx.AsyncClient per (alias, proxy URL) (connection pooling per account and exit).
 - Token refresh is single-flight per alias so concurrent 401s do not stampede
   the refresh endpoint or clobber each other's rotated refresh token.
 - /v1/messages and Codex /v1/responses support true streaming: successful
@@ -10,20 +10,22 @@
 from __future__ import annotations
 
 import asyncio
+import datetime
 import json
 import logging
 import math
+import re
 import ssl
 import time
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 import httpx
 
 from .config import Settings
-from .device import DeviceSigner, uses_v2
+from .device import DEVICE_KEY_KIND, DeviceSigner, uses_v2
 from .errors import RelayError
 from .seal import DEFAULT_SEAL_PUBLIC_KEY, seal_header_pairs
 from .store import Store
@@ -174,6 +176,123 @@ def _header_pairs(
                      else str(raw_value))
             yield name, value
     return decoded()
+
+
+_SESSION_HEADERS = frozenset({
+    "x-claude-code-session-id", "session-id", "thread-id",
+    "x-codex-session-id", "x-codex-thread-id", "x-codex-window-id",
+    "x-openai-session-id", "x-client-request-id", "chatgpt-account-id",
+})
+_SESSION_FIELDS = (
+    "session_id", "thread_id", "conversation_id", "prompt_cache_key",
+)
+_IDENTITY_FIELDS = (*_SESSION_FIELDS, "device_id", "installation_id",
+                    "account_uuid", "account_id", "user_id")
+_LEGACY_CLAUDE_USER = re.compile(r"^user_(.+)_account_(.*?)_session_(.+)$")
+
+
+def _identity_object(value: Any) -> Any:
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            pass
+    return value
+
+
+def _payload_session(payload: Mapping[str, Any]) -> str:
+    """Find caller identity only in protocol metadata, never message content."""
+    for meta in (payload.get("metadata"), payload.get("client_metadata"), payload):
+        if not isinstance(meta, dict):
+            continue
+        user = _identity_object(meta.get("user_id"))
+        if isinstance(user, dict) and isinstance(user.get("session_id"), str):
+            return user["session_id"]
+        if isinstance(user, str):
+            legacy = _LEGACY_CLAUDE_USER.fullmatch(user)
+            if legacy:
+                return legacy[3]
+        for name in _SESSION_FIELDS:
+            if isinstance(meta.get(name), str) and meta[name].strip():
+                return meta[name]
+        if isinstance(user, str) and user.strip():
+            return user
+    conversation = payload.get("conversation")
+    if isinstance(conversation, dict):
+        conversation = conversation.get("id")
+    return conversation if isinstance(conversation, str) else ""
+
+
+def relay_session_identity(
+        derive: Callable[..., str], account: str,
+        headers: Mapping[str, str], payload: dict[str, Any], *,
+        claude_session: str = "", session_hint: str = "",
+) -> tuple[str, httpx.Headers, dict[str, Any]]:
+    """API-boundary adapter for AppState.relay_session_id(..., account).
+
+    Derive each original identity once per selected account, regardless of the
+    protocol field carrying it. Only caller-owned identity slots are copied;
+    messages, tool IDs, previous_response_id and encrypted input stay untouched.
+    Protocol/signing layers receive these final values and must not hash again.
+    """
+    mapped: dict[str, str] = {}
+
+    def identity(value: str) -> str:
+        key = value.strip().lower()
+        if not key:
+            return value
+        if key not in mapped:
+            mapped[key] = derive(value, "", payload, account)
+        return mapped[key]
+
+    source = claude_session or session_hint or _payload_session(payload)
+    session = identity(source) if source else derive("", "", payload, account)
+
+    def metadata(value: dict[str, Any]) -> dict[str, Any]:
+        result = dict(value)
+        for name in _IDENTITY_FIELDS:
+            original = value.get(name)
+            if not isinstance(original, str) or not original.strip():
+                continue
+            user = _identity_object(original) if name == "user_id" else None
+            if isinstance(user, dict):
+                result[name] = _json_bytes(metadata(user)).decode("utf-8")
+            elif name == "user_id" and (match := _LEGACY_CLAUDE_USER.fullmatch(original)):
+                # Old CLI encodes identity in a string rather than JSON.
+                result[name] = (f"user_{identity(match[1])}_account_"
+                                f"{identity(match[2])}_session_{identity(match[3])}")
+            else:
+                result[name] = identity(original)
+        return result
+
+    prepared = dict(payload)
+    for name in _SESSION_FIELDS:
+        value = payload.get(name)
+        if isinstance(value, str) and value.strip():
+            prepared[name] = identity(value)
+    for name in ("metadata", "client_metadata"):
+        if isinstance(payload.get(name), dict):
+            prepared[name] = metadata(payload[name])
+    conversation = payload.get("conversation")
+    if isinstance(conversation, str) and conversation.strip():
+        prepared["conversation"] = identity(conversation)
+    elif isinstance(conversation, dict) and isinstance(conversation.get("id"), str):
+        prepared["conversation"] = {**conversation, "id": identity(conversation["id"])}
+
+    forwarded = []
+    for name, value in _header_pairs(headers):
+        lower = name.lower()
+        if lower.startswith("x-mirofish-"):
+            continue
+        if lower in _SESSION_HEADERS:
+            value = identity(value)
+        elif lower == "x-codex-turn-metadata":
+            obj = _identity_object(value)
+            if not isinstance(obj, dict):
+                continue
+            value = _json_bytes(metadata(obj)).decode("utf-8")
+        forwarded.append((name, value))
+    return session, httpx.Headers(forwarded), prepared if prepared != payload else payload
 
 
 def _forwarded_message_headers(
@@ -375,6 +494,10 @@ def _authority(url: str) -> str:
     return httpx.URL(url).netloc.decode("ascii")
 
 
+def _transport_proxy(proxy_url: Optional[str]) -> Optional[str]:
+    return None if not proxy_url or proxy_url == "direct" else str(proxy_url)
+
+
 def _ticket_lifetime(data: Any) -> float:
     """Seconds a freshly minted device ticket remains valid.
 
@@ -529,57 +652,115 @@ def _rejection_detail(body: Any) -> str:
     return str(body)[:300]
 
 
-REGION_REFUSAL_TYPE = "shared_quota_unavailable"
 CREDIT_EXHAUSTED_TYPE = "credit_exhausted_shared"
-
-
-def _is_region_blocked(status: int, body: Any) -> bool:
-    """The upstream refuses to serve requests from this exit's network region."""
-    if status != 429 or not isinstance(body, dict):
-        return False
-    error = body.get("error")
-    return (isinstance(error, dict)
-            and str(error.get("type")) == REGION_REFUSAL_TYPE)
+# The upstream reports quota exhaustion in `code`, not `type`: `type` is the
+# generic "rate_limit_error" for both a spent window and momentary rate
+# pressure, and only the code distinguishes them (credit_exhausted_5h,
+# credit_exhausted_7d, credit_exhausted_shared, ...).
+CREDIT_EXHAUSTED_CODE_PREFIX = "credit_exhausted"
+OVERLOADED_TYPE = "overloaded_error"
+PERMISSION_ERROR_TYPE = "permission_error"
+# The upstream states the exact moment access returns, so the account can be
+# parked for precisely that long instead of guessing a window. The timestamp is
+# followed by more prose, so match the stamp itself rather than the line end.
+_SUSPENDED_UNTIL = re.compile(
+    r"access resumes at\s*(\d{4}-\d{2}-\d{2}[T ][\d:.]+(?:Z|[+-]\d{2}:?\d{2})?)")
 
 
 def account_scoped_429(status: int, body: Any) -> bool:
-    """A 429 another account, rather than another proxy exit, can recover from.
+    """A 429 that another account can recover from.
 
     ``credit_exhausted_shared`` is the refusal the product documents, but a
     window that fills up can surface under other 429 types too, so every 429
-    except the region refusal counts. The single definition is shared by all
-    relay paths; account-level failover keys off it.
+    counts. ``shared_quota_unavailable`` used to be excluded and turned into a
+    proxy-rotation signal instead; with a fixed exit per account there is
+    nothing to rotate to, and it is an account-scoped refusal like the rest.
+    The single definition is shared by all relay paths; account-level failover
+    keys off it.
     """
-    if status != 429:
+    return status == 429
+
+
+def account_overloaded_503(status: int, body: Any) -> bool:
+    """The upstream has no capacity for THIS account, as opposed to a 503 that
+    merely happened on the way to it.
+
+    Only the documented ``overloaded_error`` envelope says anything about the
+    account. The other 503s seen in practice — an edge HTML error page, a
+    body-less rejection, the relay's own "no device session" / "no proxy node"
+    refusals — are transient faults in front of the upstream that every account
+    shares, so they must not be read as a verdict on the one that happened to
+    carry the request.
+    """
+    if status != 503 or not isinstance(body, dict):
         return False
-    if not isinstance(body, dict):
-        return True
+    error = body.get("error")
+    return (isinstance(error, dict)
+            and str(error.get("type")) == OVERLOADED_TYPE)
+
+
+def credit_exhausted_429(status: int, body: Any) -> bool:
+    """A 429 that means "this account's window is spent", not "slow down".
+
+    The window does not free up until it resets, so the account has to sit out
+    for a long time; a momentary rate refusal clears in seconds. Both arrive as
+    ``type: rate_limit_error``, so the distinction lives in ``code``
+    (``credit_exhausted_5h`` / ``_7d`` / ``_shared``). Reading only ``type``
+    means every spent window is mistaken for a hiccup and the account returns
+    after a minute to be refused again — which is what earns an upstream
+    suspension for "repeated rate-limit refusals".
+    """
+    if status != 429 or not isinstance(body, dict):
+        return False
     error = body.get("error")
     if not isinstance(error, dict):
+        return False
+    if str(error.get("code") or "").startswith(CREDIT_EXHAUSTED_CODE_PREFIX):
         return True
-    return str(error.get("type")) != REGION_REFUSAL_TYPE
+    # Older/other shapes put it in `type`; keep honoring that spelling.
+    return str(error.get("type")) == CREDIT_EXHAUSTED_TYPE
 
 
-def _region_block_error(status: int, body: Any,
-                        proxy_url: Optional[str]) -> Optional[RelayError]:
-    """Region availability is a property of the proxy node, not the account, so
-    rotating to a node in a served region recovers; without a proxy there is
-    nothing to rotate and the caller sees the upstream refusal as-is."""
-    if not proxy_url or not _is_region_blocked(status, body):
+def account_suspension_403(status: int, body: Any) -> Optional[tuple[bool, Optional[float]]]:
+    """Classify a 403 the upstream aimed at the account.
+
+    The upstream suspends an account in two very different ways, and the only
+    thing telling them apart is the message:
+
+    - *rate-limit bench*: "temporarily suspended after repeated upstream
+      rate-limit refusals; access resumes at <ISO>". It lifts itself at the
+      stated moment.
+    - *account suspension*: "this account is suspended; contact support". No
+      deadline, because nothing but support lifts it. Retrying is pointless and
+      pointlessly conspicuous.
+
+    Returns ``(permanent, retry_at)`` — ``retry_at`` is the stated deadline, or
+    ``None`` when there is nothing to wait for — and ``None`` when the 403 is
+    not an account suspension at all (the relay's own 403 for a panel-disabled
+    account, for instance).
+    """
+    if status != 403 or not isinstance(body, dict):
         return None
-    return RelayError("upstream does not serve this proxy exit region", 502,
-                      {"region_blocked": True, "upstream": _rejection_detail(body)})
-
-
-def _raise_if_region_blocked(alias: str, status: int, body: Any,
-                             proxy_url: Optional[str]) -> None:
-    """Turn an upstream region refusal into the pool's rotatable error shape."""
-    blocked = _region_block_error(status, body, proxy_url)
-    if blocked is None:
-        return
-    logger.warning("upstream refused exit region: account=%s %s",
-                   alias, _rejection_detail(body))
-    raise blocked
+    error = body.get("error")
+    if not isinstance(error, dict) \
+            or str(error.get("type")) != PERMISSION_ERROR_TYPE:
+        return None
+    message = str(error.get("message") or "")
+    if "suspended" not in message:
+        return None
+    match = _SUSPENDED_UNTIL.search(message)
+    if not match:
+        # A suspension with no deadline: permanent until support acts. Guessing
+        # a window here is what made 46 banned accounts retry hourly.
+        return True, None
+    stamp = match.group(1).rstrip(".")
+    try:
+        parsed = datetime.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return True, None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+    return False, parsed.timestamp()
 
 
 def _payload_summary(payload: dict[str, Any]) -> str:
@@ -803,9 +984,9 @@ _tls_context_cache: ssl.SSLContext | None = None
 def tls_context() -> ssl.SSLContext:
     """Return the shared client TLS context, narrowed where Python allows it.
 
-    Only the group list is adjusted, and only on interpreters exposing
-    ``SSLContext.set_groups`` (3.13+); elsewhere this is httpx's own context
-    unchanged.  Two things deliberately are *not* attempted:
+    Require TLS 1.2 while keeping certificate/hostname verification. The group
+    list is adjusted only on interpreters exposing ``SSLContext.set_groups``
+    (3.13+). Two things deliberately are *not* attempted:
 
     ALPN is left alone.  httpcore assigns ``http/1.1`` into whatever context it
     is handed, and the official client sends the extension too (with an empty
@@ -821,6 +1002,7 @@ def tls_context() -> ssl.SSLContext:
     global _tls_context_cache
     if _tls_context_cache is None:
         context = httpx.create_ssl_context()
+        context.minimum_version = ssl.TLSVersion.TLSv1_2
         set_groups = getattr(context, "set_groups", None)
         if set_groups is not None:
             try:
@@ -850,7 +1032,8 @@ class Upstream:
     def __init__(self, settings: Settings, store: Store) -> None:
         self.settings = settings
         self.store = store
-        self._clients: dict[tuple[str, str, str], Any] = {}
+        self._clients: dict[tuple[str, str], Any] = {}
+        self._retired_clients: list[Any] = []
         self._clients_lock = asyncio.Lock()
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._ticket_locks: dict[tuple[str, str], asyncio.Lock] = {}
@@ -875,45 +1058,29 @@ class Upstream:
 
     async def aclose(self) -> None:
         async with self._clients_lock:
-            clients = list(self._clients.values())
+            clients = [*self._clients.values(), *self._retired_clients]
             self._clients.clear()
+            self._retired_clients.clear()
         for client in clients:
             await client.aclose()
 
-    @staticmethod
-    def _proxy_route(proxy_url: Optional[str]) -> tuple[str, str]:
-        """Return the transport URL and its logical route identity.
-
-        Mihomo switches several nodes behind one stable listener URL.  A
-        keep-alive CONNECT tunnel was therefore previously reused after a node
-        rotation, leaving retries on the refused old exit.  ``RoutedProxyURL``
-        supplies the selector/node identity without changing the URL httpx
-        receives; ordinary direct proxy strings retain the legacy URL key.
-        """
-        if not proxy_url:
-            return "", ""
-        return str(proxy_url), str(getattr(proxy_url, "route_identity", ""))
-
     async def client(self, proxy_url: Optional[str],
                      alias: str = "") -> Any:
-        """Return the pooled HTTP client for this (alias, exit) pair.
+        """Return this account's pool for the explicitly selected fixed exit.
 
-        When ``Settings.tls_impersonate`` is set, the client is a
-        curl-impersonate session so the ClientHello is Chromium/BoringSSL
-        shaped; the account's Mihomo exit still applies as the CONNECT proxy.
-        Otherwise this is httpx + OpenSSL. ``MIROFISH_TLS_PROXY`` remains the
-        fallback outer proxy when no per-account exit is assigned.
+        Impersonation changes TLS only, never routing. None/empty means direct;
+        neither a legacy TLS proxy nor environment proxies may override it.
         """
-        # Per-account proxy takes precedence; tls_proxy is only the direct-path
-        # fallback. Impersonation rides *alongside* either of them.
-        effective_proxy = proxy_url or (getattr(self.settings, "tls_proxy", "") or None)
-        transport_url, route_identity = self._proxy_route(effective_proxy)
+        transport_url = _transport_proxy(proxy_url) or ""
         # The account alias is part of the pool identity: two accounts pinned
         # to the same exit must never share a keep-alive connection, because a
         # reused HTTP/1.1 connection or TLS session would carry one account's
         # request over a tunnel the other account opened.
-        key = (alias, transport_url, route_identity)
+        key = (alias, transport_url)
         async with self._clients_lock:
+            retired, self._retired_clients = self._retired_clients, []
+            for old_client in retired:
+                await old_client.aclose()
             client = self._clients.get(key)
             if client is None:
                 install_profile_header_order()
@@ -1008,17 +1175,9 @@ class Upstream:
                 method, url, headers, body, proxy_url, alias=alias)
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
-                             {"proxy_network": bool(proxy_url),
+                             {"proxy_network": bool(_transport_proxy(proxy_url)),
                               "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
         data = _parse_body(response)
-        blocked = _region_block_error(response.status_code, data, proxy_url)
-        if blocked is not None:
-            # Generic authenticated calls such as /me/tenant use this path too.
-            # Preserve the rotatable marker so AppState can abandon the exit
-            # instead of collapsing the upstream 429 into an opaque 502.
-            logger.warning("upstream refused exit region: path=%s %s",
-                           path, _rejection_detail(data))
-            raise blocked
         return response.status_code, _lower_headers(response), data
 
     # --- token refresh (single-flight per alias) ------------------------------
@@ -1030,8 +1189,7 @@ class Upstream:
         return lock
 
     def _ticket_key(self, alias: str, proxy_url: Optional[str]) -> tuple[str, str]:
-        transport_url, route_identity = self._proxy_route(proxy_url)
-        return alias, route_identity or transport_url
+        return alias, _transport_proxy(proxy_url) or ""
 
     def _ticket_lock(self, alias: str, proxy_url: Optional[str]) -> asyncio.Lock:
         key = self._ticket_key(alias, proxy_url)
@@ -1057,10 +1215,21 @@ class Upstream:
             signer.set_client_version(self.settings.mirasim_client_version)
         return signer
 
-    def reset_device_identity(self, alias: str) -> None:
-        """Drop ``alias``'s cached device identity and its ticket caches."""
-        self._device_signers.pop(alias, None)
-        self._invalidate_ticket(alias)
+    def reset_device_identity(self, alias: str) -> str:
+        """Explicitly rotate the persistent key and invalidate old authorization."""
+        device_id = self._signer(alias).rotate()
+        self._advance_credentials(alias, clear_device=True)
+        self._forget_connections(alias)
+        return device_id
+
+    def rotate_device_identity(self, alias: str) -> str:
+        """Compatibility name for an explicit reset, never automatic on login."""
+        return self.reset_device_identity(alias)
+
+    def drop_device_identity(self, alias: str) -> None:
+        """Delete an alias's key and forget its signer on deletion/replacement."""
+        self.forget_account(alias)
+        self.store.vault.delete(alias, DEVICE_KEY_KIND)
 
     def ensure_device_identity(self, legacy_alias: str = "") -> str:
         """Persist the account's device key before account data is removed."""
@@ -1088,8 +1257,16 @@ class Upstream:
         self._advance_credentials(alias, clear_device=True)
 
     def forget_account(self, alias: str) -> None:
-        """Forget account authorization without rotating the installation key."""
+        """Forget authorization and the in-memory signer, without creating a key."""
+        self._device_signers.pop(alias, None)
         self._advance_credentials(alias, clear_device=True)
+        self._forget_connections(alias)
+
+    def _forget_connections(self, alias: str) -> None:
+        # Lifecycle entry points are synchronous. Retire now, close on the next
+        # client acquisition/shutdown; a replacement account never reuses them.
+        for key in [key for key in self._clients if key[0] == alias]:
+            self._retired_clients.append(self._clients.pop(key))
 
     def has_device_session(
             self, alias: str, proxy_url: Optional[str] = None) -> bool:
@@ -1145,6 +1322,8 @@ class Upstream:
             # Probes stay lean on purpose; every other caller gets the full
             # official fingerprint instead of a partial one.
             return self._cli_identity_headers(headers, session_id)
+        if not probe and session_id:
+            _set_ordered_header(headers, "x-claude-code-session-id", session_id)
         if not _has_header(headers, "accept"):
             # Accept and anthropic-version are Messages protocol semantics,
             # not a fabricated Claude CLI/SDK fingerprint. Internal OpenAI
@@ -1179,6 +1358,7 @@ class Upstream:
             self._ticket_cache.pop(key, None)
             self._ticket_retry_after.pop(key, None)
             self._ticket_failures.pop(key, None)
+            self._signing_unsupported_until.pop(key, None)
 
     def _invalidate_route_ticket(
             self, alias: str, proxy_url: Optional[str], expected: str) -> None:
@@ -1302,11 +1482,10 @@ class Upstream:
                 timeout=httpx.Timeout(TICKET_MINT_TIMEOUT_SECONDS), alias=alias)
         except httpx.HTTPError as exc:
             raise RelayError("upstream network error", 502,
-                             {"proxy_network": bool(proxy_url),
+                             {"proxy_network": bool(_transport_proxy(proxy_url)),
                               "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
         data = _parse_body(response)
         if response.status_code < 200 or response.status_code >= 300:
-            _raise_if_region_blocked(alias, response.status_code, data, proxy_url)
             raise RelayError("device session request rejected", response.status_code, data)
         ticket = data.get("ticket") if isinstance(data, dict) else None
         if not isinstance(ticket, str) or not ticket:
@@ -1327,18 +1506,15 @@ class Upstream:
             delay = TICKET_REFUSED_RETRY_SECONDS
         self._ticket_retry_after[key] = now + delay
 
-    @staticmethod
-    def _mint_failure_is_rotatable(exc: RelayError) -> bool:
-        return isinstance(exc.data, dict) and (
-            exc.data.get("region_blocked") is True
-            or exc.data.get("proxy_network") is True
-        )
-
     def _ticket_fallback(
             self, key: tuple[str, str], alias: str,
             cached: _DeviceTicket | None, exc: RelayError) -> Optional[str]:
         """Record a mint failure and return a still-valid old ticket if possible."""
-        if self._mint_failure_is_rotatable(exc):
+        if (exc.status == 401 or account_scoped_429(exc.status, exc.data)
+                or account_suspension_403(exc.status, exc.data) is not None
+                or account_overloaded_503(exc.status, exc.data)
+                or (isinstance(exc.data, dict)
+                    and exc.data.get("proxy_network") is True)):
             raise exc
         if exc.status in (404, 501):
             self._signing_unsupported_until[key] = (
@@ -1376,6 +1552,8 @@ class Upstream:
                         ticket = await self._mint_device_ticket(alias, access, proxy_url)
                         break
                     except RelayError as exc:
+                        if generation != self._credential_generations.get(alias, 0):
+                            break
                         # A stale account token can only be diagnosed by the
                         # session endpoint. Refresh it once; all other failures
                         # follow the desktop's plain-token fallback behavior.
@@ -1383,10 +1561,7 @@ class Upstream:
                             access = await self.refresh_access(alias, access, proxy_url)
                             generation = self._credential_generations.get(alias, 0)
                             continue
-                        fallback = self._ticket_fallback(key, alias, cached, exc)
-                        if generation != self._credential_generations.get(alias, 0):
-                            break
-                        return fallback
+                        return self._ticket_fallback(key, alias, cached, exc)
                 if generation != self._credential_generations.get(alias, 0):
                     # Re-login/delete raced this request; discard its old ticket.
                     continue
@@ -1552,7 +1727,7 @@ class Upstream:
             return response
         except httpx.HTTPError as exc:
             raise RelayError("relay network error", 502,
-                             {"proxy_network": bool(proxy_url),
+                             {"proxy_network": bool(_transport_proxy(proxy_url)),
                               "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
 
     async def _retry_relay_401(
@@ -1611,7 +1786,6 @@ class Upstream:
             data = _parse_body(response)
             headers = _lower_headers(response)
             await response.aclose()
-            _raise_if_region_blocked(alias, response.status_code, data, proxy_url)
             return response.status_code, headers, data
         raise RelayError("signed relay request failed after ticket refresh", 401)
 
@@ -1645,8 +1819,6 @@ class Upstream:
             headers = _lower_headers(response)
             await response.aclose()
             if response.status_code >= 400:
-                _raise_if_region_blocked(
-                    alias, response.status_code, response_body, proxy_url)
                 logger.warning(
                     "upstream rejected /v1/messages: account=%s status=%s %s | %s",
                     alias, response.status_code, _rejection_detail(response_body),
@@ -1689,8 +1861,6 @@ class Upstream:
                 await response.aread()
                 response_body = _parse_body(response)
                 await response.aclose()
-                _raise_if_region_blocked(
-                    alias, response.status_code, response_body, proxy_url)
                 logger.warning(
                     "upstream rejected /v1/messages (stream): account=%s status=%s %s | %s",
                     alias, response.status_code, _rejection_detail(response_body),
@@ -1746,9 +1916,11 @@ class Upstream:
                 response.extensions["mirofish_body_decoded"] = True
                 response_body = _parse_body(response)
                 try:
-                    _raise_if_region_blocked(
-                        alias, response.status_code, response_body, proxy_url)
-                    if account_scoped_429(response.status_code, response_body):
+                    if (response.status_code == 401
+                            or account_scoped_429(response.status_code, response_body)
+                            or account_overloaded_503(response.status_code, response_body)
+                            or account_suspension_403(response.status_code, response_body)
+                            is not None):
                         raise RelayError(
                             "model request rejected", response.status_code,
                             response_body)
@@ -1759,7 +1931,7 @@ class Upstream:
                     "upstream rejected %s: account=%s status=%s %s",
                     path, alias, response.status_code,
                     _rejection_detail(response_body))
-                # Non-429 protocol errors such as unsupported_model belong to
+                # Other protocol errors such as unsupported_model belong to
                 # the Codex caller. Preserve their status, body, and end-to-end
                 # headers instead of translating them into our error schema.
             return response

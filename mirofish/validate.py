@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import pathlib
+import ipaddress
 import re
-import urllib.parse
+from typing import Any
 
 from .errors import RelayError
 
@@ -34,22 +34,6 @@ def email_value(value: str) -> str:
     return value
 
 
-def node_exclude_pattern(value: str) -> re.Pattern[str] | None:
-    """Compile MIROFISH_PROXY_NODE_EXCLUDE, or None when unset.
-
-    The same string is handed to Mihomo's provider `exclude-filter` (Go RE2),
-    so keep expressions to the common subset — plain alternations like
-    `香港|HK|🇭🇰` behave identically in both engines."""
-    value = (value or "").strip()
-    if not value:
-        return None
-    try:
-        return re.compile(value)
-    except re.error as exc:
-        raise RelayError(
-            "MIROFISH_PROXY_NODE_EXCLUDE is not a valid regular expression", 500) from exc
-
-
 def code_value(value: str) -> str:
     value = value.strip()
     if not CODE_RE.fullmatch(value):
@@ -64,24 +48,36 @@ def model_value(value: str) -> str:
     return MODEL_ALIASES.get(value, value)
 
 
-def proxy_subscription_value(value: str) -> str:
-    """Validate a subscription URL without ever returning it in diagnostics."""
-    value = value.strip()
+def proxy_node_value(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate a manual HTTP(S)/SOCKS5 endpoint; its name may be empty."""
+    scheme = str(payload.get("scheme", "socks5")).strip().lower()
+    if scheme not in ("socks5", "http", "https"):
+        raise RelayError("proxy scheme must be socks5, http or https", 400)
+    host = str(payload.get("host") or "").strip().lower()
+    if host.startswith("[") and host.endswith("]"):
+        host = host[1:-1]
+    if not host or len(host) > 255 or any(
+            ch.isspace() or ord(ch) < 32 or ord(ch) == 127 or ch in "/?#@\\%[]"
+            for ch in host):
+        raise RelayError("invalid proxy host", 400)
+    if ":" in host:
+        try:
+            host = str(ipaddress.IPv6Address(host))
+        except ValueError as exc:
+            raise RelayError("invalid proxy host", 400) from exc
+    port_value = payload.get("port", 0)
     try:
-        parsed = urllib.parse.urlsplit(value)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        if isinstance(port_value, (bool, float)):
             raise ValueError
-        if parsed.username or parsed.password:
-            raise ValueError
-    except ValueError as exc:
-        raise RelayError("proxy subscription must be an http(s) URL", 400) from exc
-    return value
-
-
-def proxy_subscription_file_value(value: str) -> str:
-    """Validate a container-local provider file path without exposing its content."""
-    value = value.strip()
-    path = pathlib.PurePosixPath(value)
-    if not value or not path.is_absolute() or ".." in path.parts:
-        raise RelayError("proxy subscription file must be an absolute container path", 400)
-    return value
+        port = int(port_value)
+    except (TypeError, ValueError) as exc:
+        raise RelayError("proxy port must be a number", 400) from exc
+    if not 1 <= port <= 65535:
+        raise RelayError("proxy port must be within 1-65535", 400)
+    username = str(payload.get("username") or "")
+    password = str(payload.get("password") or "")
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in username + password):
+        raise RelayError("invalid proxy credentials", 400)
+    return {"name": str(payload.get("name") or "").strip()[:200],
+            "scheme": scheme, "host": host, "port": port,
+            "username": username, "password": password}

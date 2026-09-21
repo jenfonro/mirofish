@@ -1,4 +1,4 @@
-.git/
+.git
 .claude/
 **/.claude/
 .venv/
@@ -35,3 +35,9 @@ flows/
 dist/
 tests/
 deploy/mirofish-relay/mihomo-input/
+
+data/
+**/*.sqlite3
+**/*.sqlite3-*
+webui/.npm-cache/
+**/docker-compose.override.yml
