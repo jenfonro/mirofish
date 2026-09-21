@@ -12,6 +12,7 @@ import AccountsPage from "./pages/AccountsPage.vue";
 import UsagePage from "./pages/UsagePage.vue";
 import NetworkPage from "./pages/NetworkPage.vue";
 import PlaygroundPage from "./pages/PlaygroundPage.vue";
+import AppealPage from "./pages/AppealPage.vue";
 import SettingsPage from "./pages/SettingsPage.vue";
 
 const keyInput = ref("");
@@ -32,6 +33,7 @@ const PAGES: { id: PageId; label: string; icon: keyof typeof import("./icons").i
   { id: "usage", label: "用量", icon: "usage" },
   { id: "network", label: "网络", icon: "network" },
   { id: "playground", label: "测试", icon: "playground" },
+  { id: "appeal", label: "申诉", icon: "appeal" },
   { id: "settings", label: "设置", icon: "settings" },
 ];
 
@@ -185,6 +187,7 @@ onUnmounted(() => window.removeEventListener("keydown", onKeydown));
           <UsagePage v-else-if="page === 'usage'" />
           <NetworkPage v-else-if="page === 'network'" />
           <PlaygroundPage v-else-if="page === 'playground'" />
+          <AppealPage v-else-if="page === 'appeal'" />
           <SettingsPage
             v-else-if="page === 'settings'"
             :theme="theme"

@@ -12,6 +12,7 @@ import logging
 import math
 import sqlite3
 import time
+import uuid
 from typing import Any, Optional
 
 from .config import Settings
@@ -521,6 +522,51 @@ class AccountService:
             alias, "GET", "/v1/models", proxy_url=proxy_url)
         body = data if isinstance(data, dict) else {"raw": data}
         return self._public_model_list(status, body)
+
+    async def submit_appeal(self, alias: str, text: str, *,
+                            contact: Optional[str] = None,
+                            surface: str = "settings",
+                            proxy_url: Optional[str] = None) -> dict[str, Any]:
+        """Submit a suspension appeal exactly as the official client does.
+
+        Builds the desktop's ``feedback`` envelope byte-for-byte — the exact
+        fields ``server.cjs``'s ``Duo`` emits for a non-anonymous appeal
+        (``id, at, text, kind:"appeal", anonymous:false, app{...}, user{...}``)
+        and nothing extra — and posts it through ``Upstream.feedback``.
+        ``proxy_url`` is the appeal form's own exit, independent of the
+        account's binding.
+        """
+        text = (text or "").strip()
+        if not text:
+            raise RelayError("appeal text is required", 400)
+        row = self.store.row(alias)
+        metadata = json.loads(row["metadata_json"])
+        profile = metadata.get("profile") or {}
+        user: dict[str, Any] = {"deviceId": self.upstream._signer(alias).device_id}
+        if row["user_id"]:
+            user["userId"] = row["user_id"]
+        email = (contact or "").strip() or (row["email"] or "")
+        if email:
+            user["email"] = email
+        if isinstance(profile.get("name"), str) and profile["name"]:
+            user["name"] = profile["name"]
+        body: dict[str, Any] = {
+            "id": str(uuid.uuid4()),
+            "at": utc_now(),
+            "text": text[:4000],
+            "kind": "appeal",
+            "anonymous": False,
+            "app": {"version": self.settings.mirasim_client_version,
+                    "platform": "darwin", "arch": "arm64",
+                    "surface": surface, "locale": self.settings.mirasim_locale},
+            "user": user,
+        }
+        status, _, data = await self.upstream.feedback(alias, body, proxy_url=proxy_url)
+        delivered = 200 <= status < 300
+        result = {"delivered": delivered, "status": status, "id": body["id"]}
+        if not delivered:
+            result["error"] = data if data else ("HTTP %d" % status)
+        return result
 
     @staticmethod
     def _public_model_list(status: int, data: dict[str, Any]) -> dict[str, Any]:

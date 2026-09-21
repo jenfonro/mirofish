@@ -13,6 +13,7 @@ export type PageId =
   | "usage"
   | "network"
   | "playground"
+  | "appeal"
   | "settings";
 
 export function applyTheme(theme: ThemeMode): void {
@@ -71,7 +72,7 @@ export function storedPage(): PageId {
     const raw = localStorage.getItem(PAGE_STORAGE) as PageId | null;
     const pages: PageId[] = [
       "overview", "accounts", "usage", "network",
-      "playground", "settings",
+      "playground", "appeal", "settings",
     ];
     return raw && pages.includes(raw) ? raw : "overview";
   } catch {

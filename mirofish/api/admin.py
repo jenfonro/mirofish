@@ -266,3 +266,37 @@ async def usage(request: Request, hours: int = 24) -> dict[str, Any]:
     if hours < 1 or hours > 24 * 30:
         raise RelayError("hours must be between 1 and 720", 400)
     return get_state(request).store.usage_summary(hours)
+
+
+def _appeal_proxy_url(payload: dict[str, Any]) -> Optional[str]:
+    """A direct, form-supplied exit for the appeal — never the account's pool
+    binding. Off by default; only used when the toggle is on and a URL given."""
+    if not payload.get("proxy_enabled"):
+        return None
+    url = str(payload.get("proxy_url") or "").strip()
+    if not url:
+        return None
+    scheme = url.split("://", 1)[0].lower() if "://" in url else ""
+    if scheme not in ("http", "https", "socks5", "socks5h"):
+        raise RelayError("proxy must be an http(s):// or socks5:// URL", 400)
+    return url
+
+
+@router.post("/api/appeal")
+async def submit_appeal(request: Request) -> dict[str, Any]:
+    """Submit a suspension appeal for one account, as the official client would.
+
+    The optional proxy here is a one-off direct exit typed into the form, not
+    the account's fixed binding, so it is passed straight to the account
+    service rather than resolved through the pool.
+    """
+    state = get_state(request)
+    payload = await read_json_body(request)
+    alias = alias_value(str(payload.get("alias", "")))
+    state.store.row(alias)
+    text = str(payload.get("text", ""))
+    contact = payload.get("contact")
+    proxy_url = _appeal_proxy_url(payload)
+    return await state.accounts.submit_appeal(
+        alias, text, contact=str(contact) if contact is not None else None,
+        proxy_url=proxy_url)

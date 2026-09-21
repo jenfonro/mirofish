@@ -1242,6 +1242,44 @@ class Upstream:
                                                     access=access, proxy_url=proxy_url, alias=alias)
         return status, headers, data
 
+    async def feedback(self, alias: str, body: dict[str, Any],
+                       proxy_url: Optional[str] = None) -> tuple[int, dict[str, str], Any]:
+        """Submit an appeal/feedback exactly as the desktop client does.
+
+        Mirrors ``server.cjs``: ``POST <relay_base>/feedback`` with only
+        ``content-type`` and the account bearer (an appeal is never anonymous),
+        the official ``mirasim/<version>`` User-Agent, and no device signature.
+        The account token is refreshed once on a 401. ``proxy_url`` is the
+        appeal form's own direct exit (or None), never the account binding.
+        """
+        access, _ = self.store.credentials(alias)
+        url = self.settings.relay_base.rstrip("/") + "/feedback"
+        raw = _json_bytes(body)
+        ua = "mirasim/" + self.settings.mirasim_client_version
+
+        async def send(token: str) -> httpx.Response:
+            headers = [
+                ("content-type", "application/json"),
+                ("authorization", "Bearer " + token),
+                ("user-agent", ua),
+                ("accept-encoding", "identity"),
+            ]
+            headers.extend(_wire_tail(url, raw))
+            return await self.send_explicit(
+                "POST", url, headers, raw, proxy_url,
+                timeout=httpx.Timeout(20.0), alias=alias)
+
+        try:
+            response = await send(access)
+            if response.status_code == 401:
+                access = await self.refresh_access(alias, access, proxy_url)
+                response = await send(access)
+        except httpx.HTTPError as exc:
+            raise RelayError("appeal submission network error", 502,
+                             {"proxy_network": bool(proxy_url),
+                              "reason": (str(exc) or type(exc).__name__)[:200]}) from exc
+        return response.status_code, _lower_headers(response), _parse_body(response)
+
     async def limits(
             self, alias: str,
             proxy_url: Optional[str] = None) -> tuple[int, dict[str, str], Any]:
