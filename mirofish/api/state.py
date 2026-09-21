@@ -62,9 +62,15 @@ SETTING_SCHEDULE_MAX_UTILIZATION = "schedule_max_utilization"
 # skip (a ceiling deliberately set above it raises the skip mark too). Both
 # matter because the upstream meters lazily enough that a window kept in
 # rotation can be driven far past 100% before a 429 ever lands.
-DEFAULT_SCHEDULE_MAX_UTILIZATION = 0.98
+DEFAULT_SCHEDULE_MAX_UTILIZATION = 0.90
 # The model whose spend is metered against its own weekly window as well.
 FABLE_WINDOW = "7d_fable"
+# Every Claude model also draws on the shared weekly Claude window; every
+# request draws on the 5-hour burst window. Weighing these is what stops the
+# relay from forwarding to an account whose 7d_claude/5h window is spent while
+# its plain 7d window still looks open.
+CLAUDE_WINDOW = "7d_claude"
+BURST_WINDOW = "5h"
 # Reset-first is a tilt on the balanced ordering, not a replacement for it.
 # An account is treated as carrying up to this many fewer sessions than it
 # really does as its weekly window approaches expiry, so it takes the next few
@@ -394,16 +400,40 @@ class AppState:
     def _is_fable_model(model: Optional[str]) -> bool:
         return bool(model) and "fable" in model.lower()
 
+    @staticmethod
+    def _is_claude_model(model: Optional[str]) -> bool:
+        """A Claude-family model (opus/haiku/sonnet/fable). gpt-*/kimi-* served
+        over Codex do not draw on the Claude weekly window."""
+        if not model:
+            return True
+        lowered = model.lower()
+        return not (lowered.startswith("gpt-") or lowered.startswith("kimi-"))
+
+    def _relevant_windows(self, model: Optional[str]) -> list[str]:
+        """Every usage window a request for ``model`` spends, most specific
+        family last so a refusal can name the tightest one.
+
+        Every request spends the 5h burst window and the shared 7d window; a
+        Claude model additionally spends 7d_claude, and a fable model 7d_fable
+        on top of that. Ignoring 7d_claude/5h is exactly how an account at
+        104% on 7d_claude but 25% on 7d kept being handed requests.
+        """
+        names = [BURST_WINDOW, "7d"]
+        if self._is_claude_model(model):
+            names.append(CLAUDE_WINDOW)
+            if self._is_fable_model(model):
+                names.append(FABLE_WINDOW)
+        return names
+
     def _load(self, alias: str, model: Optional[str]) -> float:
         """How full this account is for the requested model.
 
-        A fable request also draws on the model's own weekly window, so take
-        whichever of the two is tighter; the spend lands on both.
+        The spend lands on every relevant window at once, so the tightest one
+        decides: an account whose burst or Claude window is spent cannot serve
+        the request no matter how much plain weekly credit it still has.
         """
         windows = self._windows(alias)
-        names = ["7d"]
-        if self._is_fable_model(model):
-            names.append(FABLE_WINDOW)
+        names = self._relevant_windows(model)
         loads = [value for value in
                  (self._window_utilization(windows.get(name)) for name in names)
                  if value is not None]
@@ -416,12 +446,13 @@ class AppState:
         request also spends the model's own weekly window, and skipping that
         check is how a 7d_fable window ends up at 130%. The header-fed scalar
         still covers the 7d window between sweeps, since every response
-        refreshes it. A ceiling deliberately configured above 100% raises the
-        skip mark with it (the operator chose to overspend). No usable data
-        means the account is assumed to have room; the upstream 429 stays the
-        final authority either way.
+        refreshes it. The configured ceiling is a HARD skip: an account at or
+        above it on any window this model draws on is not eligible, so a
+        request is never forwarded to a spent account. No usable data means the
+        account is assumed to have room; the upstream 429 stays the final
+        authority either way.
         """
-        mark = max(QUOTA_EXHAUSTED, self.schedule_settings()["max_utilization"])
+        mark = self.schedule_settings()["max_utilization"]
         if self._load(alias, model) >= mark:
             return False
         try:
@@ -486,6 +517,17 @@ class AppState:
         return (not self.account_disabled(alias) and not self.account_parked(alias)
                 and self.exhausted_cooldown(alias) <= 0.0)
 
+    def _eligible(self, alias: str, model: Optional[str] = None) -> bool:
+        """Serviceable AND under the quota ceiling for this model's windows.
+
+        This is the gate the request path uses: an over-ceiling or banned
+        account is never handed a live request, so the relay does not keep
+        forwarding to a spent/parked account (which only earns more refusals
+        and, repeated, an outright suspension). Background probes are
+        unaffected — they run through the park/recovery path, not here.
+        """
+        return self._selectable(alias) and self._quota_ok(alias, model)
+
     def _explicit_account(self, requested: str) -> str:
         """An explicitly requested account is honored even during a cooldown
         (the caller may know the quota reset), but never when switched off or
@@ -503,19 +545,78 @@ class AppState:
                           "after a shared-quota refusal; enable or resume one "
                           "in the panel or retry later", 503)
 
+    def _explicit_account_for_model(self, requested: str,
+                                    model: Optional[str]) -> str:
+        """Explicit selection with the same quota gate as automatic routing.
+
+        A pinned account that is over its ceiling on a window this model draws
+        on is refused locally (429) rather than forwarded: sending it earns a
+        certain refusal and, repeated, a suspension. A shorter model that does
+        not draw on the spent window still works.
+        """
+        alias = self._explicit_account(requested)
+        if not self._quota_ok(alias, model):
+            raise self._spent_allowance_error(model, [alias])
+        return alias
+
+    def _tightest_window(self, model: Optional[str], aliases: list[str]) -> str:
+        """The window spent on the most of ``aliases`` — the one to wait on."""
+        counts: dict[str, int] = {}
+        names = self._relevant_windows(model)
+        ceiling = self.schedule_settings()["max_utilization"]
+        for alias in aliases:
+            windows = self._windows(alias)
+            for name in names:
+                value = self._window_utilization(windows.get(name))
+                if value is not None and value >= ceiling:
+                    counts[name] = counts.get(name, 0) + 1
+        if not counts:
+            return names[-1]
+        return max(counts, key=lambda name: (counts[name], names.index(name)))
+
+    def _spent_allowance_error(self, model: Optional[str],
+                               aliases: list[str]) -> RelayError:
+        """The upstream's own verdict, answered locally: this model's allowance
+        is spent on every candidate, so the relay does not forward the request.
+        Keyed to the tightest window so a shorter model keeps working."""
+        window = self._tightest_window(model, aliases)
+        return RelayError(
+            "every eligible account has reached its %s allowance ceiling; "
+            "switch models or wait for the window to reset" % window,
+            429, {"error": {
+                "type": "rate_limit_error",
+                "code": "credit_exhausted_" + window,
+                "message": "every eligible account has reached its %s allowance "
+                           "ceiling; switch models or wait for the window to "
+                           "reset" % window}})
+
+    def _no_candidate_error(self, model: Optional[str],
+                            serviceable: list[str]) -> RelayError:
+        """Why no account can take this request right now.
+
+        If serviceable accounts exist but every one is over the ceiling on a
+        window this model spends, the honest, non-forwarding answer is a local
+        429 naming that window. Otherwise the pool is disabled/parked/cooling
+        and it is a 503.
+        """
+        if serviceable:
+            return self._spent_allowance_error(model, serviceable)
+        return self._no_selectable_error()
+
     def pick_account(self, requested: str, model: Optional[str] = None) -> str:
         """Explicit header > default account > quota-aware round-robin."""
         requested = requested.strip()
         if requested:
-            return self._explicit_account(requested)
+            return self._explicit_account_for_model(requested, model)
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
-        if self.default_account in aliases and self._selectable(self.default_account):
+        if self.default_account in aliases and self._eligible(self.default_account, model):
             return self.default_account
-        selectable = [alias for alias in aliases if self._selectable(alias)]
-        if not selectable:
-            raise self._no_selectable_error()
+        serviceable = [alias for alias in aliases if self._selectable(alias)]
+        eligible = [alias for alias in serviceable if self._quota_ok(alias, model)]
+        if not eligible:
+            raise self._no_candidate_error(model, serviceable)
         schedule = self.schedule_settings()
         if schedule["mode"] == SCHEDULE_RESET_FIRST:
             # There is no session key to stay stable for, but the live session
@@ -524,7 +625,7 @@ class AppState:
             # one account with the nearest reset.
             counts = self.session_counts()
             with self._rr_lock:
-                chosen = min(selectable,
+                chosen = min(eligible,
                              key=lambda alias: self._assignment_key(
                                  alias, counts, schedule, model))
                 self._last_assigned[chosen] = time.time()
@@ -534,14 +635,14 @@ class AppState:
             chosen = None
             for offset in range(len(aliases)):
                 candidate = aliases[(start + offset) % len(aliases)]
-                if candidate in selectable and self._quota_ok(candidate, model):
+                if candidate in eligible:
                     chosen = candidate
                     self._rr_index = (start + offset + 1) % len(aliases)
                     break
             if chosen is None:
-                # Every serviceable account looks exhausted; round-robin among
-                # the serviceable ones anyway.
-                chosen = selectable[start % len(selectable)]
+                # Eligible is non-empty but not on the round-robin ring order;
+                # fall back to the first eligible account (never a spent one).
+                chosen = eligible[0]
                 self._rr_index = (start + 1) % len(aliases)
             return chosen
 
@@ -698,10 +799,10 @@ class AppState:
                 return entry["account"]
             # New window: order the eligible accounts by the configured mode.
             serviceable = [alias for alias in aliases if self._selectable(alias)]
-            if not serviceable:
-                raise self._no_selectable_error()
-            eligible = [alias for alias in serviceable
-                        if self._quota_ok(alias, model)] or serviceable
+            eligible = [alias for alias in serviceable if self._quota_ok(alias, model)]
+            if not eligible:
+                # Never fall back to a spent/parked account: answer locally.
+                raise self._no_candidate_error(model, serviceable)
             counts = {alias: 0 for alias in eligible}
             for existing in self._sessions.values():
                 if existing["account"] in counts:
@@ -734,18 +835,20 @@ class AppState:
         """
         requested = (requested or "").strip()
         if requested:
-            return self._explicit_account(requested)
+            model = payload.get("model") if isinstance(payload, dict) else None
+            return self._explicit_account_for_model(
+                requested, model if isinstance(model, str) else None)
         aliases = self.store.aliases()
         if not aliases:
             raise RelayError("no account configured; add one via WebUI or CLI first", 400)
-        if self.default_account in aliases and self._selectable(self.default_account):
-            return self.default_account
         key = (session_hint or "").strip() or self._session_key_from_payload(payload)
         model = payload.get("model") if isinstance(payload, dict) else None
+        model = model if isinstance(model, str) else None
+        if self.default_account in aliases and self._eligible(self.default_account, model):
+            return self.default_account
         if not key:
-            return self.pick_account("", model if isinstance(model, str) else None)
-        return self._sticky_account(key, aliases,
-                                    model if isinstance(model, str) else None)
+            return self.pick_account("", model)
+        return self._sticky_account(key, aliases, model)
 
     # --- account-level failover -----------------------------------------------
 
