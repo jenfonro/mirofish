@@ -69,6 +69,13 @@ DEFAULT_DATA_DIR = pathlib.Path.home() / ".config" / "mirofish-relay"
 DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.261 (external, mirasim)"
 # Still the bare build marker, not a UA string.
 DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.303"
+
+# The desktop OS identity stamped on client-shaped envelopes (the appeal
+# ``app.platform``/``app.arch`` and the analytics ``platform`` tag). A Windows
+# desktop is the least remarkable default and is what the reference capture
+# used; keep both configurable so a deployment can present another host.
+DEFAULT_MIRASIM_OS_PLATFORM = "win32"
+DEFAULT_MIRASIM_OS_ARCH = "x64"
 # The desktop's Codex binary identifies itself as the product, not as
 # ``codex_cli_rs``.  Since 0.0.303 Codex is no longer bundled either, so the
 # version floats with the locally installed binary while the OS/arch/terminal
@@ -93,6 +100,10 @@ class Settings:
     mirasim_seal_public_key: str = DEFAULT_SEAL_PUBLIC_KEY
     mirasim_seal_metadata: bool = True
     mirasim_locale: str = "zh-HK"
+    # The desktop OS identity presented to the upstream (feedback app.platform
+    # /app.arch and the analytics platform tag). Windows/x64 by default.
+    mirasim_os_platform: str = DEFAULT_MIRASIM_OS_PLATFORM
+    mirasim_os_arch: str = DEFAULT_MIRASIM_OS_ARCH
     keychain_service: str = "open-reverselab.mirofish-relay"
     default_model: str = "gpt-5.6-luna"
     data_dir: pathlib.Path = field(default_factory=lambda: DEFAULT_DATA_DIR)
@@ -187,6 +198,14 @@ class Settings:
             mirasim_locale=(
                 os.environ.get("MIROFISH_MIRASIM_LOCALE", "zh-HK").strip()
                 or "zh-HK"),
+            mirasim_os_platform=(
+                os.environ.get("MIROFISH_MIRASIM_OS_PLATFORM",
+                               DEFAULT_MIRASIM_OS_PLATFORM).strip()
+                or DEFAULT_MIRASIM_OS_PLATFORM),
+            mirasim_os_arch=(
+                os.environ.get("MIROFISH_MIRASIM_OS_ARCH",
+                               DEFAULT_MIRASIM_OS_ARCH).strip()
+                or DEFAULT_MIRASIM_OS_ARCH),
             cred_backend=os.environ.get("MIROFISH_CRED_BACKEND", "").lower(),
             in_docker=bool(os.environ.get("MIROFISH_IN_DOCKER")),
             default_account=os.environ.get("MIROFISH_DEFAULT_ACCOUNT", "").strip(),

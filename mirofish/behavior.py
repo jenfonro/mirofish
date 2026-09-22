@@ -20,7 +20,6 @@ import gzip
 import json
 import logging
 import os
-import platform
 import random
 import secrets
 import time
@@ -65,13 +64,14 @@ def _jitter_seconds(min_seconds: float, max_seconds: float) -> float:
     return random.uniform(min_seconds, max_seconds)
 
 
-def _platform_tag() -> str:
-    """The desktop's ``platform`` value, e.g. ``darwin-arm64``."""
-    system = platform.system().lower() or "unknown"
-    machine = platform.machine().lower() or "unknown"
-    if machine in ("x86_64", "amd64"):
-        machine = "x64"
-    return f"{system}-{machine}"
+def _platform_tag(settings: Settings) -> str:
+    """The desktop's ``platform`` value, e.g. ``win32-x64``.
+
+    Uses the same configured OS identity as the appeal envelope so the
+    analytics tag and ``feedback`` app.platform/arch agree for one deviceId,
+    rather than leaking the real (containerised) host.
+    """
+    return f"{settings.mirasim_os_platform}-{settings.mirasim_os_arch}"
 
 
 def _analytics_locale() -> str:
@@ -108,7 +108,7 @@ def _heartbeat_event(*, event_id: str, boot_id: str, seq: int,
         "tenant": _ANALYTICS_TENANT,
         "surface": _ANALYTICS_SURFACE,
         "appVersion": settings.mirasim_client_version,
-        "platform": _platform_tag(),
+        "platform": _platform_tag(settings),
         "locale": _analytics_locale(),
         "props": {"uptimeSec": uptime_sec, "clients": 1},
     }

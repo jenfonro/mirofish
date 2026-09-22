@@ -10,7 +10,6 @@ import datetime
 import json
 import logging
 import math
-import platform
 import sqlite3
 import time
 import uuid
@@ -177,23 +176,6 @@ def normalize_limits(data: Any, fetched_epoch: float) -> dict[str, Any]:
         "windows": windows,
         "fetched_epoch": fetched_epoch,
     }
-
-
-def _host_platform_arch() -> tuple[str, str]:
-    """The desktop's ``process.platform``/``process.arch`` pair for this host.
-
-    The official client stamps the appeal envelope with whatever OS it runs on
-    (win32/x64 in the capture); mirroring the real host keeps this consistent
-    with the analytics replay (``behavior._platform_tag``) instead of forging a
-    platform the account never otherwise reports.
-    """
-    system = platform.system()
-    name = {"Darwin": "darwin", "Windows": "win32", "Linux": "linux"}.get(
-        system, (system or "linux").lower())
-    machine = platform.machine().lower()
-    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64",
-            "arm64": "arm64"}.get(machine, machine or "x64")
-    return name, arch
 
 
 def _iso_ms_now() -> str:
@@ -592,7 +574,6 @@ class AccountService:
             "resold": _s("resold"),
             "contact": _s("contact"),
         }
-        platform_name, arch = _host_platform_arch()
         body: dict[str, Any] = {
             "id": str(uuid.uuid4()),
             "at": _iso_ms_now(),
@@ -601,7 +582,8 @@ class AccountService:
             "anonymous": False,
             "appeal": appeal_obj,
             "app": {"version": self.settings.mirasim_client_version,
-                    "platform": platform_name, "arch": arch,
+                    "platform": self.settings.mirasim_os_platform,
+                    "arch": self.settings.mirasim_os_arch,
                     "surface": "desktop", "locale": self.settings.mirasim_locale},
         }
         if row["user_id"]:
