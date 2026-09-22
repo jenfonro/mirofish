@@ -1246,28 +1246,31 @@ class Upstream:
                        proxy_url: Optional[str] = None) -> tuple[int, dict[str, str], Any]:
         """Submit an appeal/feedback exactly as the desktop client does.
 
-        Mirrors ``server.cjs``: ``POST <relay_base>/feedback`` with only
-        ``content-type`` and the account bearer (an appeal is never anonymous),
-        the official ``mirasim/<version>`` User-Agent, and no device signature.
-        The account token is refreshed once on a 401. ``proxy_url`` is the
-        appeal form's own direct exit (or None), never the account binding.
+        Byte-for-byte the request captured from Mirasim v0.0.342 (see the
+        ``mirasim-appeal-*`` capture) and emitted by ``server.cjs``'s
+        ``Quo``→``eY`` transport: ``POST <relay_base>/feedback`` whose only
+        headers are ``content-type`` and the account bearer (an appeal is never
+        anonymous), plus the ``accept-encoding: identity`` the transport forces
+        and the Content-Length/Host/Connection the wire layer appends — in that
+        order. That path uses Node's ``http.request`` directly, so **no
+        User-Agent and no device signature are sent**. The token is refreshed
+        once on a 401. ``proxy_url`` is the appeal form's own direct exit (or
+        None), never the account binding.
         """
         access, _ = self.store.credentials(alias)
         url = self.settings.relay_base.rstrip("/") + "/feedback"
         raw = _json_bytes(body)
-        ua = "mirasim/" + self.settings.mirasim_client_version
 
         async def send(token: str) -> httpx.Response:
             headers = [
                 ("content-type", "application/json"),
                 ("authorization", "Bearer " + token),
-                ("user-agent", ua),
                 ("accept-encoding", "identity"),
             ]
             headers.extend(_wire_tail(url, raw))
             return await self.send_explicit(
                 "POST", url, headers, raw, proxy_url,
-                timeout=httpx.Timeout(20.0), alias=alias)
+                timeout=httpx.Timeout(10.0), alias=alias)
 
         try:
             response = await send(access)

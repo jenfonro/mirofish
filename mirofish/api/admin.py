@@ -294,9 +294,11 @@ async def submit_appeal(request: Request) -> dict[str, Any]:
     payload = await read_json_body(request)
     alias = alias_value(str(payload.get("alias", "")))
     state.store.row(alias)
-    text = str(payload.get("text", ""))
-    contact = payload.get("contact")
+    # `note` is the free-text field; the structured form fields ride in
+    # `appeal`, mirroring the official client's split.
+    note = str(payload.get("note", payload.get("text", "")))
+    appeal = payload.get("appeal")
+    appeal = appeal if isinstance(appeal, dict) else {}
     proxy_url = _appeal_proxy_url(payload)
     return await state.accounts.submit_appeal(
-        alias, text, contact=str(contact) if contact is not None else None,
-        proxy_url=proxy_url)
+        alias, note, appeal, proxy_url=proxy_url)

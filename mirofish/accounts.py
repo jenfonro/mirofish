@@ -10,6 +10,7 @@ import datetime
 import json
 import logging
 import math
+import platform
 import sqlite3
 import time
 import uuid
@@ -176,6 +177,29 @@ def normalize_limits(data: Any, fetched_epoch: float) -> dict[str, Any]:
         "windows": windows,
         "fetched_epoch": fetched_epoch,
     }
+
+
+def _host_platform_arch() -> tuple[str, str]:
+    """The desktop's ``process.platform``/``process.arch`` pair for this host.
+
+    The official client stamps the appeal envelope with whatever OS it runs on
+    (win32/x64 in the capture); mirroring the real host keeps this consistent
+    with the analytics replay (``behavior._platform_tag``) instead of forging a
+    platform the account never otherwise reports.
+    """
+    system = platform.system()
+    name = {"Darwin": "darwin", "Windows": "win32", "Linux": "linux"}.get(
+        system, (system or "linux").lower())
+    machine = platform.machine().lower()
+    arch = {"x86_64": "x64", "amd64": "x64", "aarch64": "arm64",
+            "arm64": "arm64"}.get(machine, machine or "x64")
+    return name, arch
+
+
+def _iso_ms_now() -> str:
+    """UTC timestamp with millisecond precision + ``Z``, like JS ``toISOString``."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond // 1000:03d}Z"
 
 
 class AccountService:
@@ -523,44 +547,71 @@ class AccountService:
         body = data if isinstance(data, dict) else {"raw": data}
         return self._public_model_list(status, body)
 
-    async def submit_appeal(self, alias: str, text: str, *,
-                            contact: Optional[str] = None,
-                            surface: str = "settings",
+    async def submit_appeal(self, alias: str, note: str, appeal: dict[str, Any], *,
                             proxy_url: Optional[str] = None) -> dict[str, Any]:
-        """Submit a suspension appeal exactly as the official client does.
+        """Submit a suspension appeal byte-for-byte as the desktop client does.
 
-        Builds the desktop's ``feedback`` envelope byte-for-byte — the exact
-        fields ``server.cjs``'s ``Duo`` emits for a non-anonymous appeal
-        (``id, at, text, kind:"appeal", anonymous:false, app{...}, user{...}``)
-        and nothing extra — and posts it through ``Upstream.feedback``.
-        ``proxy_url`` is the appeal form's own exit, independent of the
-        account's binding.
+        Reproduces the exact ``/feedback`` envelope captured from Mirasim
+        v0.0.342 (``mirasim-appeal-*`` capture) and emitted by ``server.cjs``'s
+        ``Duo`` for a non-anonymous appeal — same keys, same order, nothing
+        extra:
+
+            {id, at, text, kind:"appeal", anonymous:false,
+             appeal:{issue, errorText, since, usage, usageNote,
+                     shared, scripted, resold, contact},
+             app:{version, platform, arch, surface, locale},
+             user:{userId, email, name, deviceId}}
+
+        ``text`` is the free-form note; the structured form fields live in the
+        ``appeal`` sub-object. ``platform``/``arch`` track the real host (as the
+        desktop's ``process.platform``/``arch`` do), matching the analytics
+        replay. ``user`` is omitted entirely when the account has no userId,
+        exactly as ``Duo`` does. ``proxy_url`` is the form's own direct exit,
+        independent of the account's pool binding.
         """
-        text = (text or "").strip()
-        if not text:
+        note = (note or "").strip()
+        if not note:
             raise RelayError("appeal text is required", 400)
         row = self.store.row(alias)
         metadata = json.loads(row["metadata_json"])
         profile = metadata.get("profile") or {}
-        user: dict[str, Any] = {"deviceId": self.upstream._signer(alias).device_id}
-        if row["user_id"]:
-            user["userId"] = row["user_id"]
-        email = (contact or "").strip() or (row["email"] or "")
-        if email:
-            user["email"] = email
-        if isinstance(profile.get("name"), str) and profile["name"]:
-            user["name"] = profile["name"]
+
+        def _s(key: str) -> str:
+            value = appeal.get(key)
+            return value.strip() if isinstance(value, str) else ""
+
+        # Field order mirrors the capture's `appeal` object exactly.
+        appeal_obj = {
+            "issue": _s("issue"),
+            "errorText": _s("errorText")[:1000],
+            "since": _s("since"),
+            "usage": _s("usage"),
+            "usageNote": _s("usageNote"),
+            "shared": _s("shared"),
+            "scripted": _s("scripted"),
+            "resold": _s("resold"),
+            "contact": _s("contact"),
+        }
+        platform_name, arch = _host_platform_arch()
         body: dict[str, Any] = {
             "id": str(uuid.uuid4()),
-            "at": utc_now(),
-            "text": text[:4000],
+            "at": _iso_ms_now(),
+            "text": note[:4000],
             "kind": "appeal",
             "anonymous": False,
+            "appeal": appeal_obj,
             "app": {"version": self.settings.mirasim_client_version,
-                    "platform": "darwin", "arch": "arm64",
-                    "surface": surface, "locale": self.settings.mirasim_locale},
-            "user": user,
+                    "platform": platform_name, "arch": arch,
+                    "surface": "desktop", "locale": self.settings.mirasim_locale},
         }
+        if row["user_id"]:
+            user: dict[str, Any] = {"userId": row["user_id"]}
+            if row["email"]:
+                user["email"] = row["email"]
+            if isinstance(profile.get("name"), str) and profile["name"]:
+                user["name"] = profile["name"]
+            user["deviceId"] = self.upstream._signer(alias).device_id
+            body["user"] = user
         status, _, data = await self.upstream.feedback(alias, body, proxy_url=proxy_url)
         delivered = 200 <= status < 300
         result = {"delivered": delivered, "status": status, "id": body["id"]}
