@@ -1415,12 +1415,13 @@ async def test_messages_fail_over_on_shared_credit_exhaustion(client, state, aut
     assert response.status_code == 200
     assert response.headers["X-Mirofish-Account"] == "beta"
     assert route.call_count == 2
-    # The refused account cools down; later windows avoid it and the panel sees it.
-    assert state.exhausted_cooldown("alpha") > 0
+    # Shared credit is a 7d window lock, not a transient account-wide cooldown.
+    assert not state._quota_ok("alpha", "claude-haiku-4-5-20251001")
+    assert state.exhausted_cooldown("alpha") == 0
     assert state.route_account("", "", _conv("a brand new window")) == "beta"
     accounts = (await client.get("/accounts", headers=auth_headers)).json()["accounts"]
     cooldowns = {a["alias"]: a["shared_quota_cooldown"] for a in accounts}
-    assert cooldowns["alpha"] > 0 and cooldowns["beta"] == 0
+    assert cooldowns["alpha"] == cooldowns["beta"] == 0
 
 
 @respx.mock

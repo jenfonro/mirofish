@@ -21,8 +21,8 @@ from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool, proxy_url
 from ..store import Store
-from ..upstream import (CREDIT_EXHAUSTED_TYPE, RESPONSES_PATH, Upstream,
-                        account_scoped_429, quota_headers)
+from ..upstream import (RESPONSES_PATH, Upstream, account_scoped_429,
+                        exhausted_window_429, quota_headers)
 from ..validate import alias_value
 from ..vault import make_credential_store
 
@@ -31,10 +31,6 @@ logger = logging.getLogger("mirofish.state")
 LOGIN_TTL_SECONDS = 600.0
 QUOTA_EXHAUSTED = 0.999
 # A fixed-binding pool never rotates, so there is no network-retry cap.
-# How long automatic selection avoids an account after the upstream refuses it
-# with credit_exhausted_shared. The reset time is unknown to us, so re-probe
-# occasionally instead of blacklisting until restart.
-SHARED_QUOTA_COOLDOWN = 600.0
 # Cooldown for a 429 the relay does not recognize. Those are usually transient
 # rate pressure that clears in seconds, so the account only needs to sit out
 # long enough for its dropped sessions to land elsewhere; the full cooldown
@@ -141,8 +137,8 @@ class AppState:
         self._sessions: dict[str, dict[str, Any]] = {}
         self._last_assigned: dict[str, float] = {}
         self._session_lock = threading.Lock()
-        # alias -> epoch until which automatic selection avoids the account
-        # (upstream refused it with credit_exhausted_shared).
+        # Transient account-wide refusals only. Spent windows are persisted
+        # separately so neither a restart nor a lagging limits read lifts them.
         self._exhausted_until: dict[str, float] = {}
         self._limits_task: Optional[asyncio.Task[None]] = None
         self._limits_wake: Optional[asyncio.Event] = None
@@ -344,6 +340,35 @@ class AppState:
         return {str(window.get("name")): window for window in windows
                 if isinstance(window, dict)}
 
+    def _window_locks(self, alias: str) -> dict[str, Optional[float]]:
+        """Unexpired upstream exhaustion verdicts, independent of cached usage.
+
+        Without a reset time the named window stays closed until a limits
+        refresh supplies one. A stale deadline from before the refusal is not
+        evidence that the window has recovered.
+        """
+        metadata = json.loads(self.store.row(alias)["metadata_json"])
+        locks = metadata.get("quota_window_locks", {})
+        if not locks:
+            return {}
+        windows = self._windows(alias)
+        active = {}
+        now = time.time()
+        for name, lock in locks.items():
+            reset_at = lock["reset_at"]
+            if reset_at is None:
+                window = windows.get(name, {})
+                candidate = window.get("reset_at")
+                if isinstance(candidate, (int, float)) and candidate > lock["at"]:
+                    length = window.get("length")
+                    if isinstance(length, (int, float)) \
+                            and candidate - length >= lock["at"]:
+                        continue  # the fresh limits describe a later window
+                    reset_at = candidate
+            if reset_at is None or reset_at > now:
+                active[name] = reset_at
+        return active
+
     @staticmethod
     def _window_utilization(window: Optional[dict[str, Any]]) -> Optional[float]:
         if not isinstance(window, dict):
@@ -451,6 +476,9 @@ class AppState:
         account is assumed to have room; the upstream 429 stays the final
         authority either way.
         """
+        locks = self._window_locks(alias)
+        if any(name in locks for name in self._relevant_windows(model)):
+            return False
         mark = self.schedule_settings()["max_utilization"]
         if self._load(alias, model) >= mark:
             return False
@@ -505,14 +533,13 @@ class AppState:
         return True
 
     def exhausted_cooldown(self, alias: str) -> float:
-        """Seconds left in this account's shared-quota cooldown (0 = serviceable)."""
+        """Seconds left in a transient account-wide cooldown."""
         return max(0.0, self._exhausted_until.get(alias, 0.0) - time.time())
 
     def _selectable(self, alias: str) -> bool:
         """Eligible for automatic selection: not switched off in the panel, not
         parked after an upstream credential refusal, and not cooling down after
-        a shared-quota refusal. Quota load is a soft preference handled
-        separately; these three are hard exclusions."""
+        a transient refusal. Model-specific allowance gates are separate."""
         return (not self.account_disabled(alias) and not self.account_parked(alias)
                 and self.exhausted_cooldown(alias) <= 0.0)
 
@@ -541,7 +568,7 @@ class AppState:
 
     def _no_selectable_error(self) -> RelayError:
         return RelayError("all accounts are disabled, parked, or cooling down "
-                          "after a shared-quota refusal; enable or resume one "
+                          "after a transient refusal; enable or resume one "
                           "in the panel or retry later", 503)
 
     def _explicit_account_for_model(self, requested: str,
@@ -565,9 +592,10 @@ class AppState:
         ceiling = self.schedule_settings()["max_utilization"]
         for alias in aliases:
             windows = self._windows(alias)
+            locks = self._window_locks(alias)
             for name in names:
                 value = self._window_utilization(windows.get(name))
-                if value is not None and value >= ceiling:
+                if name in locks or value is not None and value >= ceiling:
                     counts[name] = counts.get(name, 0) + 1
         if not counts:
             return names[-1]
@@ -778,6 +806,7 @@ class AppState:
             if entry and entry["account"] in aliases and self._selectable(entry["account"]) \
                     and self._quota_ok(entry["account"], model):
                 entry["last"] = now
+                entry["model"] = model
                 return entry["account"]
             # New window: order the eligible accounts by the configured mode.
             serviceable = [alias for alias in aliases if self._selectable(alias)]
@@ -793,7 +822,7 @@ class AppState:
             chosen = min(eligible,
                          key=lambda alias: self._assignment_key(
                              alias, counts, schedule, model))
-            self._sessions[key] = {"account": chosen, "last": now}
+            self._sessions[key] = {"account": chosen, "last": now, "model": model}
             self._last_assigned[chosen] = now
             return chosen
 
@@ -845,23 +874,14 @@ class AppState:
         """
         return account_scoped_429(exc.status, exc.data)
 
-    @staticmethod
-    def _is_credit_exhausted(exc: RelayError) -> bool:
-        """The documented shared-credit exhaustion, which holds until the
-        weekly window resets — unlike other 429 shapes, which are usually
-        transient rate pressure."""
-        if not isinstance(exc.data, dict):
-            return False
-        error = exc.data.get("error")
-        return (isinstance(error, dict)
-                and str(error.get("type")) == CREDIT_EXHAUSTED_TYPE)
-
-    def drop_account_sessions(self, alias: str) -> None:
+    def drop_account_sessions(self, alias: str, window: str = "") -> None:
         """Detach live sessions pinned to an account so each conversation's next
-        turn is reassigned instead of repeating a failing or disabled account."""
+        turn is reassigned. A scoped lock must not detach unrelated models."""
         with self._session_lock:
             stale = [key for key, entry in self._sessions.items()
-                     if entry["account"] == alias]
+                     if entry["account"] == alias
+                     and (not window
+                          or window in self._relevant_windows(entry.get("model")))]
             for key in stale:
                 del self._sessions[key]
 
@@ -891,36 +911,39 @@ class AppState:
         self.store.remove(alias)
 
     def note_account_unserviceable(self, alias: str, exc: RelayError) -> bool:
-        """Record an account-scoped upstream refusal so automatic selection
-        avoids the account for a while. Returns True when the error was one.
-
-        The cooldown length depends on what the refusal was: shared-credit
-        exhaustion holds until the window resets, so re-probing every 10
-        minutes is enough, while an unrecognized 429 is usually transient
-        rate pressure — benching the account (and, with a single account,
-        the whole relay) for 10 minutes over one of those would turn a
-        seconds-long hiccup into a self-inflicted outage.
-        """
-        if self._is_account_exhausted(exc):
-            if self._is_credit_exhausted(exc):
-                cooldown, reason = SHARED_QUOTA_COOLDOWN, "shared-quota refusal"
-            else:
-                cooldown, reason = TRANSIENT_429_COOLDOWN, "account-scoped 429"
-        else:
+        """Lock a spent window until reset; only transient 429s cool the account."""
+        if not self._is_account_exhausted(exc):
             return False
+        window = exhausted_window_429(exc.status, exc.data)
+        if window:
+            now = time.time()
+            reset_at = self._windows(alias).get(window, {}).get("reset_at")
+            if not (isinstance(reset_at, (int, float)) and reset_at > now):
+                reset_at = None
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+            locks = metadata.get("quota_window_locks", {})
+            locks[window] = {"at": now, "reset_at": reset_at}
+            self.store.merge_metadata(alias, {"quota_window_locks": locks})
+            self.drop_account_sessions(alias, window)
+            logger.warning(
+                "account allowance locked until reset: account=%s window=%s reset_at=%s",
+                alias, window, reset_at if reset_at is not None else "unknown")
+            return True
+        cooldown = TRANSIENT_429_COOLDOWN
         self._exhausted_until[alias] = time.time() + cooldown
         self.drop_account_sessions(alias)
         logger.warning(
             "account cooling down for %ds after %s: account=%s",
-            int(cooldown), reason, alias)
+            int(cooldown), "account-scoped 429", alias)
         return True
 
     async def with_account_failover(
             self, requested: str, session_hint: str, payload: Any,
             run: Callable[[str], Awaitable[Any]]) -> tuple[str, Any]:
-        """Route an account and run the request, failing over to another account
-        when the upstream refuses the chosen one with credit_exhausted_shared.
-        An explicitly requested account is never substituted."""
+        """Fail over on account-scoped 429s, preserving each window's lock.
+
+        An explicitly requested account is never substituted.
+        """
         requested = (requested or "").strip()
         tried: set[str] = set()
         last: Optional[RelayError] = None
@@ -933,9 +956,16 @@ class AppState:
             if account in tried:
                 raise last if last is not None else RelayError(
                     "account selection returned an already-failed account", 500)
+            generation = self.store.account_generation(account)
             try:
                 return account, await run(account)
             except RelayError as exc:
+                try:
+                    current_generation = self.store.account_generation(account)
+                except RelayError:
+                    raise exc  # the account was removed during the request
+                if current_generation != generation:
+                    raise  # do not persist the old account's refusal on its replacement
                 if not self.note_account_unserviceable(account, exc) or requested:
                     raise
                 tried.add(account)

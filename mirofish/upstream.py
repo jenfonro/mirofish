@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import ssl
 import time
 import uuid
@@ -558,6 +559,38 @@ def account_scoped_429(status: int, body: Any) -> bool:
     if not isinstance(error, dict):
         return True
     return str(error.get("type")) != REGION_REFUSAL_TYPE
+
+
+def exhausted_window_429(status: int, body: Any) -> Optional[str]:
+    """A named, spent allowance is not a transient ``rate_limit_error``."""
+    if status != 429 or not isinstance(body, dict):
+        return None
+    error = body.get("error")
+    if not isinstance(error, dict):
+        return None
+    for field in ("code", "type"):
+        code = str(error.get(field) or "")
+        window = code.removeprefix("credit_exhausted_")
+        if code.startswith("credit_exhausted_") \
+                and window in ("5h", "7d", "7d_claude", "7d_fable"):
+            return window
+
+    # Older refusals omit code. Match affirmative exhaustion wording, not
+    # merely "weekly quota": the 5h message says weekly credit is NOT spent.
+    message = str(error.get("message") or "")
+    match = re.search(
+        r"已用满\s*(7d_fable|7d_claude|5h|7d|5\s*小时|7\s*天)\s*用量上限",
+        message)
+    if match:
+        window = re.sub(r"\s+", "", match.group(1))
+        return {"5小时": "5h", "7天": "7d"}.get(window, window)
+    match = re.search(r"\b(5-hour|7-day) usage limit is used up\b",
+                      message, re.IGNORECASE)
+    if match:
+        return "5h" if match.group(1).lower() == "5-hour" else "7d"
+    if CREDIT_EXHAUSTED_TYPE in (error.get("code"), error.get("type")):
+        return "7d"
+    return None
 
 
 def _region_block_error(status: int, body: Any,

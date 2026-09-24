@@ -14,7 +14,7 @@ import pytest
 from mirofish.api.state import (DEFAULT_SCHEDULE_MAX_UTILIZATION,
                                 SCHEDULE_BALANCED, SCHEDULE_FABLE_FIRST,
                                 SCHEDULE_RESET_FIRST,
-                                SHARED_QUOTA_COOLDOWN, TRANSIENT_429_COOLDOWN)
+                                TRANSIENT_429_COOLDOWN)
 from mirofish.errors import RelayError
 
 from tests.conftest import add_account
@@ -257,15 +257,14 @@ def refusal(status, error_type=None):
     return RelayError("upstream refused", status, data)
 
 
-def test_any_account_scoped_429_frees_the_conversation(state):
+def test_unrecognized_account_scoped_429_frees_the_conversation(state):
     """A 429 the relay does not recognize must still move the conversation on.
 
     Affinity would otherwise route the client's retry straight back to the
     account that just answered 429, and keep doing so until its window resets.
     """
     add_account(state, "work")
-    for error_type in ("credit_exhausted_shared", "rate_limit_error",
-                       "usage_limit_reached", None):
+    for error_type in ("rate_limit_error", "usage_limit_reached", None):
         state._exhausted_until.clear()
         assert state.note_account_unserviceable("work", refusal(429, error_type)), \
             f"429 {error_type} left the account selectable"
@@ -273,18 +272,14 @@ def test_any_account_scoped_429_frees_the_conversation(state):
 
 
 def test_credit_exhaustion_cools_much_longer_than_a_transient_429(state):
-    """Only the documented credit exhaustion earns the full cooldown.
-
-    An unrecognized 429 is usually transient rate pressure; benching the
-    account for the full 10 minutes would turn a seconds-long hiccup into an
-    outage for a single-account deployment.
-    """
-    add_account(state, "work")
+    """Known exhaustion holds until reset, not a guessed 10-minute timeout."""
+    now = time.time()
+    with_windows(state, "work", resets_in_hours=2)
     state.note_account_unserviceable(
         "work", refusal(429, "credit_exhausted_shared"))
-    assert state.exhausted_cooldown("work") == \
-        pytest.approx(SHARED_QUOTA_COOLDOWN, abs=5)
-    state._exhausted_until.clear()
+    assert state._window_locks("work")["7d"] == pytest.approx(now + 2 * HOUR, abs=5)
+    assert not state._quota_ok("work", "claude-opus-5")
+    assert state.exhausted_cooldown("work") == 0
     state.note_account_unserviceable("work", refusal(429, "rate_limit_error"))
     assert state.exhausted_cooldown("work") == \
         pytest.approx(TRANSIENT_429_COOLDOWN, abs=5)
