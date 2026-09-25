@@ -289,6 +289,10 @@ onMounted(() => {
               >
                 <span class="knob"></span>
               </button>
+              <div v-if="a.parked" class="chip danger" style="margin-top:4px"
+                   :title="a.parked_reason || ''">
+                {{ a.parked_status === 403 ? "封停" : "异常" }}
+              </div>
             </td>
             <td class="mono">{{ a.alias }}</td>
             <td>
@@ -373,6 +377,10 @@ onMounted(() => {
             <dd>
               <span class="chip" :class="drawer.disabled ? '' : 'ok'">
                 {{ drawer.disabled ? "已停用" : "已启用" }}
+              </span>
+              <span v-if="drawer.parked" class="chip danger" style="margin-left:4px"
+                    :title="drawer.parked_reason || ''">
+                {{ drawer.parked_status === 403 ? "封停" : "异常 · 需重新登录" }}
               </span>
               <span v-if="drawer.shared_quota_cooldown" class="chip warn" style="margin-left:4px">
                 冷却 {{ cooldownLabel(drawer.shared_quota_cooldown) }}

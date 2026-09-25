@@ -75,6 +75,11 @@ export interface Account {
   limits?: AccountLimits | null;
   profile_pending?: boolean;
   disabled?: boolean;
+  /** Out of scheduling after the upstream refused the account itself. */
+  parked?: boolean;
+  parked_reason?: string | null;
+  /** 403: suspended (banned); 401: credentials rejected, log in again. */
+  parked_status?: number | null;
   device_id?: string | null;
   shared_quota_cooldown?: number;
   active_sessions?: number;

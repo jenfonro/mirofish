@@ -20,7 +20,7 @@ from ..behavior import BehaviorReplayer
 from ..config import Settings
 from ..errors import RelayError
 from ..proxy import ProxyPool, proxy_url
-from ..store import Store
+from ..store import Store, utc_now
 from ..upstream import (RESPONSES_PATH, Upstream, account_scoped_429,
                         exhausted_window_429, quota_headers)
 from ..validate import alias_value
@@ -189,14 +189,22 @@ class AppState:
     async def _probe_parked(self, alias: str) -> None:
         """Recovery probe for a parked account.
 
-        A park means the upstream rejected the account's credentials with a
-        real 401; only /auth/me accepting the account again is proof of
-        recovery. Anything else — a repeated 401, a proxy or network failure,
-        an upstream 5xx — keeps the park untouched.
+        A 401 park means the upstream rejected the account's credentials;
+        only /auth/me accepting the account again is proof of recovery. A 403
+        park is a ban, and a banned account can still read its profile, so
+        /auth/me would put it straight back into rotation; only the limits
+        read the ban refused is proof it was lifted. Anything else — a
+        repeated refusal, a proxy or network failure, an upstream 5xx — keeps
+        the park untouched.
         """
         try:
-            await self.with_proxy(
-                alias, lambda url: self.accounts.fetch_status(alias, proxy_url=url))
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except RelayError:
+            return  # the account was removed before its probe
+        probe = (self.accounts.fetch_limits if metadata.get("parked_status") == 403
+                 else self.accounts.fetch_status)
+        try:
+            await self.with_proxy(alias, lambda url: probe(alias, proxy_url=url))
         except Exception as exc:  # noqa: BLE001 - probe failures keep the park
             try:
                 self.store.merge_metadata(alias, {"park_checked_at": utc_now()})
@@ -488,9 +496,9 @@ class AppState:
             return False
 
     def account_parked(self, alias: str) -> bool:
-        """Parked (circuit breaker open): the upstream rejected this account's
-        credentials with a persistent real 401, so it stays out of scheduling
-        until a probe or a manual recovery shows it works again."""
+        """Parked (circuit breaker open): the upstream refused the account
+        itself — a persistent real 401 or a 403 suspension — so it stays out
+        of scheduling until a probe or a manual recovery shows it works again."""
         try:
             metadata = json.loads(self.store.row(alias)["metadata_json"])
             return bool(metadata.get("parked"))
@@ -498,10 +506,11 @@ class AppState:
             return False
 
     def maybe_park_account(self, alias: str, exc: RelayError) -> bool:
-        """Park the account when ``exc`` is a persistent real-401 credential
-        refusal. Returns True when the error was one.
+        """Park the account when ``exc`` refuses the account itself: a
+        persistent real-401 credential refusal or a 403 suspension. Returns
+        True when the error was one.
 
-        ``AccountService.park_reason`` is the classifier: only a 401 counts.
+        ``AccountService.park_reason`` is the classifier.
         The local fail-closed ``device_session_required`` 503 and the
         upstream's ``model_unavailable`` 503 say nothing about the account's
         credentials and never park it.
@@ -511,7 +520,7 @@ class AppState:
             return False
         if self.account_parked(alias):
             return True
-        self.accounts.park(alias, reason)
+        self.accounts.park(alias, reason, exc.status)
         # Live sessions pinned to the account must be reassigned, and any
         # quota cooldown is now moot: the park is the stronger signal.
         self.drop_account_sessions(alias)
@@ -926,7 +935,10 @@ class AppState:
     async def with_account_failover(
             self, requested: str, session_hint: str, payload: Any,
             run: Callable[[str], Awaitable[Any]]) -> tuple[str, Any]:
-        """Fail over on account-scoped 429s, preserving each window's lock.
+        """Fail over on account-scoped 429s, preserving each window's lock, and
+        on refusals that park the account (a real 401, a 403 suspension): the
+        request moves on to the next eligible account instead of answering
+        the caller with a refusal another account would not give.
 
         An explicitly requested account is never substituted.
         """
@@ -952,7 +964,8 @@ class AppState:
                     raise exc  # the account was removed during the request
                 if current_generation != generation:
                     raise  # do not persist the old account's refusal on its replacement
-                if not self.note_account_unserviceable(account, exc) or requested:
+                if not (self.maybe_park_account(account, exc)
+                        or self.note_account_unserviceable(account, exc)) or requested:
                     raise
                 tried.add(account)
                 last = exc

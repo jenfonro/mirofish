@@ -120,6 +120,7 @@ def public_status(row: sqlite3.Row, metadata: Optional[dict[str, Any]] = None,
             "parked": bool(metadata.get("parked")),
             "parked_reason": metadata.get("parked_reason"),
             "parked_at": metadata.get("parked_at"),
+            "parked_status": metadata.get("parked_status"),
             "checked_at": metadata.get("checked_at"),
             "device_id": device_id,
             "proxy": proxy}
@@ -358,15 +359,17 @@ class AccountService:
     def park_reason(exc: RelayError) -> Optional[str]:
         """Why this failure parks the account, or None when it must not.
 
-        Only a persistent, real 401 — the upstream rejected the account's
-        credentials even after a token refresh already retried — says the
-        account itself is unusable (token revoked, account banned).  The
-        relay's own fail-closed ``device_session_required`` 503 is a local
-        signing condition, and an upstream ``model_unavailable`` 503 is a
-        capacity signal; neither says anything about the account's
-        credentials, so neither parks it.
+        Two refusals say the account itself is unusable. A persistent, real
+        401 — the upstream rejected the account's credentials even after a
+        token refresh already retried (token revoked). And a 403 whose message
+        says the account is suspended — the upstream's ban, which every retry
+        on this account only repeats. Any other 403 concerns one request, not
+        the account.  The relay's own fail-closed ``device_session_required``
+        503 is a local signing condition, and an upstream ``model_unavailable``
+        503 is a capacity signal; neither says anything about the account, so
+        neither parks it.
         """
-        if exc.status != 401:
+        if exc.status not in (401, 403):
             return None
         message = ""
         if isinstance(exc.data, dict):
@@ -377,22 +380,34 @@ class AccountService:
                 if isinstance(value, str) and value.strip():
                     message = value.strip()
                     break
+        if exc.status == 403:
+            return message[:300] if "suspended" in message.lower() else None
         return (message or "upstream rejected the account's credentials (401)")[:300]
 
-    def park(self, alias: str, reason: str) -> dict[str, Any]:
-        """Quarantine an account whose credentials the upstream rejected."""
+    def park(self, alias: str, reason: str, status: int) -> dict[str, Any]:
+        """Quarantine an account the upstream refused (``park_reason``).
+
+        ``status`` keeps which refusal it was: a 403 ban and a 401 credential
+        refusal recover differently. The refusal itself is the latest check,
+        so the recovery probe waits a full interval instead of asking again
+        right away.
+        """
         alias = alias_value(alias)
+        now = utc_now()
         metadata = self.store.merge_metadata(
             alias, {"parked": True, "parked_reason": (reason or "")[:300],
-                    "parked_at": utc_now()})
-        logger.warning("account parked: account=%s reason=%s", alias, reason)
+                    "parked_at": now, "parked_status": status,
+                    "park_checked_at": now})
+        logger.warning("account parked: account=%s status=%s reason=%s",
+                       alias, status, reason)
         return metadata
 
     def unpark(self, alias: str) -> dict[str, Any]:
         """Return a parked account to scheduling (manual or probe recovery)."""
         alias = alias_value(alias)
         return self.store.merge_metadata(
-            alias, {"parked": False, "parked_reason": None, "parked_at": None})
+            alias, {"parked": False, "parked_reason": None, "parked_at": None,
+                    "parked_status": None})
 
     # --- status ------------------------------------------------------------
 
@@ -453,13 +468,28 @@ class AccountService:
         alias = alias_value(alias)
         status, _, data = await self.upstream.limits(alias, proxy_url=proxy_url)
         if status < 200 or status >= 300:
-            raise RelayError("could not read usage limits", status, data)
+            exc = RelayError("could not read usage limits", status, data)
+            # A ban refuses this zero-cost read too. Parking on it keeps a
+            # manual or background refresh from leaving a banned account in
+            # rotation until a model request is refused. Only the ban parks
+            # from here; a persistent 401 is parked by the request path.
+            reason = self.park_reason(exc) if status == 403 else None
+            if reason and not json.loads(self.store.row(alias)["metadata_json"]).get("parked"):
+                self.park(alias, reason, status)
+            raise exc
         limits = normalize_limits(data, time.time())
         self._attach_fable_split(alias, limits)
         row = self.store.row(alias)
         metadata = json.loads(row["metadata_json"])
         metadata["limits"] = limits
         metadata["limits_checked_at"] = utc_now()
+        if metadata.get("parked") and metadata.get("parked_status") == 403 \
+                and not limits["suspended"]:
+            # The limits read is exactly what the ban refused, so its success
+            # is the proof the ban was lifted.
+            metadata.update({"parked": False, "parked_reason": None,
+                             "parked_at": None, "parked_status": None})
+            logger.warning("suspended account recovered: account=%s", alias)
         seven_day = next((window for window in limits["windows"]
                           if window["name"] == "7d"), None)
         if seven_day and seven_day["budget"] > 0:
