@@ -56,13 +56,13 @@ async def _codex_relay(request: Request, path: str) -> Any:
 
     requested = request.headers.get("X-Mirofish-Account", "")
     hint = _session_hint(request)
-    relay_session = state.relay_session_id("", hint, payload)
     try:
         query_string = request.scope.get("query_string", b"").decode("ascii")
     except UnicodeDecodeError as exc:
         raise RelayError("invalid URL query encoding", 400) from exc
 
     async def run(account: str):
+        relay_session = state.relay_session_id("", hint, payload, account)
         row = state.store.row(account)
         account_id = _safe_metadata(
             str(row["user_id"]) if row["user_id"] is not None else "")

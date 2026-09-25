@@ -1178,6 +1178,13 @@ class Upstream:
             # Probes stay lean on purpose; every other caller gets the full
             # official fingerprint instead of a partial one.
             return self._cli_identity_headers(headers, session_id)
+        if session_id:
+            # A CLI caller's own id names the caller's session, which one
+            # client may take to several accounts; carry the per-account id
+            # instead, paired with x-mirasim-session as the official client
+            # pairs them. Replaced in place, so wire order is unchanged.
+            headers = [(name, session_id if name.lower() == "x-claude-code-session-id"
+                        else value) for name, value in headers]
         if not _has_header(headers, "accept"):
             # Accept and anthropic-version are Messages protocol semantics,
             # not a fabricated Claude CLI/SDK fingerprint. Internal OpenAI
