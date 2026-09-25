@@ -19,6 +19,7 @@ from mirofish.behavior import (
     _telemetry_envelope,
     _update_url,
 )
+from mirofish.errors import RelayError
 from tests.conftest import RELAY_BASE, add_account
 
 
@@ -122,6 +123,20 @@ def test_paused_when_disabled_or_cooling_down(state):
 
     state._exhausted_until["work"] = time.time() + 30.0
     assert replayer._paused("work") is True
+
+
+def test_paused_while_parked(state):
+    """A banned or credential-refused account keeps quiet upstream: its only
+    contact is the recovery probe, never telemetry, roster or update checks."""
+    add_account(state, "work")
+    replayer = BehaviorReplayer(state)
+    state.maybe_park_account("work", RelayError("rejected", 403, {"error": {
+        "type": "permission_error",
+        "message": "this account is suspended; contact support"}}))
+    assert replayer._paused("work") is True
+
+    state.accounts.unpark("work")
+    assert replayer._paused("work") is False
 
 
 @respx.mock

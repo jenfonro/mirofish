@@ -9,8 +9,10 @@ on the account's own proxy exit, with random jitter so the fleet does not
 beat in lockstep.
 
 Replay is controlled by ``MIROFISH_BEHAVIOR_REPLAY`` (default on). A task
-pauses while the account is switched off in the panel (sleep) or is inside a
-shared-quota / 429 cooldown (fuse), and exits when the alias disappears.
+pauses while the account is switched off in the panel (sleep), is inside a
+shared-quota / 429 cooldown (fuse), or is parked after the upstream refused
+the account itself (a ban or rejected credentials), and exits when the alias
+disappears. A parked account's only upstream contact is its recovery probe.
 """
 
 from __future__ import annotations
@@ -279,8 +281,9 @@ class BehaviorReplayer:
             await self._wait(1.0)
 
     def _paused(self, alias: str) -> bool:
-        """Sleep = panel switch; fuse = shared-quota / 429 cooldown."""
+        """Sleep = panel switch; fuse = shared-quota / 429 cooldown or a park."""
         return (self.state.account_disabled(alias)
+                or self.state.account_parked(alias)
                 or self.state.exhausted_cooldown(alias) > 0.0)
 
     async def _wait(self, seconds: float) -> None:
