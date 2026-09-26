@@ -9,7 +9,7 @@ def test_default_upstream_endpoints_match_current_official_client(monkeypatch):
 
     assert settings.auth_base == "https://auth.mirasim.ai"
     assert settings.relay_base == "https://relay.mirasim.ai"
-    assert settings.mirasim_client_version == "0.0.303"
+    assert settings.mirasim_client_version == "0.0.367"
 
 
 def test_relay_endpoint_can_be_overridden(monkeypatch):
@@ -77,10 +77,10 @@ def test_transport_limits_are_configurable_and_keepalive_is_capped(monkeypatch):
 def test_codex_user_agent_defaults_to_the_capture_and_is_overridable(monkeypatch):
     monkeypatch.delenv("MIROFISH_CODEX_USER_AGENT", raising=False)
     assert Settings.from_env().codex_user_agent == \
-        "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)"
+        "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)"
 
     monkeypatch.setenv("MIROFISH_CODEX_USER_AGENT", " mirasim/9.9.9 (x) ")
     assert Settings.from_env().codex_user_agent == "mirasim/9.9.9 (x)"
 
     monkeypatch.setenv("MIROFISH_CODEX_USER_AGENT", "  ")
-    assert Settings.from_env().codex_user_agent.startswith("mirasim/0.153.4 ")
+    assert Settings.from_env().codex_user_agent.startswith("mirasim/0.155.1 ")

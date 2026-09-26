@@ -23,7 +23,7 @@
     {"name": "x-app", "value": "cli"},
     {"name": "accept-encoding", "value": "gzip, deflate, br, zstd"},
     {"name": "authorization", "value": "<redacted:authorization>"},
-    {"name": "x-mirasim-client", "value": "0.0.303"},
+    {"name": "x-mirasim-client", "value": "0.0.367"},
     {"name": "x-mirasim-enc", "value": "<dynamic:sealed_metadata>"},
     {"name": "content-length", "value": "<dynamic:content_length>"},
     {"name": "Host", "value": "relay.mirasim.ai"},

@@ -153,7 +153,8 @@ gzip / deflate / br / zstd 请求体会先按大小上限解压，随后以解�
 `x-mirasim-*` 不能覆盖代理生成的字段，其余 Codex 协议头（`x-codex-*`、`session-id`、
 `thread-id`、`chatgpt-account-id` 等）按 blocklist 方式、保持原顺序透传。发出去的请求与官方桌面端
 内置 Codex 的抓包一致：`user-agent` 统一改写为 `MIROFISH_CODEX_USER_AGENT`（默认即抓包中的
-`mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)`），`originator`
+`mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)`，版本随当前桌面端
+旁装的 Codex 浮动），`originator`
 固定为 `mirasim`，独立 Codex CLI 才会带的 `openai-beta` 与 `accept-encoding` 不转发；调用方的
 cookie 一律丢弃，relay 按「账号 × 出口」维护自己的 cookie 罐，把上游（Cloudflare）下发给 relay
 域名的 `__cflb` / `_cfuvid` / `__cf_bm` 等按 RFC 6265 规则在 `authorization` 之前回传，作用域
@@ -207,8 +208,8 @@ h11 默认的 Host 前置写法（`mirofish/wire.py`），loopback 测试逐字�
 凭证、relay 元数据和请求体三者的 SHA-256 摘要，凭证本身不会进入被签名的记录。0.0.303 的模型
 请求拿不到 device ticket 时直接返回 503（`device_session_required`），不会用账号 token 顶替。
 
-0.0.303 还会把模型请求的 relay 元数据封装为 `x-mirasim-enc`：除明文保留的
-`x-mirasim-client` 外，session / agent / device / account / locale / call 以及签名字段都不会
+0.0.303 起还会把模型请求的 relay 元数据封装为 `x-mirasim-enc`：除明文保留的
+`x-mirasim-client` 外，session / agent / device / account / locale / turn / call 以及签名字段都不会
 以明文头发送。封装格式是临时 X25519 公钥、12 字节 nonce 与 ChaCha20-Poly1305 密文，HKDF-SHA256
 使用 `mrs-seal-v1` 作为 info，AAD 绑定 HTTP method 与上游 pathname。relay 使用内置公钥，若上游
 轮换可通过 `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY`（或官方兼容的 `MIRASIM_SEAL_PUBKEY`）覆盖；默认
@@ -277,8 +278,8 @@ MIROFISH_TLS_IMPERSONATE=chrome136
 | `MIROFISH_DEFAULT_MODEL` | `gpt-5.6-luna` | OpenAI 兼容请求未提供模型时使用的上游模型 ID |
 | `MIROFISH_RELAY_BASE` | `https://relay.mirasim.ai` | 官方客户端当前使用的模型 relay 地址 |
 | `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.278 (external, mirasim)` | 所有模型请求统一改写成的官方客户端 User-Agent |
-| `MIROFISH_CODEX_USER_AGENT` | `mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)` | Codex 路径统一改写成的官方内置 Codex User-Agent |
-| `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.303` | relay 客户端版本标识 |
+| `MIROFISH_CODEX_USER_AGENT` | `mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)` | Codex 路径统一改写成的官方内置 Codex User-Agent |
+| `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.367` | relay 客户端版本标识 |
 | `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY` | 内置 32 字节公钥 | `x-mirasim-enc` 的 X25519 接收公钥 |
 | `MIROFISH_MIRASIM_SEAL_METADATA` | `1` | 是否封装模型请求的 relay 元数据 |
 | `MIROFISH_PROXY_SUBSCRIPTION_URL` | 空 | Mihomo 代理订阅地址 |

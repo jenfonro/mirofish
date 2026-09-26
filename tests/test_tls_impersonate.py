@@ -57,7 +57,7 @@ def test_ordered_headers_keep_wire_order_and_casing():
         headers=[
             ("x-zzz", "1"),
             ("Authorization", "Bearer t"),
-            ("x-mirasim-client", "0.0.303"),
+            ("x-mirasim-client", "0.0.367"),
             ("Host", "relay.mirasim.ai"),
         ],
         content=b"{}",

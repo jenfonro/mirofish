@@ -8,7 +8,8 @@ from fastapi import APIRouter, Depends, Request
 
 from ..errors import RelayError
 from ..upstream import (ALPHA_SEARCH_PATH, RESPONSES_COMPACT_PATH,
-                        RESPONSES_PATH, forwarded_response_headers)
+                        RESPONSES_PATH, forwarded_response_headers,
+                        relay_turn_id)
 from ..validate import model_value
 from .deps import get_state, read_json_body_bytes, require_auth
 from .relay import (_finalize_upstream_stream, _ManagedStreamingResponse,
@@ -69,7 +70,8 @@ async def _codex_relay(request: Request, path: str) -> Any:
         return await state.open_responses_stream(
             account, body, request_headers=request.headers,
             session_id=relay_session, account_id=account_id,
-            query_string=query_string, path=path)
+            query_string=query_string, path=path,
+            turn_id=relay_turn_id(relay_session, payload))
 
     account, (response, stack) = await state.with_account_failover(
         requested, hint, payload, run)

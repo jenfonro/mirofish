@@ -31,7 +31,7 @@ OFFICIAL_FIXTURE_NAMES = {
 #: product, not ``codex_cli_rs``, and carries one conversation id in three
 #: header slots.
 CODEX_USER_AGENT = (
-    "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
+    "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
 CODEX_CONVERSATION = "c10482cc-6726-48fc-a4e8-965da883d620"
 
 
@@ -106,7 +106,7 @@ def _headers(session: str, authorization: str = "Bearer ticket-secret"):
         ("x-app", "cli"),
         ("accept-encoding", "gzip, deflate, br, zstd"),
         ("authorization", authorization),
-        ("x-mirasim-client", "0.0.303"),
+        ("x-mirasim-client", "0.0.367"),
         # ephemeral X25519 key + nonce + ciphertext/tag of a small envelope.
         ("x-mirasim-enc", _b64url(b"e" * 32 + b"n" * 12 + b"c" * 180)),
         ("content-length", str(len(_body()))),
@@ -189,7 +189,7 @@ def _codex_wire_headers(body: bytes) -> list[tuple[str, str]]:
         *caller[:-1],
         ("cookie", "__cflb=synthetic-lb; _cfuvid=synthetic-uvid; __cf_bm=synthetic-bm"),
         caller[-1],
-        ("x-mirasim-client", "0.0.303"),
+        ("x-mirasim-client", "0.0.367"),
         ("x-mirasim-enc", _b64url(b"e" * 32 + b"n" * 12 + b"c" * 300)),
         ("content-length", str(len(body))),
         ("Host", "relay.mirasim.ai"),
@@ -213,7 +213,7 @@ def _representative_profile(name: str):
             "GET", "https://cdn-assets.mirasim.ai/mirasim/releases/latest.json",
             "HTTP/1.1", [
                 ("Accept", "application/json"),
-                ("User-Agent", "mirasim-desktop/0.0.303"),
+                ("User-Agent", "mirasim-desktop/0.0.367"),
                 ("accept-encoding", "identity"),
                 ("Host", "cdn-assets.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -223,7 +223,7 @@ def _representative_profile(name: str):
             "GET", "https://relay.mirasim.ai/v1/limits", "HTTP/1.1", [
                 ("x-mirasim-probe", "usage"),
                 ("Authorization", "Bearer synthetic-access-token"),
-                ("x-mirasim-client", "0.0.303"),
+                ("x-mirasim-client", "0.0.367"),
                 ("accept-encoding", "identity"),
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -238,7 +238,7 @@ def _representative_profile(name: str):
                 ("content-type", "application/json"),
                 ("authorization", "Bearer synthetic-access-token"),
                 *_signed_identity_headers(),
-                ("x-mirasim-client", "0.0.303"),
+                ("x-mirasim-client", "0.0.367"),
                 ("accept-encoding", "identity"),
                 ("content-length", str(len(body))),
                 ("Host", "relay.mirasim.ai"),
@@ -286,7 +286,7 @@ def _representative_profile(name: str):
             "GET", "https://relay.mirasim.ai/v1/models", "HTTP/1.1", [
                 ("authorization", "Bearer synthetic-device-ticket"),
                 *_signed_identity_headers(),
-                ("x-mirasim-client", "0.0.303"),
+                ("x-mirasim-client", "0.0.367"),
                 ("accept-encoding", "identity"),
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),
@@ -302,7 +302,7 @@ def _representative_profile(name: str):
                 ("x-mirasim-probe", "usage"),
                 ("Authorization", "Bearer synthetic-device-ticket"),
                 *_signed_identity_headers(),
-                ("x-mirasim-client", "0.0.303"),
+                ("x-mirasim-client", "0.0.367"),
                 ("accept-encoding", "identity"),
                 ("Host", "relay.mirasim.ai"),
                 ("Connection", "keep-alive"),

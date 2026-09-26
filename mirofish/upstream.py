@@ -413,12 +413,16 @@ def _as_float(value: Any) -> Optional[float]:
 def _relay_envelope(
         token: str, session_id: str, agent: str, account_id: str, call_id: str,
         device_id: str, client_version: str, locale: str,
-        probe: bool) -> list[tuple[str, str]]:
+        probe: bool, turn_id: str = "") -> list[tuple[str, str]]:
     """The relay-owned request metadata, in the order the desktop emits it.
 
     Probe requests carry a deliberately reduced envelope: no session, agent,
     device, account, locale or call id, because a usage probe is not part of a
     conversation and the product does not attribute one.
+
+    The turn id is the 0.0.367 desktop's per-prompt task id: set on the
+    session's metadata while the kernel is answering a prompt, so it sits
+    after the session-wide fields and before the per-request call id.
     """
     if probe:
         envelope = [("x-mirasim-probe", "usage"),
@@ -441,6 +445,8 @@ def _relay_envelope(
         envelope.append(("x-mirasim-client", client_version))
     if locale:
         envelope.append(("x-mirasim-locale", locale))
+    if turn_id:
+        envelope.append(("x-mirasim-turn", turn_id))
     if call_id:
         envelope.append(("x-mirasim-call", call_id))
     return envelope
@@ -702,6 +708,42 @@ def _with_client_metadata(payload: dict[str, Any], device_id: str,
         "session_id": session_id,
     }, separators=(",", ":"))
     return {**payload, "metadata": {"user_id": user_id}}
+
+
+def _carries_tool_result(content: Any) -> bool:
+    return isinstance(content, list) and any(
+        isinstance(block, dict) and block.get("type") == "tool_result"
+        for block in content)
+
+
+def relay_turn_id(session_id: str, payload: Any) -> str:
+    """The id the desktop stamps as ``x-mirasim-turn`` on every model call
+    it makes while answering one user prompt.
+
+    The kernel mints one task id per prompt, so the whole tool loop that
+    answers a prompt shares one id and the next prompt gets a fresh one.  A
+    caller's prompts are read off its own body: a Messages user turn with no
+    tool result is a prompt, one carrying tool results is the loop going on;
+    a Responses input counts its user items.  Derived from the per-account
+    session id, so one turn taken to two accounts is two unrelated ids.
+    """
+    prompts = 0
+    if isinstance(payload, dict):
+        messages = payload.get("messages")
+        items = payload.get("input")
+        if isinstance(messages, list):
+            prompts = sum(
+                1 for message in messages
+                if isinstance(message, dict) and message.get("role") == "user"
+                and not _carries_tool_result(message.get("content")))
+        elif isinstance(items, str):
+            prompts = 1
+        elif isinstance(items, list):
+            prompts = sum(1 for item in items
+                          if isinstance(item, dict) and item.get("role") == "user")
+    digest = hashlib.sha256(
+        ("%s\x00turn:%d" % (session_id, prompts)).encode("utf-8")).digest()[:16]
+    return str(uuid.UUID(bytes=digest, version=4))
 
 
 def _claude_compatible_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1539,6 +1581,7 @@ class Upstream:
                                      probe: bool = False,
                                      agent: str = "claude",
                                      account_id: str = "",
+                                     turn_id: str = "",
     ) -> httpx.Response:
         model_request = _is_model_request_path(path)
         # Explicit usage probes are intentionally allowed to use the account
@@ -1574,7 +1617,7 @@ class Upstream:
                     # relay outright.
                     self._signer(alias).device_id,
                     self.settings.mirasim_client_version,
-                    self.settings.mirasim_locale, probe):
+                    self.settings.mirasim_locale, probe, turn_id):
                 _set_ordered_header(headers, name, value)
             # The v2 signature covers the final relay metadata (before its
             # device/timestamp/nonce/signature fields are assigned).  Build the
@@ -1685,12 +1728,15 @@ class Upstream:
         url_path = path
         extra_headers: Optional[list[tuple[str, str]]] = None
         relay_session = session_id
+        turn = ""
         model_call = path in (MESSAGES_PATH, COUNT_TOKENS_PATH)
         if model_call:
             relay_session = session_id or str(uuid.uuid4())
             if not probe and payload is not None and "metadata" in payload:
                 payload = _with_client_metadata(
                     payload, self._signer(alias).device_id, relay_session)
+            if not probe:
+                turn = relay_turn_id(relay_session, payload)
             extra_headers = self._message_request_headers(
                 request_headers, probe, relay_session, alias)
             if beta:
@@ -1704,7 +1750,8 @@ class Upstream:
                 # x-mirasim-call identifies one HTTP request, not one logical
                 # call: a credential-refresh retry is a second request and gets
                 # its own id, as the session id stays put across both.
-                call_id=str(uuid.uuid4()) if model_call else "", probe=probe)
+                call_id=str(uuid.uuid4()) if model_call else "", probe=probe,
+                turn_id=turn)
             if response.status_code == 401 and attempt == 0:
                 await self._retry_relay_401(alias, proxy_url, response)
                 continue
@@ -1729,6 +1776,7 @@ class Upstream:
         if not probe:
             payload = _with_client_metadata(
                 payload, self._signer(alias).device_id, relay_session)
+        turn = "" if probe else relay_turn_id(relay_session, payload)
         request_body = _json_bytes(payload)
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
@@ -1737,7 +1785,7 @@ class Upstream:
                 alias, "POST", MESSAGES_PATH, request_body, proxy_url,
                 url_path=url_path,
                 extra_headers=extra_headers, session_id=relay_session,
-                call_id=str(uuid.uuid4()), probe=probe)
+                call_id=str(uuid.uuid4()), probe=probe, turn_id=turn)
             if response.status_code == 401 and attempt == 0:
                 await self._retry_relay_401(alias, proxy_url, response)
                 continue
@@ -1773,6 +1821,7 @@ class Upstream:
         if not probe:
             payload = _with_client_metadata(
                 payload, self._signer(alias).device_id, relay_session)
+        turn = "" if probe else relay_turn_id(relay_session, payload)
         request_body = _json_bytes(payload)
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
@@ -1781,7 +1830,7 @@ class Upstream:
                 alias, "POST", MESSAGES_PATH, request_body, proxy_url,
                 stream=True, url_path=url_path,
                 extra_headers=extra_headers, session_id=relay_session,
-                call_id=str(uuid.uuid4()), probe=probe)
+                call_id=str(uuid.uuid4()), probe=probe, turn_id=turn)
             if response.status_code == 401 and attempt == 0:
                 await self._retry_relay_401(alias, proxy_url, response)
                 continue
@@ -1806,12 +1855,15 @@ class Upstream:
                 Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
             session_id: str = "", account_id: str = "",
             query_string: str = "", path: str = RESPONSES_PATH,
+            turn_id: str = "",
     ) -> httpx.Response:
         """Open a Codex relay call without rebuilding its JSON body.
 
         Several local paths collapse onto each upstream endpoint.  The query is
         retained on the request URL but deliberately excluded from the signing
         pathname, matching the desktop MITM's canonicalization.
+        The caller derives the turn id from the body it already parsed; the
+        bytes are not re-read here.
         """
         if path not in CODEX_PATHS:
             raise RelayError("unsupported codex endpoint", 404)
@@ -1832,7 +1884,7 @@ class Upstream:
                 alias, "POST", path, body, proxy_url,
                 stream=True, url_path=url_path, extra_headers=extra_headers,
                 session_id=relay_session, call_id=str(uuid.uuid4()),
-                agent="codex", account_id=account_id)
+                agent="codex", account_id=account_id, turn_id=turn_id)
             if getattr(response, "_request", None) is not None:
                 jar.extract_cookies(response)
             if response.status_code == 401 and attempt == 0:

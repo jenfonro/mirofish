@@ -62,14 +62,16 @@ _SAFE_HEADER_EXACT_VALUES = {
         "claude-cli/2.1.278 (external, mirasim)",
         "mirasim-desktop/0.0.228",
         "mirasim-desktop/0.0.303",
+        "mirasim-desktop/0.0.367",
         "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
+        "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
     }),
     "x-app": frozenset({"cli"}),
     # Codex protocol flags carried by the desktop's bundled Codex.
     "x-codex-beta-features": frozenset({"remote_compaction_v2"}),
     "x-openai-internal-codex-responses-lite": frozenset({"true"}),
     "x-mirasim-agent": frozenset({"claude", "codex"}),
-    "x-mirasim-client": frozenset({"0.0.228", "0.0.272", "0.0.303"}),
+    "x-mirasim-client": frozenset({"0.0.228", "0.0.272", "0.0.303", "0.0.367"}),
     "x-mirasim-locale": frozenset({"zh-HK"}),
     "x-mirasim-probe": frozenset({"usage"}),
     "x-stainless-arch": frozenset({"arm64"}),
@@ -168,6 +170,7 @@ _SESSION_HEADER_NAMES = frozenset({
 _DYNAMIC_HEADER_NAMES = frozenset({
     "content-length", "x-codex-window-id", "x-mirasim-call", "x-mirasim-device",
     "x-mirasim-nonce", "x-mirasim-enc", "x-mirasim-sig", "x-mirasim-ts",
+    "x-mirasim-turn",
 }) | _SESSION_HEADER_NAMES
 #: Known Codex header names whose values are structured but private (turn
 #: metadata carries the installation id and working directory; the routing
@@ -361,7 +364,7 @@ def _normalize_header_value(
             raise UnsafeProfile(f"invalid {name}: session id is too long")
         label = session_labels.setdefault(value, f"session:{len(session_labels) + 1}")
         return f"<dynamic:{label}>"
-    if lower == "x-mirasim-call":
+    if lower in ("x-mirasim-call", "x-mirasim-turn"):
         _uuid4(value, lower)
         return "<dynamic:uuid4>"
     if lower == "x-codex-window-id":
@@ -516,6 +519,7 @@ def validate_profile(profile: dict[str, Any]) -> None:
             "content-length": "<dynamic:content_length>",
             "x-codex-window-id": "<dynamic:window_id>",
             "x-mirasim-call": "<dynamic:uuid4>",
+            "x-mirasim-turn": "<dynamic:uuid4>",
             "x-mirasim-device": "<dynamic:device_id>",
             "x-mirasim-enc": "<dynamic:sealed_metadata>",
             "x-mirasim-nonce": "<dynamic:base64url_12b>",

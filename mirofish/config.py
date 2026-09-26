@@ -68,21 +68,22 @@ DEFAULT_DATA_DIR = pathlib.Path.home() / ".config" / "mirofish-relay"
 # analysis machine.
 DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.278 (external, mirasim)"
 # Still the bare build marker, not a UA string.
-DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.303"
+DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.367"
 
 # The desktop OS identity stamped on client-shaped envelopes (the appeal
-# ``app.platform``/``app.arch`` and the analytics ``platform`` tag). A Windows
-# desktop is the least remarkable default and is what the reference capture
-# used; keep both configurable so a deployment can present another host.
-DEFAULT_MIRASIM_OS_PLATFORM = "win32"
-DEFAULT_MIRASIM_OS_ARCH = "x64"
+# ``app.platform``/``app.arch`` and the analytics ``platform`` tag).  The same
+# machine the Claude SDK fingerprint describes (``MacOS`` / ``arm64``), so one
+# installation reports one box everywhere; keep both configurable so a
+# deployment can present another host.
+DEFAULT_MIRASIM_OS_PLATFORM = "darwin"
+DEFAULT_MIRASIM_OS_ARCH = "arm64"
 # The desktop's Codex binary identifies itself as the product, not as
 # ``codex_cli_rs``.  Since 0.0.303 Codex is no longer bundled either, so the
-# version floats with the locally installed binary while the OS/arch/terminal
-# parts stay as captured; this value is the build installed on the analysis
-# machine.
+# version floats with the locally installed binary while the OS/terminal
+# parts stay as captured; this value is the build installed beside the
+# 0.0.367 desktop, on the arm64 Mac the rest of the fingerprint describes.
 DEFAULT_CODEX_USER_AGENT = (
-    "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
+    "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
 
 
 @dataclass
@@ -101,7 +102,8 @@ class Settings:
     mirasim_seal_metadata: bool = True
     mirasim_locale: str = "zh-HK"
     # The desktop OS identity presented to the upstream (feedback app.platform
-    # /app.arch and the analytics platform tag). Windows/x64 by default.
+    # /app.arch and the analytics platform tag). The arm64 Mac of the Claude
+    # SDK fingerprint by default.
     mirasim_os_platform: str = DEFAULT_MIRASIM_OS_PLATFORM
     mirasim_os_arch: str = DEFAULT_MIRASIM_OS_ARCH
     keychain_service: str = "open-reverselab.mirofish-relay"

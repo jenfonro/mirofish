@@ -67,7 +67,7 @@ def _jitter_seconds(min_seconds: float, max_seconds: float) -> float:
 
 
 def _platform_tag(settings: Settings) -> str:
-    """The desktop's ``platform`` value, e.g. ``win32-x64``.
+    """The desktop's ``platform`` value, e.g. ``darwin-arm64``.
 
     Uses the same configured OS identity as the appeal envelope so the
     analytics tag and ``feedback`` app.platform/arch agree for one deviceId,

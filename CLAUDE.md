@@ -46,7 +46,9 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   `MIROFISH_MIRASIM_CLIENT_VERSION` is pinned below 0.0.272. `tests/mirasim_protocol.py` is the
   test-side verifier (own X25519 pair, unseal + signature check); `tests/test_seal.py` pins the
   primitives and both operator switches.
-- Current upstream client profile is 0.0.303. For model requests, keep
+- Current upstream client profile is 0.0.367 (envelope, signing and seal verified byte-identical
+  to 0.0.303 against the 0.0.367 WASM core; the one addition is the per-prompt `x-mirasim-turn`
+  between `x-mirasim-locale` and `x-mirasim-call`). For model requests, keep
   `x-mirasim-client` clear and seal every other generated `x-mirasim-*` field in
   `x-mirasim-enc` (`mrs-seal-v1`: X25519 + HKDF-SHA256 + ChaCha20-Poly1305,
   pathname/method-bound AAD). A malformed seal key must fail closed; the
@@ -59,7 +61,8 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   probe keeps the capitalized `Authorization` of the desktop's probe object. The Codex path leaves
   the relay as the Codex the desktop launches would send it: caller protocol headers (`x-codex-*`,
   `session-id`, `thread-id`, `chatgpt-account-id`) pass through in order, `user-agent` is replaced
-  by `MIROFISH_CODEX_USER_AGENT` (the captured `mirasim/0.153.4 ...` string) and `originator` by
+  by `MIROFISH_CODEX_USER_AGENT` (the captured `mirasim/... (Mac OS ...; arm64) ...` string, version
+  floated to the Codex installed beside the current desktop) and `originator` by
   `mirasim`, `openai-beta`/`accept-encoding` are dropped, caller cookies are stripped, and the
   Cloudflare cookies the relay host sets are replayed from a per-(account, exit) `httpx.Cookies`
   jar placed just before `authorization` (RFC 6265 scoping applies, so a `Domain=chatgpt.com`

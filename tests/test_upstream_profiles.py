@@ -71,12 +71,14 @@ def _verify_signature(state, request: httpx.Request, path: str,
 
 #: Field order inside a sealed model envelope: the desktop assigns these onto
 #: its request-header object in this sequence, then signs, then seals every
-#: ``x-mirasim-*`` field except the clear client marker.
+#: ``x-mirasim-*`` field except the clear client marker.  0.0.367 adds the
+#: per-prompt turn id to the session-wide fields, ahead of the call id.
 SEALED_MODEL_FIELDS = [
     "x-mirasim-session",
     "x-mirasim-agent",
     "x-mirasim-device",
     "x-mirasim-locale",
+    "x-mirasim-turn",
     "x-mirasim-call",
     "x-mirasim-ts",
     "x-mirasim-nonce",
@@ -301,7 +303,7 @@ async def test_messages_preserve_sdk_order_and_isolate_caller_credentials(state)
             state, "work", "0f20cf48-c292-42e9-a99e-994511307deb")}},
         ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert request.headers["authorization"] == "Bearer device-ticket"
-    assert request.headers["x-mirasim-client"] == "0.0.303"
+    assert request.headers["x-mirasim-client"] == "0.0.367"
     sealed = relay_metadata(request, "/v1/messages")
     assert [name for name in sealed if name != "x-mirasim-client"] == \
         SEALED_MODEL_FIELDS
