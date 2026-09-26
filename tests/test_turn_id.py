@@ -69,6 +69,18 @@ def test_turn_id_counts_responses_user_items():
     assert relay_turn_id(SESSION, {"input": "hi"}) == first
 
 
+def test_a_compacted_history_does_not_revive_the_first_turn_id():
+    """Compaction leaves one summary user message, so the prompt count is
+    back at one; the id must still not be the first prompt's, which a kernel
+    task id never repeats.  The loop under the summary keeps the new id."""
+    first = relay_turn_id(SESSION, {"messages": [_user("do it")]})
+    summary = _user("This session is being continued from a previous conversation...")
+    compacted = relay_turn_id(SESSION, {"messages": [summary]})
+    assert compacted != first
+    assert relay_turn_id(SESSION, {"messages": [summary, _assistant(), _tool_result()]}) \
+        == compacted
+
+
 @respx.mock
 async def test_messages_carry_the_turn_between_locale_and_call(
         client, state, auth_headers):

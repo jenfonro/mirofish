@@ -725,6 +725,15 @@ def _carries_tool_result(content: Any) -> bool:
         for block in content)
 
 
+def _prompt_text(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "".join(block.get("text", "") for block in content
+                       if isinstance(block, dict) and isinstance(block.get("text"), str))
+    return ""
+
+
 def relay_turn_id(session_id: str, payload: Any) -> str:
     """The id the desktop stamps as ``x-mirasim-turn`` on every model call
     it makes while answering one user prompt.
@@ -735,23 +744,32 @@ def relay_turn_id(session_id: str, payload: Any) -> str:
     tool result is a prompt, one carrying tool results is the loop going on;
     a Responses input counts its user items.  Derived from the per-account
     session id, so one turn taken to two accounts is two unrelated ids.
+
+    The latest prompt's own text is in the hash as well as its ordinal: a
+    compaction replaces the history with one summary message and the count
+    starts over, and without the text the id would become the session's
+    first turn id again, which a kernel task id never does.
     """
-    prompts = 0
+    prompts, latest = 0, ""
     if isinstance(payload, dict):
         messages = payload.get("messages")
         items = payload.get("input")
         if isinstance(messages, list):
-            prompts = sum(
-                1 for message in messages
-                if isinstance(message, dict) and message.get("role") == "user"
-                and not _carries_tool_result(message.get("content")))
+            for message in messages:
+                if isinstance(message, dict) and message.get("role") == "user" \
+                        and not _carries_tool_result(message.get("content")):
+                    prompts += 1
+                    latest = _prompt_text(message.get("content"))
         elif isinstance(items, str):
-            prompts = 1
+            prompts, latest = 1, items
         elif isinstance(items, list):
-            prompts = sum(1 for item in items
-                          if isinstance(item, dict) and item.get("role") == "user")
+            for item in items:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    prompts += 1
+                    latest = _prompt_text(item.get("content"))
     digest = hashlib.sha256(
-        ("%s\x00turn:%d" % (session_id, prompts)).encode("utf-8")).digest()[:16]
+        ("%s\x00turn:%d\x00%s" % (session_id, prompts, latest)).encode("utf-8")
+    ).digest()[:16]
     return str(uuid.UUID(bytes=digest, version=4))
 
 
