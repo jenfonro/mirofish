@@ -16,7 +16,7 @@ import respx
 
 from mirofish.errors import RelayError
 from tests.conftest import RELAY_BASE, add_account
-from tests.mirasim_protocol import relay_metadata
+from tests.mirasim_protocol import client_user_id, relay_metadata
 from tests.test_api import ANTHROPIC_RESPONSE, SSE_BODY
 
 
@@ -237,6 +237,10 @@ async def test_upstream_403_suspension_is_served_by_another_account_in_isolation
         expected = state.relay_session_id(caller_session, "", {}, alias)
         assert metadata["x-mirasim-session"] == expected
         assert request.headers["x-claude-code-session-id"] == expected
+        # The body agrees with the headers: each account's own install and
+        # its own session id, so the two requests share no identifier.
+        assert json.loads(request.content)["metadata"] == {
+            "user_id": client_user_id(state, alias, expected)}
         sessions.add(expected)
     assert caller_session not in sessions and len(sessions) == 2
 

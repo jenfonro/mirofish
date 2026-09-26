@@ -10,7 +10,7 @@ from mirofish.config import DEFAULT_CODEX_USER_AGENT
 from mirofish.upstream import (RESPONSES_COMPACT_PATH, RESPONSES_PATH,
                                SIGNED_MODEL_REQUIRED_MESSAGE)
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
-from tests.mirasim_protocol import relay_metadata, verify_signature
+from tests.mirasim_protocol import client_user_id, relay_metadata, verify_signature
 
 
 def _device_session(result: httpx.Response | None = None):
@@ -361,13 +361,16 @@ async def test_unsigned_fallback_refreshes_account_token_on_401(
 
 
 @respx.mock
-async def test_messages_preserve_an_already_complete_body_bytes(
+async def test_messages_leave_in_the_official_compact_form_with_the_accounts_metadata(
         client, state, auth_headers):
+    """A body the relay has nothing to add to is still re-emitted the way the
+    official client serializes it, carrying this account's own identity;
+    the caller's pretty-printing is not a shape any shipped client sends."""
     add_account(state, "work")
     _device_session()
     route = respx.post(RELAY_BASE + "/v1/messages?beta=true").mock(
         return_value=httpx.Response(200, json={"content": [], "usage": {}}))
-    raw = json.dumps({
+    payload = {
         "model": "claude-fable-5",
         "max_tokens": 8,
         "system": [{
@@ -382,13 +385,18 @@ async def test_messages_preserve_an_already_complete_body_bytes(
                 "cache_control": {"type": "ephemeral"},
             }],
         }],
-    }, ensure_ascii=False, indent=2).encode("utf-8")
+    }
+    raw = json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8")
 
     response = await client.post(
         "/v1/messages?beta=true", headers=auth_headers, content=raw)
 
     assert response.status_code == 200
-    assert route.calls.last.request.content == raw
+    sent = route.calls.last.request
+    session = relay_metadata(sent)["x-mirasim-session"]
+    assert sent.content == json.dumps(
+        {**payload, "metadata": {"user_id": client_user_id(state, "work", session)}},
+        ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 
 async def test_invalid_or_oversized_compression_is_rejected_before_forwarding(

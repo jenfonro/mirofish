@@ -15,7 +15,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from ..upstream import _claude_compatible_payload, quota_headers
 from ..validate import model_value
-from .deps import get_state, read_json_body, read_json_body_bytes, require_auth
+from .deps import get_state, read_json_body, require_auth
 from .state import ACCOUNT_GENERATION_EXTENSION
 
 router = APIRouter(dependencies=[Depends(require_auth)])
@@ -204,12 +204,8 @@ async def _finalize_upstream_stream(
 @router.post("/v1/messages")
 async def messages(request: Request) -> Any:
     state = get_state(request)
-    raw_body, payload = await read_json_body_bytes(request)
+    payload = await read_json_body(request)
     validated_model = model_value(str(payload.get("model", "")))
-    if payload.get("model") != validated_model:
-        # A configured alias/validation normalization changed the object; the
-        # bytes must be regenerated so the signed body matches that object.
-        raw_body = None
     payload["model"] = validated_model
     session_hint = request.headers.get("X-Mirofish-Session", "")
     requested = request.headers.get("X-Mirofish-Account", "")
@@ -240,7 +236,7 @@ async def messages(request: Request) -> Any:
                 account,
                 lambda proxy_url: state.upstream.messages(
                     account, payload, proxy_url, request_headers=request.headers,
-                    session_id=relay_session, beta=beta, raw_body=raw_body))
+                    session_id=relay_session, beta=beta))
             return result, generation
         account, (upstream_result, account_generation) = await state.with_account_failover(
             requested, session_hint, payload, run)
@@ -255,7 +251,7 @@ async def messages(request: Request) -> Any:
             claude_session, session_hint, payload, account)
         return await state.open_messages_stream(
             account, payload, request_headers=request.headers,
-            session_id=relay_session, beta=beta, raw_body=raw_body)
+            session_id=relay_session, beta=beta)
     account, (response, stack) = await state.with_account_failover(
         requested, session_hint, payload, run_stream)
     account_generation = response.extensions.get(ACCOUNT_GENERATION_EXTENSION)

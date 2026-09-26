@@ -90,7 +90,7 @@ def _headers(session: str, authorization: str = "Bearer ticket-secret"):
     return [
         ("accept", "application/json"),
         ("content-type", "application/json"),
-        ("user-agent", "claude-cli/2.1.261 (external, mirasim)"),
+        ("user-agent", "claude-cli/2.1.278 (external, mirasim)"),
         ("x-claude-code-session-id", session),
         ("x-stainless-arch", "arm64"),
         ("x-stainless-lang", "js"),

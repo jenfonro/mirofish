@@ -198,8 +198,8 @@ h11 默认的 Host 前置写法（`mirofish/wire.py`），loopback 测试逐字�
 0.0.303 客户端的设备身份按**每账号**隔离：每个 alias 有自己的 Ed25519 密钥（首次使用时惰性
 创建，写入 vault，可通过 `POST /api/accounts/<alias>/reset-device` 轮换）。机器层面的字段
 （arch / os、stainless 版本、locale）仍是全安装共用，看起来始终是同一台机器；分散的只有
-`x-mirasim-device`。非 CLI 调用方补全为
-同一套抓包确认的 Claude CLI 指纹；真实 `claude-cli/...` 调用方的 arch / os 等字段保持原值。
+`x-mirasim-device`。所有调用方（含真实 `claude-cli/...` 调用方）统一改写为
+同一套抓包确认的 Claude CLI 指纹，调用方自己的版本、arch / os 不会到达上游。
 `x-mirasim-device` 是该账号密钥公钥派生出的 22 字符设备 ID：签名请求与（仅旧版客户端标识
 才允许的）降级到账号 token 的请求发出同一个值，只有时间戳、nonce 与签名三个字段是签名路径独有
 的。若降级路径改用形状不同的标识（例如 36 字符 UUID），单看这一个字段就能区分两条路径。签名为
@@ -276,7 +276,7 @@ MIROFISH_TLS_IMPERSONATE=chrome136
 | `MIROFISH_DEFAULT_ACCOUNT` | 空 | 强制使用的默认账号别名 |
 | `MIROFISH_DEFAULT_MODEL` | `gpt-5.6-luna` | OpenAI 兼容请求未提供模型时使用的上游模型 ID |
 | `MIROFISH_RELAY_BASE` | `https://relay.mirasim.ai` | 官方客户端当前使用的模型 relay 地址 |
-| `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.261 (external, mirasim)` | 为非 CLI 调用方补全的官方客户端 User-Agent |
+| `MIROFISH_CLAUDE_CLI_USER_AGENT` | `claude-cli/2.1.278 (external, mirasim)` | 所有模型请求统一改写成的官方客户端 User-Agent |
 | `MIROFISH_CODEX_USER_AGENT` | `mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)` | Codex 路径统一改写成的官方内置 Codex User-Agent |
 | `MIROFISH_MIRASIM_CLIENT_VERSION` | `0.0.303` | relay 客户端版本标识 |
 | `MIROFISH_MIRASIM_SEAL_PUBLIC_KEY` | 内置 32 字节公钥 | `x-mirasim-enc` 的 X25519 接收公钥 |

@@ -1155,7 +1155,6 @@ class AppState:
             payload: dict[str, Any], *,
             request_headers: Optional[Mapping[str, str]] = None,
             session_id: str = "", beta: bool = False,
-            raw_body: Optional[bytes] = None,
     ) -> tuple[httpx.Response, AsyncExitStack]:
         """Open a streaming upstream call through the account's fixed exit.
 
@@ -1169,7 +1168,7 @@ class AppState:
             response = await self.upstream.stream_messages(
                 alias, payload, proxy_url(proxy) if proxy else None,
                 request_headers=request_headers,
-                session_id=session_id, beta=beta, raw_body=raw_body)
+                session_id=session_id, beta=beta)
             response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
             stack.push_async_callback(response.aclose)
         except RelayError as exc:

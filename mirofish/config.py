@@ -66,7 +66,7 @@ DEFAULT_DATA_DIR = pathlib.Path.home() / ".config" / "mirofish-relay"
 # no longer bundles Claude, so the claude-cli version in this UA floats with
 # the locally installed binary; the value here is the build installed on the
 # analysis machine.
-DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.261 (external, mirasim)"
+DEFAULT_CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.278 (external, mirasim)"
 # Still the bare build marker, not a UA string.
 DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.303"
 

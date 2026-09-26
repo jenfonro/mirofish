@@ -17,7 +17,7 @@ import respx
 from mirofish.config import DEFAULT_CODEX_USER_AGENT
 from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, LIMITS_PATH
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
-from tests.mirasim_protocol import relay_metadata, verify_signature
+from tests.mirasim_protocol import client_user_id, relay_metadata, verify_signature
 from tests.test_request_profile import _body as captured_messages_body
 from tests.test_request_profile import _headers as captured_messages_headers
 from tests.test_request_profile import codex_body, codex_caller_headers
@@ -245,7 +245,7 @@ async def test_signed_models_profile_matches_the_capture(state):
 CLAUDE_HEADERS = [
     ("accept", "application/json"),
     ("content-type", "application/json"),
-    ("user-agent", "claude-cli/2.1.261 (external, mirasim)"),
+    ("user-agent", "claude-cli/2.1.278 (external, mirasim)"),
     ("x-claude-code-session-id", "0f20cf48-c292-42e9-a99e-994511307deb"),
     ("x-stainless-arch", "arm64"),
     ("x-stainless-lang", "js"),
@@ -297,7 +297,9 @@ async def test_messages_preserve_sdk_order_and_isolate_caller_credentials(state)
         "Connection",
     ]
     assert request.content == json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        {**payload, "metadata": {"user_id": client_user_id(
+            state, "work", "0f20cf48-c292-42e9-a99e-994511307deb")}},
+        ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert request.headers["authorization"] == "Bearer device-ticket"
     assert request.headers["x-mirasim-client"] == "0.0.303"
     sealed = relay_metadata(request, "/v1/messages")
@@ -393,7 +395,7 @@ async def test_caller_sdk_fingerprint_cannot_survive_beside_the_cli_identity(sta
     assert request.headers["accept-encoding"] == "gzip, deflate, br, zstd"
     assert request.headers["anthropic-dangerous-direct-browser-access"] == "true"
     assert request.headers["x-app"] == "cli"
-    assert request.headers["user-agent"] == "claude-cli/2.1.261 (external, mirasim)"
+    assert request.headers["user-agent"] == "claude-cli/2.1.278 (external, mirasim)"
     assert request.headers["x-stainless-lang"] == "js"
     assert request.headers["x-stainless-runtime"] == "node"
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
@@ -517,19 +519,23 @@ async def test_installation_fingerprint_fields_stay_shared(state):
 
 
 @respx.mock
-async def test_a_real_cli_caller_keeps_its_own_machine_headers(state):
+async def test_a_real_cli_caller_is_rebuilt_as_this_installation(state):
+    """A CLI caller's version and machine describe the caller's box.  One
+    box serving several accounts would surface behind all of them, so the
+    caller leaves as this installation's client, like every other caller."""
     _mock_device_session()
     cli_headers = httpx.Headers(dict(CLAUDE_HEADERS) | {
+        "user-agent": "claude-cli/2.1.261 (external, mirasim)",
         "x-stainless-arch": "x64",
         "x-stainless-os": "Linux",
     })
 
     request = await _messages_request(state, "work", request_headers=cli_headers)
 
-    assert _machine_slot(request) == ("x64", "Linux")
+    assert _machine_slot(request) == ("arm64", "MacOS")
     assert request.headers["x-stainless-runtime-version"] == "v26.3.0"
     assert request.headers["x-stainless-package-version"] == "0.112.1"
-    assert request.headers["user-agent"] == "claude-cli/2.1.261 (external, mirasim)"
+    assert request.headers["user-agent"] == "claude-cli/2.1.278 (external, mirasim)"
 
 
 @respx.mock

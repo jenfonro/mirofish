@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -109,7 +110,6 @@ _MAX_FORWARDED_HEADER_VALUE = 8192
 # Captured verbatim from an official client's /v1/messages request.  A
 # third-party caller arrives with its own SDK identity or none at all, which
 # leaves upstream looking at a fingerprint that matches no shipped client.
-_CLI_USER_AGENT_PREFIX = "claude-cli/"
 _CLI_ACCEPT_ENCODING = "gzip, deflate, br, zstd"
 _CLI_CLAUDE_CODE_BETA = "claude-code-20250219"
 _CLI_STAINLESS_FINGERPRINT: tuple[tuple[str, str], ...] = (
@@ -351,13 +351,6 @@ def forwarded_response_headers(response: httpx.Response) -> list[tuple[str, str]
 def _has_header(headers: Sequence[tuple[str, str]], name: str) -> bool:
     lowered = name.lower()
     return any(header_name.lower() == lowered for header_name, _ in headers)
-
-
-def _is_cli_caller(headers: Sequence[tuple[str, str]]) -> bool:
-    """True when the caller already presents an official Claude CLI identity."""
-    return any(name.lower() == "user-agent"
-               and value.lower().startswith(_CLI_USER_AGENT_PREFIX)
-               for name, value in headers)
 
 
 def _set_ordered_header(
@@ -688,6 +681,27 @@ def _json_bytes(payload: Optional[dict[str, Any]]) -> bytes:
     if payload is None:
         return b""
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+
+def _with_client_metadata(payload: dict[str, Any], device_id: str,
+                          session_id: str) -> dict[str, Any]:
+    """Replace the caller's ``metadata.user_id`` with this account's own.
+
+    Claude Code fills it with ``{"device_id","account_uuid","session_id"}``:
+    its install id, its OAuth account (empty on a relay login) and the same
+    session it names in ``x-claude-code-session-id``.  Forwarded as received,
+    one caller's install and session would surface identically on every
+    account it fails over to, and would contradict the per-account session
+    header.  So it is rebuilt the way the headers are: the install id is
+    derived from the account's own device, the session id is the one the
+    headers carry.  Copy-on-write, like the other body rewrites.
+    """
+    user_id = json.dumps({
+        "device_id": hashlib.sha256(device_id.encode("ascii")).hexdigest(),
+        "account_uuid": "",
+        "session_id": session_id,
+    }, separators=(",", ":"))
+    return {**payload, "metadata": {"user_id": user_id}}
 
 
 def _claude_compatible_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1131,7 +1145,7 @@ class Upstream:
     def _cli_identity_headers(
             self, forwarded: Sequence[tuple[str, str]],
             session_id: str) -> list[tuple[str, str]]:
-        """Rebuild a non-CLI caller's headers as the captured official profile.
+        """Rebuild every caller's headers as this installation's official profile.
 
         Only ``anthropic-version`` and ``anthropic-beta`` survive from the
         caller: those change request semantics and are the caller's to choose.
@@ -1139,8 +1153,12 @@ class Upstream:
         a Python SDK's own ``x-stainless-lang: python`` cannot survive beside a
         ``js`` claim, and a caller's ``accept: text/event-stream`` cannot
         contradict a client that the capture shows always sends
-        ``application/json``, streaming or not.  The session id matches
-        ``x-mirasim-session`` exactly as the official client pairs them.
+        ``application/json``, streaming or not.  A real CLI caller is rebuilt
+        too: its version and machine describe the caller's box, and one box
+        serving several accounts would put the same box behind all of them
+        while a real installation's version never changes between turns.  The
+        session id matches ``x-mirasim-session`` exactly as the official
+        client pairs them.
         """
         supplied = {name.lower(): value for name, value in forwarded}
         betas = [item for item in supplied.get("anthropic-beta", "").split(",")
@@ -1174,15 +1192,14 @@ class Upstream:
             probe: bool, session_id: str = "",
             alias: str = "") -> list[tuple[str, str]]:
         headers = _forwarded_message_headers(request_headers)
-        if not probe and not _is_cli_caller(headers):
+        if not probe:
             # Probes stay lean on purpose; every other caller gets the full
-            # official fingerprint instead of a partial one.
+            # official fingerprint instead of its own or a partial one.
             return self._cli_identity_headers(headers, session_id)
         if session_id:
-            # A CLI caller's own id names the caller's session, which one
-            # client may take to several accounts; carry the per-account id
-            # instead, paired with x-mirasim-session as the official client
-            # pairs them. Replaced in place, so wire order is unchanged.
+            # A CLI caller's own id names the caller's session; carry the
+            # per-account id instead. Replaced in place, so wire order is
+            # unchanged.
             headers = [(name, session_id if name.lower() == "x-claude-code-session-id"
                         else value) for name, value in headers]
         if not _has_header(headers, "accept"):
@@ -1201,10 +1218,9 @@ class Upstream:
             headers.insert(insert_at, ("content-type", "application/json"))
         if not _has_header(headers, "anthropic-version"):
             headers.append(("anthropic-version", self.settings.anthropic_version))
-        if probe:
-            # The product's explicit usage probe is intentionally a lean
-            # request and does not carry per-conversation relay metadata.
-            _set_ordered_header(headers, "accept-encoding", "identity")
+        # The product's explicit usage probe is intentionally a lean request
+        # and does not carry per-conversation relay metadata.
+        _set_ordered_header(headers, "accept-encoding", "identity")
         return headers
 
     def _invalidate_ticket(self, alias: str) -> None:
@@ -1666,17 +1682,20 @@ class Upstream:
                           session_id: str = "", beta: bool = False,
                           probe: bool = False) -> tuple[int, dict[str, str], Any]:
         """Call a relay control/model endpoint using device auth."""
-        request_body = _json_bytes(payload)
         url_path = path
         extra_headers: Optional[list[tuple[str, str]]] = None
         relay_session = session_id
         model_call = path in (MESSAGES_PATH, COUNT_TOKENS_PATH)
         if model_call:
             relay_session = session_id or str(uuid.uuid4())
+            if not probe and payload is not None and "metadata" in payload:
+                payload = _with_client_metadata(
+                    payload, self._signer(alias).device_id, relay_session)
             extra_headers = self._message_request_headers(
                 request_headers, probe, relay_session, alias)
             if beta:
                 url_path += "?beta=true"
+        request_body = _json_bytes(payload)
         for attempt in range(2):
             response = await self._signed_relay_response(
                 alias, method, path, request_body, proxy_url,
@@ -1702,15 +1721,15 @@ class Upstream:
                            Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
                        session_id: str = "", beta: bool = False,
                        probe: bool = False,
-                       raw_body: Optional[bytes] = None,
     ) -> tuple[dict[str, Any], dict[str, str]]:
         """Buffered (non-stream) Messages call with ticket/signature retry."""
-        original = payload
-        payload = _with_cache_breakpoints(_claude_compatible_payload(payload))
-        request_body = (raw_body if raw_body is not None and payload is original
-                        else _json_bytes(payload))
         url_path = MESSAGES_PATH + ("?beta=true" if beta else "")
         relay_session = session_id or str(uuid.uuid4())
+        payload = _with_cache_breakpoints(_claude_compatible_payload(payload))
+        if not probe:
+            payload = _with_client_metadata(
+                payload, self._signer(alias).device_id, relay_session)
+        request_body = _json_bytes(payload)
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
         for attempt in range(2):
@@ -1742,19 +1761,19 @@ class Upstream:
                                   Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
                               session_id: str = "", beta: bool = False,
                               probe: bool = False,
-                              raw_body: Optional[bytes] = None,
     ) -> httpx.Response:
         """Open a streaming Anthropic Messages call; caller must aclose() it.
 
         Returns after upstream status/headers are known, so proxy rotation can
         still happen on connect failure; the body streams afterwards.
         """
-        original = payload
-        payload = _with_cache_breakpoints(_claude_compatible_payload(payload))
-        request_body = (raw_body if raw_body is not None and payload is original
-                        else _json_bytes(payload))
         url_path = MESSAGES_PATH + ("?beta=true" if beta else "")
         relay_session = session_id or str(uuid.uuid4())
+        payload = _with_cache_breakpoints(_claude_compatible_payload(payload))
+        if not probe:
+            payload = _with_client_metadata(
+                payload, self._signer(alias).device_id, relay_session)
+        request_body = _json_bytes(payload)
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
         for attempt in range(2):

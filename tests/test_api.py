@@ -19,8 +19,8 @@ from mirofish.errors import RelayError
 from mirofish.device import DEVICE_KEY_KIND
 from mirofish.translate import MAX_SSE_EVENT_BYTES
 from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, _DeviceTicket
-from tests.mirasim_protocol import (relay_metadata, signing_payload, unseal,
-                                    verify_signature)
+from tests.mirasim_protocol import (client_user_id, relay_metadata,
+                                    signing_payload, unseal, verify_signature)
 
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 
@@ -346,7 +346,9 @@ async def test_messages_preserves_beta_query_and_claude_fingerprint(
     assert response.status_code == 200
     sent = route.calls.last.request
     assert sent.url.query == b"beta=true"
-    assert sent.headers["user-agent"] == headers["user-agent"]
+    # The caller's own CLI version names the caller's box; upstream sees this
+    # installation's.
+    assert sent.headers["user-agent"] == "claude-cli/2.1.278 (external, mirasim)"
     assert sent.headers["x-stainless-package-version"] == "0.112.1"
     assert sent.headers["anthropic-beta"] == (
         "claude-code-20250219,mid-conversation-system-2026-04-07")
@@ -358,6 +360,9 @@ async def test_messages_preserves_beta_query_and_claude_fingerprint(
     assert expected != session_id
     assert metadata["x-mirasim-session"] == expected
     assert sent.headers["x-claude-code-session-id"] == expected
+    # The body names the same session and this account's own install.
+    assert json.loads(sent.content)["metadata"] == {
+        "user_id": client_user_id(state, "work", expected)}
     assert metadata["x-mirasim-agent"] == "claude"
     assert metadata["x-mirasim-locale"] == "zh-HK"
     assert sent.headers["authorization"] == "Bearer device-ticket"
@@ -607,8 +612,11 @@ async def test_stream_finalize_records_usage_even_when_stack_close_fails():
     ),
 ])
 @respx.mock
-async def test_complete_claude_code_payload_is_forwarded_unchanged(
+async def test_complete_claude_code_payload_keeps_its_shape_under_the_accounts_identity(
         client, state, auth_headers, model, betas):
+    """Only the caller's own identity is replaced: its install and session in
+    ``metadata.user_id`` and its CLI version; every other byte of the body
+    and every semantic header leave as the caller sent them."""
     add_account(state, "work")
     mock_device_session()
     route = respx.post(RELAY_BASE + "/v1/messages?beta=true").mock(
@@ -667,12 +675,13 @@ async def test_complete_claude_code_payload_is_forwarded_unchanged(
         await response.aread()
 
     sent = route.calls.last.request
-    assert sent.content == json.dumps(
-        payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    assert sent.headers["anthropic-beta"] == betas
-    assert sent.headers["user-agent"] == headers["user-agent"]
-    assert sent.headers["x-stainless-package-version"] == "0.112.1"
     expected = state.relay_session_id(session_id, "", {}, "work")
+    assert sent.content == json.dumps(
+        {**payload, "metadata": {"user_id": client_user_id(state, "work", expected)}},
+        ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    assert sent.headers["anthropic-beta"] == betas
+    assert sent.headers["user-agent"] == "claude-cli/2.1.278 (external, mirasim)"
+    assert sent.headers["x-stainless-package-version"] == "0.112.1"
     assert relay_metadata(sent)["x-mirasim-session"] == expected
     assert sent.headers["x-claude-code-session-id"] == expected
     assert sent.url.query == b"beta=true"
@@ -1016,6 +1025,30 @@ async def test_count_tokens_proxied(client, state, auth_headers):
         state.relay_session_id(count_session, "", {}, "work")
     assert route.calls.last.request.url.query == b"beta=true"
     verify_relay_signature(state, route.calls.last.request, "/v1/messages/count_tokens")
+    # A count carries no metadata unless the caller sent some: the count
+    # endpoint's acceptance of the field is not something to assume.
+    assert "metadata" not in sent
+
+
+@respx.mock
+async def test_count_tokens_rewrites_a_callers_metadata_per_account(
+        client, state, auth_headers):
+    add_account(state, "work")
+    mock_device_session()
+    route = respx.post(RELAY_BASE + "/v1/messages/count_tokens").mock(
+        return_value=httpx.Response(200, json={"input_tokens": 42}))
+    count_session = "6f1de6e1-1f3c-4a51-b8cd-0c1cb1c8f4d2"
+    headers = {**auth_headers, "X-Claude-Code-Session-Id": count_session}
+    response = await client.post("/v1/messages/count_tokens", headers=headers, json={
+        "model": "claude-haiku-4-5-20251001",
+        "metadata": {"user_id": json.dumps({
+            "device_id": "a" * 64, "account_uuid": "", "session_id": count_session})},
+        "messages": [{"role": "user", "content": "hi"}]})
+    assert response.status_code == 200
+    sent = json.loads(route.calls.last.request.content)
+    expected = state.relay_session_id(count_session, "", {}, "work")
+    assert sent["metadata"] == {"user_id": client_user_id(state, "work", expected)}
+    assert b"a" * 64 not in route.calls.last.request.content
 
 
 @respx.mock

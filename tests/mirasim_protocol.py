@@ -76,6 +76,18 @@ def relay_metadata(request: httpx.Request, path: str | None = None) -> dict[str,
     return fields
 
 
+def client_user_id(state, alias: str, session_id: str) -> str:
+    """The ``metadata.user_id`` Claude Code would emit from this account's
+    own installation: its install id (derived from the account's device),
+    no OAuth account, and the session the headers carry."""
+    device = state.upstream._signer(alias).device_id
+    return json.dumps({
+        "device_id": hashlib.sha256(device.encode("ascii")).hexdigest(),
+        "account_uuid": "",
+        "session_id": session_id,
+    }, separators=(",", ":"))
+
+
 def signing_payload(request: httpx.Request, path: str, credential: str,
                     fields: dict[str, str] | None = None) -> bytes:
     """Rebuild the ``mrs-sig-v2`` canonical record for ``request``."""

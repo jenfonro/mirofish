@@ -261,18 +261,20 @@ SDK system 标记时补一个独立兼容块；原 system 内容保留，官方�
   `MIROFISH_RELAY_BASE` 覆盖默认 relay 地址，通过
   `MIROFISH_MIRASIM_CLIENT_VERSION` 覆盖客户端版本标识，通过
   `MIROFISH_MIRASIM_LOCALE` 覆盖默认的 `zh-HK` locale。
-- 调用方自带 `claude-cli/...` User-Agent 时，其 SDK 指纹按抓包顺序原样透传。其他调用方
-  （OpenAI 兼容、第三方 SDK）会被补全为完整的官方指纹：`User-Agent`、`x-stainless-*`、
+- 所有调用方（含自带 `claude-cli/...` User-Agent 的 Claude Code）都会被改写为本安装
+  的官方指纹：`User-Agent`、`x-stainless-*`、
   `x-app: cli`、`accept-encoding: gzip, deflate, br, zstd`，并加上路由所需的
   `anthropic-beta: claude-code-20250219`；`x-claude-code-session-id` 与
   `x-mirasim-session` 取相同值，和官方客户端一致。指纹字段是整体覆盖而不是逐项补默认值，
   避免出现 `lang: python` 与 `runtime: node` 并存这种任何真实客户端都不会发出的组合；
   只有 `anthropic-version` 和 `anthropic-beta` 这两个会改变请求语义的选项保留调用方的值。
   `MIROFISH_CLAUDE_CLI_USER_AGENT` 可覆盖 User-Agent。
+  请求体的 `metadata.user_id` 同样按账号改写：`device_id` 由该账号的设备身份派生，
+  `session_id` 与上述会话头取相同值，调用方自己的安装 ID 和会话 ID 不会到达上游。
 - 设备身份按账号隔离：每个 alias 有自己的 Ed25519 密钥（惰性创建，可经
   `POST /api/accounts/<alias>/reset-device` 轮换）。机器层面的字段仍是全安装共用：
-  非 CLI 调用方统一补全为抓包中的
-  `arm64 / MacOS` Claude CLI 组合；真实 `claude-cli/...` 调用方的 arch / os 原样保留。
+  所有调用方统一改写为抓包中的
+  `arm64 / MacOS` Claude CLI 组合；真实 `claude-cli/...` 调用方的 arch / os 同样不保留。
   `x-mirasim-device` 是该账号公钥派生的 22 字符设备 ID，签名与（旧版标识下的）无签名降级发出的是同一个值；
   降级路径不会改用形状不同的替代标识，否则单看这个字段就能区分两条路径。
 - 桌面端后台整机行为由 `mirofish/behavior.py` 重放：gzipped `/events` 遥测、

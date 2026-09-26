@@ -59,6 +59,7 @@ _SAFE_HEADER_EXACT_VALUES = {
     "user-agent": frozenset({
         "claude-cli/2.1.241 (external, mirasim)",
         "claude-cli/2.1.261 (external, mirasim)",
+        "claude-cli/2.1.278 (external, mirasim)",
         "mirasim-desktop/0.0.228",
         "mirasim-desktop/0.0.303",
         "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
