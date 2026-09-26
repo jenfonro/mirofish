@@ -89,7 +89,11 @@ async def test_codex_compressed_body_is_decompressed_then_signed_verbatim(
     metadata = relay_metadata(request)
     assert metadata["x-mirasim-agent"] == "codex"
     assert metadata["x-mirasim-account"] == "u-work"
-    assert request.headers["originator"] == "mirasim"
+    assert request.headers["originator"] == "@mirasim/kernel"
+    # The kernel's provider header leads every bundled-Codex request; a
+    # caller never supplies it.
+    assert list(request.headers.keys())[0] == "x-openai-actor-authorization"
+    assert request.headers["x-openai-actor-authorization"] == "mirasim"
     assert uuid.UUID(metadata["x-mirasim-session"]).version == 4
     assert "content-encoding" not in request.headers
     assert "content-digest" not in request.headers

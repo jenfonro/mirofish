@@ -15,7 +15,8 @@ import pytest
 import respx
 
 from mirofish.config import DEFAULT_CODEX_USER_AGENT
-from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, LIMITS_PATH
+from mirofish.upstream import (CLAUDE_AGENT_SYSTEM_MARKER, LIMITS_PATH,
+                               forwarded_codex_headers)
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 from tests.mirasim_protocol import client_user_id, relay_metadata, verify_signature
 from tests.test_request_profile import _body as captured_messages_body
@@ -647,7 +648,8 @@ async def test_codex_relay_request_matches_the_official_capture(state):
     assert "cookie" not in first.headers
     _assert_matches_golden(second, "codex_responses_official.json")
     assert second.headers["user-agent"] == DEFAULT_CODEX_USER_AGENT
-    assert second.headers["originator"] == "mirasim"
+    assert second.headers["originator"] == "@mirasim/kernel"
+    assert list(second.headers.keys())[0] == "x-openai-actor-authorization"
     assert second.headers["authorization"] == "Bearer device-ticket"
     for name in ("openai-beta", "accept-encoding"):
         assert name not in second.headers
@@ -659,3 +661,36 @@ async def test_codex_relay_request_matches_the_official_capture(state):
     assert "codex-caller-secret" not in second.headers.values()
     assert second.content == body
     _verify_signature(state, second, "/v1/responses", alias=alias)
+
+
+def test_codex_credential_lands_behind_the_callers_fields_as_the_desktop_puts_it():
+    """Codex 0.155.1 emits the credential ahead of ``originator`` and
+    ``user-agent`` (driven with the 0.0.367 kernel's initialize params against
+    a local sink), while the capture shows it behind them: the desktop deletes
+    the caller's credential and assigns its own, which is last in JS key
+    order.  The kernel's provider header leads, and a caller's copy of it is
+    never trusted."""
+    caller = [
+        ("x-openai-actor-authorization", "caller-spoof"),
+        ("x-codex-beta-features", "remote_compaction_v2"),
+        ("x-codex-window-id", "0f20cf48-c292-42e9-a99e-994511307deb:0"),
+        ("session-id", "0f20cf48-c292-42e9-a99e-994511307deb"),
+        ("accept", "text/event-stream"),
+        ("content-type", "application/json"),
+        ("authorization", "Bearer caller-secret"),
+        ("originator", "codex_cli_rs"),
+        ("user-agent", "codex_cli_rs/0.155.1 (Linux 6.1; x86_64) unknown"),
+    ]
+
+    wire = forwarded_codex_headers(httpx.Headers(caller), DEFAULT_CODEX_USER_AGENT)
+
+    assert [name for name, _ in wire] == [
+        "x-openai-actor-authorization", "x-codex-beta-features",
+        "x-codex-window-id", "session-id", "accept", "content-type",
+        "originator", "user-agent", "authorization"]
+    assert dict(wire)["x-openai-actor-authorization"] == "mirasim"
+    assert dict(wire)["originator"] == "@mirasim/kernel"
+    assert dict(wire)["user-agent"] == DEFAULT_CODEX_USER_AGENT
+    assert dict(wire)["authorization"] == ""
+    assert "caller-secret" not in dict(wire).values()
+    assert "caller-spoof" not in dict(wire).values()

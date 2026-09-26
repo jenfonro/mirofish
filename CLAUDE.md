@@ -61,9 +61,11 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   probe keeps the capitalized `Authorization` of the desktop's probe object. The Codex path leaves
   the relay as the Codex the desktop launches would send it: caller protocol headers (`x-codex-*`,
   `session-id`, `thread-id`, `chatgpt-account-id`) pass through in order, `user-agent` is replaced
-  by `MIROFISH_CODEX_USER_AGENT` (the captured `mirasim/... (Mac OS ...; arm64) ...` string, version
-  floated to the Codex installed beside the current desktop) and `originator` by
-  `mirasim`, `openai-beta`/`accept-encoding` are dropped, caller cookies are stripped, and the
+  by `MIROFISH_CODEX_USER_AGENT` (`@mirasim/kernel/<codex version> (Mac OS ...; arm64) ...
+  (@mirasim/kernel; 0.1.0)`: the name the 0.0.367 kernel gives Codex at initialize, verified by
+  driving the installed Codex 0.155.1 against a local sink) and `originator` by
+  `@mirasim/kernel`, the kernel's provider header `x-openai-actor-authorization: mirasim` is put
+  first, `openai-beta`/`accept-encoding` are dropped, caller cookies are stripped, and the
   Cloudflare cookies the relay host sets are replayed from a per-(account, exit) `httpx.Cookies`
   jar placed just before `authorization` (RFC 6265 scoping applies, so a `Domain=chatgpt.com`
   cookie is never replayed; the Claude path sends no cookies, matching Node's fetch).

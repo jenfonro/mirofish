@@ -144,9 +144,16 @@ _BODY_INTEGRITY_REQUEST_HEADERS = {
 # it; see forwarded_codex_headers.
 _MIRASIM_HEADER_PREFIX = "x-mirasim-"
 _RELAY_OWNED_REQUEST_HEADERS = {"cookie", "cookie2"}
-# Every observed official Codex request reaches the relay with this exact
-# originator, so pin it rather than trusting whatever the local caller sends.
-_CODEX_ORIGINATOR = "mirasim"
+# The 0.0.367 kernel initialises the bundled Codex app-server with
+# clientInfo ``@mirasim/kernel``; Codex 0.155.1 uses that name as its
+# originator (verified by driving the installed binary against a local sink
+# with the kernel's own initialize params), so pin it rather than trusting
+# whatever the local caller sends.
+_CODEX_ORIGINATOR = "@mirasim/kernel"
+# The kernel also configures the provider with this ``http_headers`` entry,
+# which Codex emits ahead of every other field; a stand-alone Codex never
+# sends it.
+_CODEX_ACTOR_AUTHORIZATION = ("x-openai-actor-authorization", "mirasim")
 # Fields a stand-alone Codex CLI adds that the desktop's bundled Codex does
 # not put on the wire (0.0.272 capture).  ``accept-encoding`` only affects
 # what comes back, and the relay streams whatever the upstream sends either
@@ -247,10 +254,12 @@ def forwarded_codex_headers(
 
     The desktop MITM uses a blocklist, not a fixed allowlist: Codex frequently
     adds routing and beta headers, and dropping a new one can change the request.
-    Authentication and hop-by-hop fields are always rebuilt locally.  The
-    caller's ``user-agent`` is replaced by ``user_agent`` when given: the
-    desktop's bundled Codex identifies as the product, and a stand-alone
-    ``codex_cli_rs/...`` string would name a client the upstream never sees.
+    Authentication and hop-by-hop fields are always rebuilt locally, the
+    credential landing after every caller field as the desktop's delete-and-
+    reassign puts it.  The caller's ``user-agent`` is replaced by
+    ``user_agent`` when given: the desktop's bundled Codex identifies by the
+    kernel's client name, and a stand-alone ``codex_cli_rs/...`` string would
+    name a client the upstream never sees.
 
     Two namespaces are refused outright even though the desktop forwards them.
     ``x-mirasim-*`` belongs to the relay's own signing envelope: the desktop
@@ -271,22 +280,16 @@ def forwarded_codex_headers(
     positions: dict[str, int] = {}
     for raw_name, raw_value in pairs:
         name = raw_name.lower()
-        if name in {"authorization", "x-api-key"}:
-            # Keep the first credential field's object-order slot without ever
-            # retaining its value.  Assigning a replacement to an existing JS
-            # object key does not move it; the desktop MITM has the same shape.
-            if "authorization" not in positions:
-                positions["authorization"] = len(forwarded)
-                forwarded.append(("authorization", ""))
-            continue
-        if name in _HOP_BY_HOP_REQUEST_HEADERS or name in connection_fields \
+        if name in {"authorization", "x-api-key"} \
+                or name in _HOP_BY_HOP_REQUEST_HEADERS or name in connection_fields \
                 or name in _LOCAL_REQUEST_HEADERS \
                 or name in _BODY_INTEGRITY_REQUEST_HEADERS \
                 or name in _RELAY_OWNED_REQUEST_HEADERS \
                 or name.startswith("x-forwarded-") \
                 or name == "forwarded" or name.startswith("x-mirofish-") \
                 or name.startswith(_MIRASIM_HEADER_PREFIX) \
-                or name in _CODEX_DROPPED_REQUEST_HEADERS:
+                or name in _CODEX_DROPPED_REQUEST_HEADERS \
+                or name == _CODEX_ACTOR_AUTHORIZATION[0]:
             continue
         value = raw_value.strip()
         if not value or len(value) > 16384 or any(char in value for char in "\r\n\0"):
@@ -303,6 +306,12 @@ def forwarded_codex_headers(
                          if name.lower() == "content-type"), "")
     if content_type.partition(";")[0].strip().lower() != "application/json":
         _set_ordered_header(forwarded, "content-type", "application/json")
+    forwarded.insert(0, _CODEX_ACTOR_AUTHORIZATION)
+    # The desktop deletes the caller's credential fields and then assigns its
+    # own, which puts ``authorization`` after every caller field: Codex sends
+    # it ahead of ``originator``/``user-agent``, the upstream sees it behind
+    # them.  The value is assigned in place by the relay envelope.
+    forwarded.append(("authorization", ""))
     _place_before_authorization(forwarded, "originator", _CODEX_ORIGINATOR)
     if user_agent:
         _place_before_authorization(forwarded, "user-agent", user_agent)

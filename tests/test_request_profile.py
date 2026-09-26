@@ -27,11 +27,13 @@ OFFICIAL_FIXTURE_NAMES = {
     "models_official.json",
     "codex_responses_official.json",
 }
-#: The 0.0.272 capture's Codex identity: the desktop's bundled Codex names the
-#: product, not ``codex_cli_rs``, and carries one conversation id in three
-#: header slots.
+#: The desktop's bundled Codex identity: it names the kernel's client name,
+#: not ``codex_cli_rs``, and carries one conversation id in three header
+#: slots.  Verified against Codex 0.155.1 driven with the 0.0.367 kernel's
+#: initialize params.
 CODEX_USER_AGENT = (
-    "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
+    "@mirasim/kernel/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 "
+    "(@mirasim/kernel; 0.1.0)")
 CODEX_CONVERSATION = "c10482cc-6726-48fc-a4e8-965da883d620"
 
 
@@ -184,8 +186,9 @@ def _codex_wire_headers(body: bytes) -> list[tuple[str, str]]:
     """The same request as the relay puts it on the wire."""
     caller = codex_caller_headers(
         authorization="Bearer synthetic-device-ticket",
-        user_agent=CODEX_USER_AGENT, originator="mirasim")
+        user_agent=CODEX_USER_AGENT, originator="@mirasim/kernel")
     return [
+        ("x-openai-actor-authorization", "mirasim"),
         *caller[:-1],
         ("cookie", "__cflb=synthetic-lb; _cfuvid=synthetic-uvid; __cf_bm=synthetic-bm"),
         caller[-1],

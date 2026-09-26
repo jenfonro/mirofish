@@ -77,13 +77,16 @@ DEFAULT_MIRASIM_CLIENT_VERSION = "0.0.367"
 # deployment can present another host.
 DEFAULT_MIRASIM_OS_PLATFORM = "darwin"
 DEFAULT_MIRASIM_OS_ARCH = "arm64"
-# The desktop's Codex binary identifies itself as the product, not as
-# ``codex_cli_rs``.  Since 0.0.303 Codex is no longer bundled either, so the
-# version floats with the locally installed binary while the OS/terminal
-# parts stay as captured; this value is the build installed beside the
-# 0.0.367 desktop, on the arm64 Mac the rest of the fingerprint describes.
+# The desktop's Codex binary identifies itself by the name the kernel gives
+# it at initialize (``@mirasim/kernel`` since 0.0.367; ``mirasim`` before),
+# not as ``codex_cli_rs``: originator prefix and the client suffix are both
+# that name.  Since 0.0.303 Codex is no longer bundled, so the version floats
+# with the locally installed binary while the OS/terminal parts stay as
+# captured; this value is the 0.155.1 build installed beside the 0.0.367
+# desktop, on the arm64 Mac the rest of the fingerprint describes.
 DEFAULT_CODEX_USER_AGENT = (
-    "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
+    "@mirasim/kernel/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 "
+    "(@mirasim/kernel; 0.1.0)")
 
 
 @dataclass
