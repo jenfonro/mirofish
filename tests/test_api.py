@@ -1375,7 +1375,7 @@ async def test_all_limits_survives_one_failure(client, state, auth_headers):
         httpx.Response(200, json=LIMITS_RESPONSE),
         httpx.Response(403, json={"error": {"message": "nope"}}),
     ])
-    response = await client.get("/api/limits", headers=auth_headers)
+    response = await client.get("/api/limits?refresh=1", headers=auth_headers)
     assert response.status_code == 200
     results = {r["alias"]: r for r in response.json()["accounts"]}
     assert results["alpha"]["ok"] != results["beta"]["ok"]

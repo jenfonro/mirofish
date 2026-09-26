@@ -501,6 +501,25 @@ class AccountService:
         self.store.update_metadata(alias, metadata)
         return limits
 
+    def cached_limits_entry(self, alias: str) -> dict[str, Any]:
+        """One account's limits as its last read left them — no upstream contact.
+
+        Shaped like one live read in a batch: a parked account reports the
+        refusal that parked it, as reading it now would, and the fable split
+        is recounted from the local usage log so it stays current between
+        reads.
+        """
+        metadata = json.loads(self.store.row(alias)["metadata_json"])
+        if metadata.get("parked"):
+            return {"alias": alias, "ok": False,
+                    "error": metadata.get("parked_reason") or "account is parked",
+                    "status": metadata.get("parked_status")}
+        limits = metadata.get("limits")
+        if not isinstance(limits, dict):
+            return {"alias": alias, "ok": False, "error": "limits not read yet"}
+        self._attach_fable_split(alias, limits)
+        return {"alias": alias, "ok": True, "limits": limits}
+
     def _attach_fable_split(self, alias: str, limits: dict[str, Any]) -> None:
         """Break the shared fable window down per model, in place.
 

@@ -151,7 +151,7 @@ async function reloadUsage() {
 
 async function reloadLimits() {
   try {
-    await loadLimits();
+    await loadLimits(true);
   } catch (e: any) {
     toast(`刷新额度失败：${e.message}`, "error");
   }
@@ -282,7 +282,8 @@ onMounted(() => {
       <h3>用量额度</h3>
       <span class="chip">上游 /v1/limits · 零消耗</span>
       <span class="spacer"></span>
-      <button class="btn ghost sm" :disabled="store.limitsLoading" @click="reloadLimits">
+      <button class="btn ghost sm" :disabled="store.limitsLoading" @click="reloadLimits"
+              title="实时读取启用中的账号；停用账号显示上次读取的结果">
         {{ store.limitsLoading ? "读取中…" : "刷新" }}
       </button>
     </div>

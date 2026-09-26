@@ -83,16 +83,23 @@ URGENCY_HORIZON_HOURS = 48.0
 # an upstream round-trip in front of every new conversation. The probe costs
 # no model tokens, and stale numbers only ever cost one extra attempt, since
 # the upstream 429 plus failover is what actually stops a request.
+# The sweep wakes every LIMITS_REFRESH_SECONDS, but re-reads an account only
+# once its last read — or last attempt, failed or not — is LIMITS_CACHE_SECONDS
+# old, so an idle account costs one read an hour and a manual refresh resets
+# its clock. A window whose reset time has passed stops counting as load on
+# its own (_window_utilization), so a long cache never benches a refilled one.
 LIMITS_REFRESH_SECONDS = 300.0
+LIMITS_CACHE_SECONDS = 3600.0
 # Subscription profiles (plan tier, expiry, holder name) change on the scale
 # of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
 # an account whose stored profile is missing (pre-upgrade rows) or a day old.
 PROFILE_REFRESH_SECONDS = 86400.0
-# A parked account (upstream answered a real 401: revoked or banned
-# credentials) stays out of scheduling until a probe shows /auth/me accepting
-# it again. Re-probing is deliberately slow: a revocation lifts on
-# human/upstream timescales, and every probe costs an upstream round trip.
-PARK_PROBE_SECONDS = 1800.0
+# A parked account (the upstream refused the account itself: a real 401 or a
+# 403 suspension) stays out of scheduling until its recovery probe succeeds.
+# Re-probing is deliberately slow — a ban or revocation lifts on human/upstream
+# timescales, and every probe costs an upstream round trip — and matches the
+# hourly limits refresh.
+PARK_PROBE_SECONDS = 3600.0
 # httpx response extension used to carry the account generation from request
 # start to stream finalization. This keeps an in-flight old-account response
 # from being logged under a newly re-used alias.
@@ -126,6 +133,9 @@ class AppState:
         # Transient account-wide refusals only. Spent windows are persisted
         # separately so neither a restart nor a lagging limits read lifts them.
         self._exhausted_until: dict[str, float] = {}
+        # Last background limits attempt per account (success or failure), so
+        # a failing read waits out the cache interval instead of every sweep.
+        self._limits_attempted: dict[str, float] = {}
         self._limits_task: Optional[asyncio.Task[None]] = None
         self._limits_wake: Optional[asyncio.Event] = None
         self.behavior = BehaviorReplayer(self)
@@ -139,17 +149,20 @@ class AppState:
     # --- background limits refresh -------------------------------------------
 
     async def refresh_all_limits(self) -> None:
-        """Re-probe every selectable account's usage windows, one failure at a
-        time.
+        """Re-read the usage windows of every selectable account whose cache
+        is LIMITS_CACHE_SECONDS old, one failure at a time.
 
         Scheduling only reads these numbers, so an account that cannot be
         probed keeps its previous values instead of dropping out of the
-        ordering. Accounts switched off in the panel are skipped: they never
-        take part in automatic selection, so keeping their windows warm would
-        contact the upstream for nothing. Parked accounts get no limits/profile
-        refresh either — only the low-frequency recovery probe below.
+        ordering. An account read within the interval — by a manual refresh,
+        or by its own last attempt — is left alone. Accounts switched off in
+        the panel are skipped: they never take part in automatic selection, so
+        keeping their windows warm would contact the upstream for nothing.
+        Parked accounts get no limits/profile refresh either — only the
+        low-frequency recovery probe below.
         """
         async def one(alias: str) -> None:
+            self._limits_attempted[alias] = time.time()
             try:
                 await self.with_proxy(
                     alias, lambda url: self.accounts.fetch_limits(alias, proxy_url=url))
@@ -167,12 +180,27 @@ class AppState:
         for alias in self.store.aliases():
             if self.account_disabled(alias):
                 continue
-            (parked if self.account_parked(alias) else serviceable).append(alias)
+            if self.account_parked(alias):
+                parked.append(alias)
+            elif self._limits_due(alias):
+                serviceable.append(alias)
         probes = [self._probe_parked(alias) for alias in parked
                   if self._park_probe_due(alias)]
         if serviceable or probes:
             await asyncio.gather(
                 *(one(alias) for alias in serviceable), *probes)
+
+    def _limits_due(self, alias: str) -> bool:
+        """True when an account's windows were never read, or were last read
+        or last attempted LIMITS_CACHE_SECONDS ago."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except Exception:  # noqa: BLE001 - racing a concurrent account removal
+            return False
+        last = max((epoch for epoch in (
+            self._metadata_epoch(metadata, "limits_checked_at"),
+            self._limits_attempted.get(alias)) if epoch is not None), default=None)
+        return last is None or time.time() - last >= LIMITS_CACHE_SECONDS
 
     def _park_probe_due(self, alias: str) -> bool:
         """True when a parked account is due for its next recovery probe:
@@ -893,6 +921,7 @@ class AppState:
             self._last_assigned.pop(alias, None)
         self.model_cache.pop(alias, None)
         self._exhausted_until.pop(alias, None)
+        self._limits_attempted.pop(alias, None)
 
     def remove_account(self, alias: str) -> None:
         """Remove an account and every in-memory identity derived from it."""

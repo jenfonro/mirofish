@@ -65,13 +65,26 @@ async def account_limits(alias: str, request: Request) -> dict[str, Any]:
 
 
 @router.get("/api/limits")
-async def all_limits(request: Request) -> dict[str, Any]:
-    """Fetch usage limits for every account concurrently (zero model cost)."""
+async def all_limits(request: Request,
+                     refresh: Optional[str] = None) -> dict[str, Any]:
+    """Usage limits for every account.
+
+    Page loads call this, so by default it contacts no upstream at all: each
+    account's windows are what its last read stored — the hourly background
+    refresh, a manual refresh, or a recovery probe. ``refresh=1`` is the
+    panel's refresh button: a live read of the enabled accounts, concurrently
+    and at zero model cost. A disabled account keeps its cached entry — it
+    takes no part in scheduling, so re-reading it would contact the upstream
+    for nothing; its own drawer can still read it on demand.
+    """
     state = get_state(request)
     aliases = state.store.aliases()
+    live = refresh in ("1", "true")
 
     async def one(alias: str) -> dict[str, Any]:
         try:
+            if not live or state.account_disabled(alias):
+                return state.accounts.cached_limits_entry(alias)
             limits = await state.with_proxy(
                 alias, lambda url: state.accounts.fetch_limits(alias, proxy_url=url))
             return {"alias": alias, "ok": True, "limits": limits}

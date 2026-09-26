@@ -48,11 +48,12 @@ export async function loadUsage(hours = 24): Promise<void> {
   store.usage = await api<UsageSummary>(`/api/usage?hours=${hours}`);
 }
 
-/** Live per-window usage limits for every account (zero model cost). */
-export async function loadLimits(): Promise<void> {
+/** Per-window usage limits for every account. Page loads read the relay's
+ *  cache (no upstream contact); ``refresh`` re-reads the enabled accounts live. */
+export async function loadLimits(refresh = false): Promise<void> {
   store.limitsLoading = true;
   try {
-    store.limits = await api<LimitsSummary>("/api/limits");
+    store.limits = await api<LimitsSummary>(refresh ? "/api/limits?refresh=1" : "/api/limits");
   } finally {
     store.limitsLoading = false;
   }
