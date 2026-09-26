@@ -84,12 +84,21 @@ URGENCY_HORIZON_HOURS = 48.0
 # no model tokens, and stale numbers only ever cost one extra attempt, since
 # the upstream 429 plus failover is what actually stops a request.
 # The sweep wakes every LIMITS_REFRESH_SECONDS, but re-reads an account only
-# once its last read — or last attempt, failed or not — is LIMITS_CACHE_SECONDS
-# old, so an idle account costs one read an hour and a manual refresh resets
-# its clock. A window whose reset time has passed stops counting as load on
-# its own (_window_utilization), so a long cache never benches a refilled one.
+# once it is idle and its data stale: its last read, last attempt (failed or
+# not) and last model call are all LIMITS_CACHE_SECONDS old. So an idle account
+# costs one read an hour, a manual refresh resets its clock, and an account in
+# use is never read in the background — its account-scoped 429 asks for the
+# read instead (REFUSAL_REFRESH_MIN_AGE). A window whose reset time has passed
+# stops counting as load on its own (_window_utilization), so a long cache
+# never benches a refilled one.
 LIMITS_REFRESH_SECONDS = 300.0
 LIMITS_CACHE_SECONDS = 3600.0
+# However long the cache, a spent window can go unseen until the upstream says
+# so. An account-scoped 429 therefore re-reads that account at once, so the
+# scheduler learns which window is spent, or that the account is out
+# altogether, instead of waiting out the cache. Refusals that arrive before
+# the read collapse into it, and a read or attempt this recent already answers.
+REFUSAL_REFRESH_MIN_AGE = 60.0
 # Subscription profiles (plan tier, expiry, holder name) change on the scale
 # of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
 # an account whose stored profile is missing (pre-upgrade rows) or a day old.
@@ -136,6 +145,11 @@ class AppState:
         # Last background limits attempt per account (success or failure), so
         # a failing read waits out the cache interval instead of every sweep.
         self._limits_attempted: dict[str, float] = {}
+        # Last model call handed to each account: an account in use is left to
+        # its 429s rather than read in the background.
+        self._last_called: dict[str, float] = {}
+        # Accounts an upstream 429 asked the next sweep to re-read at once.
+        self._limits_forced: set[str] = set()
         self._limits_task: Optional[asyncio.Task[None]] = None
         self._limits_wake: Optional[asyncio.Event] = None
         self.behavior = BehaviorReplayer(self)
@@ -149,17 +163,18 @@ class AppState:
     # --- background limits refresh -------------------------------------------
 
     async def refresh_all_limits(self) -> None:
-        """Re-read the usage windows of every selectable account whose cache
-        is LIMITS_CACHE_SECONDS old, one failure at a time.
+        """Re-read the usage windows of every selectable account that is idle
+        with a stale cache (_limits_due), or that a 429 just asked to be read,
+        one failure at a time.
 
         Scheduling only reads these numbers, so an account that cannot be
         probed keeps its previous values instead of dropping out of the
         ordering. An account read within the interval — by a manual refresh,
-        or by its own last attempt — is left alone. Accounts switched off in
-        the panel are skipped: they never take part in automatic selection, so
-        keeping their windows warm would contact the upstream for nothing.
-        Parked accounts get no limits/profile refresh either — only the
-        low-frequency recovery probe below.
+        or by its own last attempt — or called within it is left alone.
+        Accounts switched off in the panel are skipped: they never take part
+        in automatic selection, so keeping their windows warm would contact
+        the upstream for nothing. Parked accounts get no limits/profile
+        refresh either — only the low-frequency recovery probe below.
         """
         async def one(alias: str) -> None:
             self._limits_attempted[alias] = time.time()
@@ -177,12 +192,13 @@ class AppState:
                 logger.debug("profile refresh failed: account=%s %s", alias, exc)
 
         serviceable, parked = [], []
+        forced, self._limits_forced = self._limits_forced, set()
         for alias in self.store.aliases():
             if self.account_disabled(alias):
                 continue
             if self.account_parked(alias):
                 parked.append(alias)
-            elif self._limits_due(alias):
+            elif alias in forced or self._limits_due(alias):
                 serviceable.append(alias)
         probes = [self._probe_parked(alias) for alias in parked
                   if self._park_probe_due(alias)]
@@ -191,16 +207,33 @@ class AppState:
                 *(one(alias) for alias in serviceable), *probes)
 
     def _limits_due(self, alias: str) -> bool:
-        """True when an account's windows were never read, or were last read
-        or last attempted LIMITS_CACHE_SECONDS ago."""
+        """True when an account is idle and its windows stale: never read, or
+        its last read, last attempt and last model call are all
+        LIMITS_CACHE_SECONDS ago."""
         try:
             metadata = json.loads(self.store.row(alias)["metadata_json"])
         except Exception:  # noqa: BLE001 - racing a concurrent account removal
             return False
         last = max((epoch for epoch in (
             self._metadata_epoch(metadata, "limits_checked_at"),
-            self._limits_attempted.get(alias)) if epoch is not None), default=None)
+            self._limits_attempted.get(alias),
+            self._last_called.get(alias)) if epoch is not None), default=None)
         return last is None or time.time() - last >= LIMITS_CACHE_SECONDS
+
+    def refresh_limits_after_refusal(self, alias: str) -> None:
+        """Have the sweep re-read an account the upstream just refused with an
+        account-scoped 429 (REFUSAL_REFRESH_MIN_AGE), waking it now."""
+        try:
+            metadata = json.loads(self.store.row(alias)["metadata_json"])
+        except RelayError:
+            return
+        recent = max((epoch for epoch in (
+            self._metadata_epoch(metadata, "limits_checked_at"),
+            self._limits_attempted.get(alias)) if epoch is not None), default=None)
+        if recent is not None and time.time() - recent < REFUSAL_REFRESH_MIN_AGE:
+            return
+        self._limits_forced.add(alias)
+        self.kick_limits_refresh()
 
     def _park_probe_due(self, alias: str) -> bool:
         """True when a parked account is due for its next recovery probe:
@@ -922,6 +955,8 @@ class AppState:
         self.model_cache.pop(alias, None)
         self._exhausted_until.pop(alias, None)
         self._limits_attempted.pop(alias, None)
+        self._last_called.pop(alias, None)
+        self._limits_forced.discard(alias)
 
     def remove_account(self, alias: str) -> None:
         """Remove an account and every in-memory identity derived from it."""
@@ -968,6 +1003,7 @@ class AppState:
         on refusals that park the account (a real 401, a 403 suspension): the
         request moves on to the next eligible account instead of answering
         the caller with a refusal another account would not give.
+        An account-scoped 429 also has that account's limits re-read at once.
 
         An explicitly requested account is never substituted.
         """
@@ -984,6 +1020,7 @@ class AppState:
                 raise last if last is not None else RelayError(
                     "account selection returned an already-failed account", 500)
             generation = self.store.account_generation(account)
+            self._last_called[account] = time.time()
             try:
                 return account, await run(account)
             except RelayError as exc:
@@ -993,8 +1030,11 @@ class AppState:
                     raise exc  # the account was removed during the request
                 if current_generation != generation:
                     raise  # do not persist the old account's refusal on its replacement
-                if not (self.maybe_park_account(account, exc)
-                        or self.note_account_unserviceable(account, exc)) or requested:
+                parked = self.maybe_park_account(account, exc)
+                spent = not parked and self.note_account_unserviceable(account, exc)
+                if spent:
+                    self.refresh_limits_after_refusal(account)
+                if not (parked or spent) or requested:
                     raise
                 tried.add(account)
                 last = exc

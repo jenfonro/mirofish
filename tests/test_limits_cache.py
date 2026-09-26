@@ -22,6 +22,9 @@ from tests.test_api import mock_device_session
 SUSPENDED_BODY = {"type": "error", "error": {
     "type": "permission_error",
     "message": "this account is suspended; contact support"}}
+RATE_LIMITED = {"error": {"type": "rate_limit_error", "message": "rate limit exceeded"}}
+OPUS = "claude-opus-5"
+FABLE = "claude-fable-5-1"
 
 
 def limits_body():
@@ -114,10 +117,10 @@ async def test_the_sweep_reads_each_account_at_most_once_an_hour(state, clock, r
     clock[0] = start + 1800
     await state.accounts.fetch_limits("a")
     calls.clear()
-    clock[0] = start + 3600
+    clock[0] = start + 3601
     await state.refresh_all_limits()
     assert calls == ["b"]
-    clock[0] = start + 5400
+    clock[0] = start + 5401
     await state.refresh_all_limits()
     assert calls == ["b", "a"]
 
@@ -132,7 +135,7 @@ async def test_a_failed_background_read_waits_the_hour_too(state, clock, reads):
     clock[0] = start + 300
     await state.refresh_all_limits()
     assert calls == ["flaky"]
-    clock[0] = start + 3600
+    clock[0] = start + 3601
     await state.refresh_all_limits()
     assert calls == ["flaky", "flaky"]
 
@@ -157,5 +160,87 @@ def test_a_ban_recovery_probe_waits_an_hour(state, clock):
     start = clock[0]
     clock[0] = start + 1800
     assert not state._park_probe_due("work")
-    clock[0] = start + 3600
+    clock[0] = start + 3601
     assert state._park_probe_due("work")
+
+
+async def test_an_account_in_use_is_left_to_its_429s(state, clock, reads):
+    """The hourly read is for stale data on an idle account; one in use is
+    never read in the background."""
+    calls, _ = reads
+    add_account(state, "busy")
+    start = clock[0]
+    await state.refresh_all_limits()
+
+    async def upstream(alias):
+        return "ok"
+
+    for offset in (1800, 3000):
+        clock[0] = start + offset
+        await state.with_account_failover("", "", {"model": OPUS}, upstream)
+    for offset in (3600, 6599):
+        clock[0] = start + offset
+        await state.refresh_all_limits()
+    assert calls == ["busy"]
+    clock[0] = start + 6601  # an hour idle since its last call
+    await state.refresh_all_limits()
+    assert calls == ["busy", "busy"]
+
+
+async def test_a_429_has_the_refused_account_read_at_once(state, clock, monkeypatch):
+    for alias in ("a", "b"):
+        add_account(state, alias)
+    read = []
+
+    async def limits(alias, proxy_url=None):
+        read.append(alias)
+        return 200, {}, {"windows": [{"name": "7d_fable", "used": 100.0,
+                                      "budget": 100.0, "reset_at": clock[0] + 7200}]}
+
+    monkeypatch.setattr(state.upstream, "limits", limits)
+    kicks = []
+    monkeypatch.setattr(state, "kick_limits_refresh", lambda: kicks.append(1))
+    calls = []
+
+    async def upstream(alias):
+        calls.append(alias)
+        if len(calls) == 1:
+            raise RelayError("model request rejected", 429, RATE_LIMITED)
+        return "served"
+
+    account, result = await state.with_account_failover(
+        "", "conversation", {"model": FABLE}, upstream)
+    refused = calls[0]
+    assert result == "served" and account != refused
+    assert kicks, "the sweep was not woken"
+    # A second refusal before the read collapses into the same read, and the
+    # healthy account, in use, is not read at all.
+    state.refresh_limits_after_refusal(refused)
+    await state.refresh_all_limits()
+    assert read == [refused]
+    # A read this recent already answers the next refusal.
+    kicks.clear()
+    state.refresh_limits_after_refusal(refused)
+    assert not kicks and not state._limits_forced
+    # The read tells scheduling which window is spent; other models still work.
+    clock[0] += 61
+    assert state.route_account("", "", {"model": FABLE}) == account
+    assert state.route_account(refused, "", {"model": OPUS}) == refused
+
+
+async def test_a_429_read_that_finds_a_ban_takes_the_account_out(
+        state, clock, monkeypatch):
+    add_account(state, "work")
+    monkeypatch.setattr(state.upstream, "limits",
+                        AsyncMock(return_value=(403, {}, SUSPENDED_BODY)))
+
+    async def upstream(alias):
+        raise RelayError("model request rejected", 429, RATE_LIMITED)
+
+    with pytest.raises(RelayError):
+        await state.with_account_failover("", "", {"model": OPUS}, upstream)
+    await state.refresh_all_limits()
+    assert state.account_parked("work")
+    with pytest.raises(RelayError) as local:
+        state.route_account("", "", {"model": OPUS})
+    assert local.value.status == 503
