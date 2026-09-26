@@ -27,13 +27,11 @@ OFFICIAL_FIXTURE_NAMES = {
     "models_official.json",
     "codex_responses_official.json",
 }
-#: The desktop's bundled Codex identity: it names the kernel's client name,
-#: not ``codex_cli_rs``, and carries one conversation id in three header
-#: slots.  Verified against Codex 0.155.1 driven with the 0.0.367 kernel's
-#: initialize params.
+#: The desktop's bundled Codex identity: it names the product, not
+#: ``codex_cli_rs``, and carries one conversation id in three header slots.
+#: 0.0.272 capture, re-confirmed on a live 0.0.367 session with Codex 0.155.1.
 CODEX_USER_AGENT = (
-    "@mirasim/kernel/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 "
-    "(@mirasim/kernel; 0.1.0)")
+    "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)")
 CODEX_CONVERSATION = "c10482cc-6726-48fc-a4e8-965da883d620"
 
 
@@ -73,7 +71,9 @@ def _body(secret: str = "body text must disappear") -> bytes:
         {"role": "user", "content": [cached(*blocks("text"))]},
         {"role": "system", "content": secret},
     ]
-    system = blocks("text", "text", "text")
+    system = [{"type": "text", "text": "x-anthropic-billing-header: "
+                                        "cc_version=2.1.278.000; cc_entrypoint=mirasim;"},
+              *blocks("text", "text")]
     return json.dumps({
         "model": "claude-sonnet-5",
         "messages": messages,
@@ -186,7 +186,7 @@ def _codex_wire_headers(body: bytes) -> list[tuple[str, str]]:
     """The same request as the relay puts it on the wire."""
     caller = codex_caller_headers(
         authorization="Bearer synthetic-device-ticket",
-        user_agent=CODEX_USER_AGENT, originator="@mirasim/kernel")
+        user_agent=CODEX_USER_AGENT, originator="mirasim")
     return [
         ("x-openai-actor-authorization", "mirasim"),
         *caller[:-1],

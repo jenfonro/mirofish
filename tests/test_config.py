@@ -77,11 +77,10 @@ def test_transport_limits_are_configurable_and_keepalive_is_capped(monkeypatch):
 def test_codex_user_agent_defaults_to_the_capture_and_is_overridable(monkeypatch):
     monkeypatch.delenv("MIROFISH_CODEX_USER_AGENT", raising=False)
     assert Settings.from_env().codex_user_agent == \
-        "@mirasim/kernel/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 " \
-        "(@mirasim/kernel; 0.1.0)"
+        "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)"
 
     monkeypatch.setenv("MIROFISH_CODEX_USER_AGENT", " mirasim/9.9.9 (x) ")
     assert Settings.from_env().codex_user_agent == "mirasim/9.9.9 (x)"
 
     monkeypatch.setenv("MIROFISH_CODEX_USER_AGENT", "  ")
-    assert Settings.from_env().codex_user_agent.startswith("@mirasim/kernel/0.155.1 ")
+    assert Settings.from_env().codex_user_agent.startswith("mirasim/0.155.1 ")

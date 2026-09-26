@@ -38,6 +38,9 @@ RESPONSES_PATH = "/v1/responses"
 RESPONSES_COMPACT_PATH = "/v1/responses/compact"
 ALPHA_SEARCH_PATH = "/v1/alpha/search"
 LIMITS_PATH = "/v1/limits"
+#: Claude Code's start-up preconnect, relayed by the desktop with the session's
+#: full envelope and ticket (live 0.0.367 capture).
+HELLO_PATH = "/api/hello"
 #: Upstream endpoints the Codex agent reaches through the transparent MITM path.
 CODEX_PATHS = (RESPONSES_PATH, RESPONSES_COMPACT_PATH, ALPHA_SEARCH_PATH)
 
@@ -49,9 +52,18 @@ def _is_model_request_path(path: str) -> bool:
     routes are sent.  Keeping the predicate centralized prevents a new Codex
     alias from accidentally taking the account-token fallback path.
     """
-    return path in (MESSAGES_PATH, COUNT_TOKENS_PATH, *CODEX_PATHS)
+    return path in (MESSAGES_PATH, COUNT_TOKENS_PATH, HELLO_PATH, *CODEX_PATHS)
 
 TICKET_REFRESH_LEAD_SECONDS = 120.0
+#: The desktop keeps one Claude Code process per session while it is warm and
+#: evicts it after this much idle time; a fresh process preconnects again.
+HELLO_IDLE_SECONDS = 30 * 60.0
+#: What Bun's fetch puts on the preconnect, in the order the desktop relays it.
+_HELLO_HEADERS: tuple[tuple[str, str], ...] = (
+    ("user-agent", "Bun/1.4.3"),
+    ("accept", "*/*"),
+    ("accept-encoding", "gzip, deflate, br, zstd"),
+)
 TICKET_MINT_TIMEOUT_SECONDS = 10.0
 TICKET_BACKOFF_BASE_SECONDS = 1.0
 TICKET_BACKOFF_MAX_SECONDS = 30.0
@@ -144,15 +156,16 @@ _BODY_INTEGRITY_REQUEST_HEADERS = {
 # it; see forwarded_codex_headers.
 _MIRASIM_HEADER_PREFIX = "x-mirasim-"
 _RELAY_OWNED_REQUEST_HEADERS = {"cookie", "cookie2"}
-# The 0.0.367 kernel initialises the bundled Codex app-server with
-# clientInfo ``@mirasim/kernel``; Codex 0.155.1 uses that name as its
-# originator (verified by driving the installed binary against a local sink
-# with the kernel's own initialize params), so pin it rather than trusting
-# whatever the local caller sends.
-_CODEX_ORIGINATOR = "@mirasim/kernel"
+# Every observed official Codex request reaches the relay with this exact
+# originator (0.0.272 capture; re-confirmed on a live 0.0.367 kernel session
+# with Codex 0.155.1), so pin it rather than trusting whatever the local
+# caller sends.  The kernel's one-shot print path initialises Codex under a
+# different client name; interactive sessions, which are what the relay
+# stands in for, do not.
+_CODEX_ORIGINATOR = "mirasim"
 # The kernel also configures the provider with this ``http_headers`` entry,
 # which Codex emits ahead of every other field; a stand-alone Codex never
-# sends it.
+# sends it.  Seen first on the wire of the live 0.0.367 session.
 _CODEX_ACTOR_AUTHORIZATION = ("x-openai-actor-authorization", "mirasim")
 # Fields a stand-alone Codex CLI adds that the desktop's bundled Codex does
 # not put on the wire (0.0.272 capture).  ``accept-encoding`` only affects
@@ -420,18 +433,23 @@ def _as_float(value: Any) -> Optional[float]:
 
 
 def _relay_envelope(
-        token: str, session_id: str, agent: str, account_id: str, call_id: str,
+        token: str, session_id: str, agent: str, call_id: str,
         device_id: str, client_version: str, locale: str,
         probe: bool, turn_id: str = "") -> list[tuple[str, str]]:
     """The relay-owned request metadata, in the order the desktop emits it.
 
     Probe requests carry a deliberately reduced envelope: no session, agent,
-    device, account, locale or call id, because a usage probe is not part of a
+    device, locale or call id, because a usage probe is not part of a
     conversation and the product does not attribute one.
 
     The turn id is the 0.0.367 desktop's per-prompt task id: set on the
     session's metadata while the kernel is answering a prompt, so it sits
     after the session-wide fields and before the per-request call id.
+
+    ``x-mirasim-account`` is deliberately absent on both legs: the desktop
+    assigns it from a locally configured own-provider account, and a session
+    routed through the relay has none (live 0.0.367 Claude and Codex
+    captures both seal session/agent/device/locale/turn/call only).
     """
     if probe:
         envelope = [("x-mirasim-probe", "usage"),
@@ -448,8 +466,6 @@ def _relay_envelope(
                         ("x-mirasim-device", device_id)):
         if value:
             envelope.append((name, value))
-    if account_id:
-        envelope.append(("x-mirasim-account", account_id))
     if client_version:
         envelope.append(("x-mirasim-client", client_version))
     if locale:
@@ -725,6 +741,99 @@ def _carries_tool_result(content: Any) -> bool:
         for block in content)
 
 
+_CLI_USER_AGENT_IDENTITY = re.compile(
+    r"claude-cli/(\d+\.\d+\.\d+) \(external, ([A-Za-z0-9_-]+)\)")
+_BILLING_HEADER_PREFIX = "x-anthropic-billing-header:"
+#: The salt Claude Code 2.1.278 mixes into its ``cc_version`` fingerprint
+#: (``ZAr`` in the installed binary).
+_BILLING_FINGERPRINT_SALT = "59cf53e54c78"
+
+
+def _billing_prompt_text(payload: dict[str, Any]) -> str:
+    """The text Claude Code fingerprints: its first non-meta user message.
+
+    Internally that is the user's own prompt; the meta attachments it sends
+    alongside (``<system-reminder>`` blocks) are separate messages.  On the
+    wire they are merged ahead of the prompt inside the first user message's
+    content, so the prompt is the first text block that is not one of them.
+    """
+    messages = payload.get("messages")
+    if not isinstance(messages, list):
+        return ""
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text" \
+                        and isinstance(block.get("text"), str) \
+                        and not block["text"].startswith("<system-reminder>"):
+                    return block["text"]
+        return ""
+    return ""
+
+
+def _billing_fingerprint(text: str, version: str) -> str:
+    """``aHe`` in Claude Code 2.1.278: UTF-16 code units 4, 7 and 20 of the
+    prompt (``"0"`` past the end), salted, with the CLI version, SHA-256,
+    first three hex digits.  Node encodes the record as UTF-8, where a lone
+    surrogate becomes U+FFFD."""
+    units = text.encode("utf-16-le")
+    chars = []
+    for index in (4, 7, 20):
+        unit = units[2 * index:2 * index + 2]
+        code = int.from_bytes(unit, "little") if len(unit) == 2 else None
+        if code is None:
+            chars.append("0")
+        elif 0xD800 <= code <= 0xDFFF:
+            chars.append("\ufffd")
+        else:
+            chars.append(chr(code))
+    record = _BILLING_FINGERPRINT_SALT + "".join(chars) + version
+    return hashlib.sha256(record.encode("utf-8")).hexdigest()[:3]
+
+
+def _with_billing_header(payload: dict[str, Any], user_agent: str,
+                         add: bool = True) -> dict[str, Any]:
+    """Make the body's billing block agree with the client identity sent.
+
+    Claude Code opens ``system`` with ``x-anthropic-billing-header:
+    cc_version=<cli version>.<fingerprint>; cc_entrypoint=<entrypoint>;``
+    (live 0.0.367 capture; no cache_control on it).  A caller's own block
+    names the caller's CLI build and entrypoint, which no longer match the
+    user-agent this relay presents, so it is rebuilt from that user-agent
+    and the body the request actually carries.  ``add`` inserts one when the
+    caller sent none; without it an absent block is left absent.
+    """
+    identity = _CLI_USER_AGENT_IDENTITY.fullmatch(user_agent or "")
+    model = payload.get("model")
+    if identity is None or not isinstance(model, str) \
+            or not model.lower().startswith("claude-"):
+        return payload
+    version, entrypoint = identity.groups()
+    text = "%s cc_version=%s.%s; cc_entrypoint=%s;" % (
+        _BILLING_HEADER_PREFIX, version,
+        _billing_fingerprint(_billing_prompt_text(payload), version), entrypoint)
+    block = {"type": "text", "text": text}
+    system = payload.get("system")
+    if isinstance(system, list):
+        for index, existing in enumerate(system):
+            if isinstance(existing, dict) and isinstance(existing.get("text"), str) \
+                    and existing["text"].startswith(_BILLING_HEADER_PREFIX):
+                return {**payload, "system": [*system[:index], block, *system[index + 1:]]}
+        if not add:
+            return payload
+        return {**payload, "system": [block, *system]}
+    if not add:
+        return payload
+    if isinstance(system, str):
+        return {**payload, "system": [block, {"type": "text", "text": system}]}
+    return {**payload, "system": [block]}
+
+
 def _prompt_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -971,6 +1080,7 @@ class Upstream:
         self._refresh_locks: dict[str, asyncio.Lock] = {}
         self._ticket_locks: dict[tuple[str, str], asyncio.Lock] = {}
         self._ticket_cache: dict[tuple[str, str], _DeviceTicket] = {}
+        self._hello_at: dict[tuple[str, str], float] = {}
         self._ticket_retry_after: dict[tuple[str, str], float] = {}
         self._ticket_failures: dict[tuple[str, str], int] = {}
         self._signing_unsupported_until: dict[tuple[str, str], float] = {}
@@ -1607,7 +1717,6 @@ class Upstream:
                                      call_id: str = "",
                                      probe: bool = False,
                                      agent: str = "claude",
-                                     account_id: str = "",
                                      turn_id: str = "",
     ) -> httpx.Response:
         model_request = _is_model_request_path(path)
@@ -1635,7 +1744,7 @@ class Upstream:
             # copy upstream reads is not ours to decide.
             headers = list(extra_headers or ())
             for name, value in _relay_envelope(
-                    credential.value, session_id, agent, account_id, call_id,
+                    credential.value, session_id, agent, call_id,
                     # The device id is derived from the Ed25519 public key and
                     # is the same value whether or not this request ends up
                     # signed.  Substituting an unrelated install UUID on the
@@ -1762,6 +1871,9 @@ class Upstream:
             if not probe and payload is not None and "metadata" in payload:
                 payload = _with_client_metadata(
                     payload, self._signer(alias).device_id, relay_session)
+            if not probe and payload is not None:
+                payload = _with_billing_header(
+                    payload, self.settings.claude_cli_user_agent, add=False)
             if not probe:
                 turn = relay_turn_id(relay_session, payload)
             extra_headers = self._message_request_headers(
@@ -1789,6 +1901,35 @@ class Upstream:
             return response.status_code, headers, data
         raise RelayError("signed relay request failed after ticket refresh", 401)
 
+    async def _preconnect(self, alias: str, proxy_url: Optional[str],
+                          session_id: str, turn_id: str) -> None:
+        """Claude Code's ``HEAD /api/hello``, as the desktop relays it.
+
+        Fired once per Claude Code process before its first model call: a
+        session's first request on this account, or its first after the
+        desktop would have evicted the idle process.  Carries the session's
+        envelope like the model call that follows.  Failure is ignored, as
+        Claude Code ignores it.
+        """
+        key = (alias, session_id)
+        now = time.monotonic()
+        last = self._hello_at.get(key)
+        self._hello_at[key] = now
+        if last is not None and now - last < HELLO_IDLE_SECONDS:
+            return
+        if len(self._hello_at) > 4096:
+            for stale in [k for k, at in self._hello_at.items()
+                          if now - at >= HELLO_IDLE_SECONDS]:
+                del self._hello_at[stale]
+        try:
+            response = await self._signed_relay_response(
+                alias, "HEAD", HELLO_PATH, b"", proxy_url,
+                extra_headers=list(_HELLO_HEADERS), session_id=session_id,
+                call_id=str(uuid.uuid4()), turn_id=turn_id)
+            await response.aclose()
+        except Exception:  # noqa: BLE001 - a failed preconnect never blocks the model call
+            logger.debug("preconnect failed: account=%s", alias)
+
     async def messages(self, alias: str, payload: dict[str, Any],
                        proxy_url: Optional[str] = None, *,
                        request_headers: Optional[
@@ -1803,10 +1944,13 @@ class Upstream:
         if not probe:
             payload = _with_client_metadata(
                 payload, self._signer(alias).device_id, relay_session)
+            payload = _with_billing_header(payload, self.settings.claude_cli_user_agent)
         turn = "" if probe else relay_turn_id(relay_session, payload)
         request_body = _json_bytes(payload)
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
+        if not probe:
+            await self._preconnect(alias, proxy_url, relay_session, turn)
         for attempt in range(2):
             response = await self._signed_relay_response(
                 alias, "POST", MESSAGES_PATH, request_body, proxy_url,
@@ -1848,10 +1992,13 @@ class Upstream:
         if not probe:
             payload = _with_client_metadata(
                 payload, self._signer(alias).device_id, relay_session)
+            payload = _with_billing_header(payload, self.settings.claude_cli_user_agent)
         turn = "" if probe else relay_turn_id(relay_session, payload)
         request_body = _json_bytes(payload)
         extra_headers = self._message_request_headers(
             request_headers, probe, relay_session, alias)
+        if not probe:
+            await self._preconnect(alias, proxy_url, relay_session, turn)
         for attempt in range(2):
             response = await self._signed_relay_response(
                 alias, "POST", MESSAGES_PATH, request_body, proxy_url,
@@ -1880,7 +2027,7 @@ class Upstream:
             proxy_url: Optional[str] = None, *,
             request_headers: Optional[
                 Mapping[str, str] | Iterable[tuple[Any, Any]]] = None,
-            session_id: str = "", account_id: str = "",
+            session_id: str = "",
             query_string: str = "", path: str = RESPONSES_PATH,
             turn_id: str = "",
     ) -> httpx.Response:
@@ -1911,7 +2058,7 @@ class Upstream:
                 alias, "POST", path, body, proxy_url,
                 stream=True, url_path=url_path, extra_headers=extra_headers,
                 session_id=relay_session, call_id=str(uuid.uuid4()),
-                agent="codex", account_id=account_id, turn_id=turn_id)
+                agent="codex", turn_id=turn_id)
             if getattr(response, "_request", None) is not None:
                 jar.extract_cookies(response)
             if response.status_code == 401 and attempt == 0:

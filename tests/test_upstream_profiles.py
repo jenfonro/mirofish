@@ -638,8 +638,7 @@ async def test_codex_relay_request_matches_the_official_capture(state):
     for _ in range(2):
         response = await state.upstream.stream_responses(
             alias, body, request_headers=caller,
-            session_id="0f20cf48-c292-42e9-a99e-994511307deb",
-            account_id="u-capture")
+            session_id="0f20cf48-c292-42e9-a99e-994511307deb")
         await response.aclose()
 
     first, second = (call.request for call in route.calls)
@@ -648,7 +647,7 @@ async def test_codex_relay_request_matches_the_official_capture(state):
     assert "cookie" not in first.headers
     _assert_matches_golden(second, "codex_responses_official.json")
     assert second.headers["user-agent"] == DEFAULT_CODEX_USER_AGENT
-    assert second.headers["originator"] == "@mirasim/kernel"
+    assert second.headers["originator"] == "mirasim"
     assert list(second.headers.keys())[0] == "x-openai-actor-authorization"
     assert second.headers["authorization"] == "Bearer device-ticket"
     for name in ("openai-beta", "accept-encoding"):
@@ -689,7 +688,7 @@ def test_codex_credential_lands_behind_the_callers_fields_as_the_desktop_puts_it
         "x-codex-window-id", "session-id", "accept", "content-type",
         "originator", "user-agent", "authorization"]
     assert dict(wire)["x-openai-actor-authorization"] == "mirasim"
-    assert dict(wire)["originator"] == "@mirasim/kernel"
+    assert dict(wire)["originator"] == "mirasim"
     assert dict(wire)["user-agent"] == DEFAULT_CODEX_USER_AGENT
     assert dict(wire)["authorization"] == ""
     assert "caller-secret" not in dict(wire).values()

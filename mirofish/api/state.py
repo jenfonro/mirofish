@@ -1185,7 +1185,7 @@ class AppState:
     async def open_responses_stream(
             self, alias: str, body: bytes, *,
             request_headers: Optional[Mapping[str, str]] = None,
-            session_id: str = "", account_id: str = "",
+            session_id: str = "",
             query_string: str = "", path: str = RESPONSES_PATH,
             turn_id: str = "",
     ) -> tuple[httpx.Response, AsyncExitStack]:
@@ -1197,7 +1197,7 @@ class AppState:
             response = await self.upstream.stream_responses(
                 alias, body, proxy_url(proxy) if proxy else None,
                 request_headers=request_headers,
-                session_id=session_id, account_id=account_id,
+                session_id=session_id,
                 query_string=query_string, path=path, turn_id=turn_id)
             response.extensions[ACCOUNT_GENERATION_EXTENSION] = account_generation
             stack.push_async_callback(response.aclose)

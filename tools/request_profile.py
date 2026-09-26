@@ -55,7 +55,7 @@ _SAFE_HEADER_EXACT_VALUES = {
         "auth.mirasim.ai", "cdn-assets.mirasim.ai", "relay.mirasim.ai",
     }),
     "openai-beta": frozenset({"responses=experimental"}),
-    "originator": frozenset({"codex_cli_rs", "mirasim", "@mirasim/kernel"}),
+    "originator": frozenset({"codex_cli_rs", "mirasim"}),
     "user-agent": frozenset({
         "claude-cli/2.1.241 (external, mirasim)",
         "claude-cli/2.1.261 (external, mirasim)",
@@ -65,7 +65,6 @@ _SAFE_HEADER_EXACT_VALUES = {
         "mirasim-desktop/0.0.367",
         "mirasim/0.153.4 (Mac OS 26.6.2; x86_64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
         "mirasim/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (mirasim; 0.1.0)",
-        "@mirasim/kernel/0.155.1 (Mac OS 26.6.2; arm64) Apple_Terminal/470.2 (@mirasim/kernel; 0.1.0)",
     }),
     "x-app": frozenset({"cli"}),
     # Codex protocol flags carried by the desktop's bundled Codex.
@@ -109,11 +108,9 @@ _SAFE_HEADER_VALUE_PATTERNS = {
         rf"claude-cli/{_VERSION_TEXT} \(external, mirasim\)"
         rf"|mirasim-desktop/{_VERSION_TEXT}"
         # The bundled Codex: originator/version (OS; arch) terminal/version
-        # (client name; version).  Only the build numbers move between
-        # captures; the client name is what the kernel calls itself.
-        rf"|(?:mirasim|@mirasim/kernel)/{_VERSION_TEXT}"
-        rf" \(Mac OS {_VERSION_TEXT}; (?:x86_64|arm64)\)"
-        rf" Apple_Terminal/{_VERSION_TEXT} \((?:mirasim|@mirasim/kernel); {_VERSION_TEXT}\)"),
+        # (product; version).  Only the build numbers move between captures.
+        rf"|mirasim/{_VERSION_TEXT} \(Mac OS {_VERSION_TEXT}; (?:x86_64|arm64)\)"
+        rf" Apple_Terminal/{_VERSION_TEXT} \(mirasim; {_VERSION_TEXT}\)"),
     "x-mirasim-client": re.compile(_VERSION_TEXT),
     "x-stainless-package-version": re.compile(_VERSION_TEXT),
     "x-stainless-runtime-version": re.compile(rf"v{_VERSION_TEXT}"),

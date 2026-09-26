@@ -61,14 +61,18 @@ This repository contains the Mirofish relay, a Python package (`mirofish/`) with
   probe keeps the capitalized `Authorization` of the desktop's probe object. The Codex path leaves
   the relay as the Codex the desktop launches would send it: caller protocol headers (`x-codex-*`,
   `session-id`, `thread-id`, `chatgpt-account-id`) pass through in order, `user-agent` is replaced
-  by `MIROFISH_CODEX_USER_AGENT` (`@mirasim/kernel/<codex version> (Mac OS ...; arm64) ...
-  (@mirasim/kernel; 0.1.0)`: the name the 0.0.367 kernel gives Codex at initialize, verified by
-  driving the installed Codex 0.155.1 against a local sink) and `originator` by
-  `@mirasim/kernel`, the kernel's provider header `x-openai-actor-authorization: mirasim` is put
-  first, `openai-beta`/`accept-encoding` are dropped, caller cookies are stripped, and the
+  by `MIROFISH_CODEX_USER_AGENT` (`mirasim/<codex version> (Mac OS ...; arm64) ... (mirasim;
+  0.1.0)`, re-confirmed on a live 0.0.367 session with Codex 0.155.1) and `originator` by
+  `mirasim`, the kernel's provider header `x-openai-actor-authorization: mirasim` is put first,
+  the relay's credential lands after every caller field (the desktop deletes and reassigns it),
+  `openai-beta`/`accept-encoding` are dropped, caller cookies are stripped, and the
   Cloudflare cookies the relay host sets are replayed from a per-(account, exit) `httpx.Cookies`
   jar placed just before `authorization` (RFC 6265 scoping applies, so a `Domain=chatgpt.com`
   cookie is never replayed; the Claude path sends no cookies, matching Node's fetch).
+  Neither leg seals `x-mirasim-account`. The Claude path also rebuilds the body's
+  `x-anthropic-billing-header` system block (`cc_version=<UA version>.<2.1.278 fingerprint>;
+  cc_entrypoint=<UA entrypoint>;`) and sends Claude Code's `HEAD /api/hello` preconnect, with the
+  session's envelope, once per session on an account and again after 30 idle minutes.
   `mirofish/behavior.py` replays the rest of the desktop's whole-client background behaviour
   (gzipped `/events` telemetry in the live `{deviceId, sentAt, events}` envelope with
   `app.heartbeat` records, `/v1/model-roster`, and the `cdn-assets` update check) as one

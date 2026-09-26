@@ -88,6 +88,17 @@ def client_user_id(state, alias: str, session_id: str) -> str:
     }, separators=(",", ":"))
 
 
+def billing_block(prompt: str, version: str = "2.1.278",
+                  entrypoint: str = "mirasim") -> dict[str, str]:
+    """The ``system[0]`` block Claude Code opens every request with, for the
+    prompt the relay fingerprints (its first non-meta user text).  The
+    fingerprint algorithm itself is pinned against live vectors in
+    ``tests/test_billing_header.py``."""
+    from mirofish.upstream import _billing_fingerprint
+    return {"type": "text", "text": "x-anthropic-billing-header: cc_version=%s.%s; cc_entrypoint=%s;" % (
+        version, _billing_fingerprint(prompt, version), entrypoint)}
+
+
 def signing_payload(request: httpx.Request, path: str, credential: str,
                     fields: dict[str, str] | None = None) -> bytes:
     """Rebuild the ``mrs-sig-v2`` canonical record for ``request``."""

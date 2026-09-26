@@ -10,7 +10,8 @@ from mirofish.config import DEFAULT_CODEX_USER_AGENT
 from mirofish.upstream import (RESPONSES_COMPACT_PATH, RESPONSES_PATH,
                                SIGNED_MODEL_REQUIRED_MESSAGE)
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
-from tests.mirasim_protocol import client_user_id, relay_metadata, verify_signature
+from tests.mirasim_protocol import (billing_block, client_user_id, relay_metadata,
+                                    verify_signature)
 
 
 def _device_session(result: httpx.Response | None = None):
@@ -88,8 +89,8 @@ async def test_codex_compressed_body_is_decompressed_then_signed_verbatim(
     assert request.headers["user-agent"] == DEFAULT_CODEX_USER_AGENT
     metadata = relay_metadata(request)
     assert metadata["x-mirasim-agent"] == "codex"
-    assert metadata["x-mirasim-account"] == "u-work"
-    assert request.headers["originator"] == "@mirasim/kernel"
+    assert "x-mirasim-account" not in metadata  # neither leg carries it (live 0.0.367)
+    assert request.headers["originator"] == "mirasim"
     # The kernel's provider header leads every bundled-Codex request; a
     # caller never supplies it.
     assert list(request.headers.keys())[0] == "x-openai-actor-authorization"
@@ -399,7 +400,8 @@ async def test_messages_leave_in_the_official_compact_form_with_the_accounts_met
     sent = route.calls.last.request
     session = relay_metadata(sent)["x-mirasim-session"]
     assert sent.content == json.dumps(
-        {**payload, "metadata": {"user_id": client_user_id(state, "work", session)}},
+        {**payload, "metadata": {"user_id": client_user_id(state, "work", session)},
+         "system": [billing_block("hello"), *payload["system"]]},
         ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
 

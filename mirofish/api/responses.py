@@ -64,12 +64,9 @@ async def _codex_relay(request: Request, path: str) -> Any:
 
     async def run(account: str):
         relay_session = state.relay_session_id("", hint, payload, account)
-        row = state.store.row(account)
-        account_id = _safe_metadata(
-            str(row["user_id"]) if row["user_id"] is not None else "")
         return await state.open_responses_stream(
             account, body, request_headers=request.headers,
-            session_id=relay_session, account_id=account_id,
+            session_id=relay_session,
             query_string=query_string, path=path,
             turn_id=relay_turn_id(relay_session, payload))
 

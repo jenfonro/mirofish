@@ -19,7 +19,7 @@ from mirofish.errors import RelayError
 from mirofish.device import DEVICE_KEY_KIND
 from mirofish.translate import MAX_SSE_EVENT_BYTES
 from mirofish.upstream import CLAUDE_AGENT_SYSTEM_MARKER, _DeviceTicket
-from tests.mirasim_protocol import (client_user_id, relay_metadata,
+from tests.mirasim_protocol import (billing_block, client_user_id, relay_metadata,
                                     signing_payload, unseal, verify_signature)
 
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
@@ -286,6 +286,7 @@ async def test_messages_non_stream(client, state, auth_headers):
     sent = json.loads(route.calls.last.request.content)
     assert sent["model"] == "claude-haiku-4-5"
     assert sent["system"] == [
+        billing_block("hi"),
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
          "cache_control": {"type": "ephemeral"}},
     ]
@@ -446,6 +447,7 @@ async def test_messages_stream_passthrough(client, state, auth_headers):
         state.relay_session_id("0f20cf48-c292-42e9-a99e-994511307deb", "", {}, "work")
     assert route.calls.last.request.url.query == b"beta=true"
     assert json.loads(route.calls.last.request.content)["system"] == [
+        billing_block("hi"),
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
          "cache_control": {"type": "ephemeral"}},
     ]
@@ -615,8 +617,9 @@ async def test_stream_finalize_records_usage_even_when_stack_close_fails():
 async def test_complete_claude_code_payload_keeps_its_shape_under_the_accounts_identity(
         client, state, auth_headers, model, betas):
     """Only the caller's own identity is replaced: its install and session in
-    ``metadata.user_id`` and its CLI version; every other byte of the body
-    and every semantic header leave as the caller sent them."""
+    ``metadata.user_id``, its CLI version in the user-agent and the billing
+    block that names the same build; every other byte of the body and every
+    semantic header leave as the caller sent them."""
     add_account(state, "work")
     mock_device_session()
     route = respx.post(RELAY_BASE + "/v1/messages?beta=true").mock(
@@ -639,7 +642,8 @@ async def test_complete_claude_code_payload_keeps_its_shape_under_the_accounts_i
             "edits": [{"type": "clear_thinking_20251015", "keep": "all"}]},
         "metadata": {"user_id": metadata_id},
         "system": [
-            {"type": "text", "text": "first"},
+            {"type": "text", "text": "x-anthropic-billing-header: "
+                                     "cc_version=2.1.241.9f1; cc_entrypoint=cli;"},
             {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
              "cache_control": {"type": "ephemeral"}},
             {"type": "text", "text": "third",
@@ -677,7 +681,8 @@ async def test_complete_claude_code_payload_keeps_its_shape_under_the_accounts_i
     sent = route.calls.last.request
     expected = state.relay_session_id(session_id, "", {}, "work")
     assert sent.content == json.dumps(
-        {**payload, "metadata": {"user_id": client_user_id(state, "work", expected)}},
+        {**payload, "metadata": {"user_id": client_user_id(state, "work", expected)},
+         "system": [billing_block("hello"), *payload["system"][1:]]},
         ensure_ascii=False, separators=(",", ":")).encode("utf-8")
     assert sent.headers["anthropic-beta"] == betas
     assert sent.headers["user-agent"] == "claude-cli/2.1.278 (external, mirasim)"
@@ -709,6 +714,7 @@ async def test_chat_completions_non_stream(client, state, auth_headers):
     # The marker and the final system block are cache breakpoints, and the last
     # user turn is promoted to structured content so it can carry the third.
     assert sent["system"] == [
+        billing_block("hi"),
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
          "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": "terse",
@@ -1391,6 +1397,7 @@ async def test_model_scan_sends_claude_compatible_work_with_session_not_probe(
     body = json.loads(sent.content)
     assert body["max_tokens"] == 2
     assert body["system"] == [
+        billing_block("Reply OK"),
         {"type": "text", "text": CLAUDE_AGENT_SYSTEM_MARKER,
          "cache_control": {"type": "ephemeral"}},
     ]

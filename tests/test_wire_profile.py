@@ -42,7 +42,13 @@ class _RawServer:
                 if length:
                     await reader.readexactly(int(length.group(1)))
                 self.heads.append(head)
-                path = head.split(b" ", 2)[1]
+                method, path = head.split(b" ", 2)[:2]
+                if method == b"HEAD":
+                    # The preconnect: a HEAD response carries no body, and a
+                    # body here would corrupt the next response on the socket.
+                    writer.write(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n")
+                    await writer.drain()
+                    continue
                 if path.startswith(b"/v1/device/session"):
                     payload = {"ticket": "device-ticket", "expiresIn": 900}
                 elif path.startswith(b"/v1/models"):
@@ -94,14 +100,20 @@ async def test_wire_order_matches_the_captured_profiles(settings):
         listener.close()
         await listener.wait_closed()
 
-    device, models, messages = server.heads
+    device, models, hello, messages = server.heads
     assert device.startswith(b"POST /v1/device/session HTTP/1.1\r\n")
     assert models.startswith(b"GET /v1/models HTTP/1.1\r\n")
+    assert hello.startswith(b"HEAD /api/hello HTTP/1.1\r\n")
     assert messages.startswith(b"POST /v1/messages?beta=true HTTP/1.1\r\n")
     # Byte-level field order and casing equal the capture: Host and Connection
     # last, Host not hoisted to the front by the serializer.
     assert _wire_names(device) == _golden_names("device_session_official.json")
     assert _wire_names(models) == _golden_names("models_official.json")
+    # Claude Code's preconnect as the live 0.0.367 desktop relays it: Bun's
+    # three headers, the ticket, the clear build marker, the sealed envelope.
+    assert _wire_names(hello) == [
+        "user-agent", "accept", "accept-encoding", "authorization",
+        "x-mirasim-client", "x-mirasim-enc", "Host", "Connection"]
     assert _wire_names(messages) == _golden_names("messages_beta_official.json")
     assert messages.rstrip(b"\r\n").endswith(
         b"Host: 127.0.0.1:%d\r\nConnection: keep-alive" % port)
