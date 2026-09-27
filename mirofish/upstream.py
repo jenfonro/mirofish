@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import logging
@@ -54,7 +55,13 @@ def _is_model_request_path(path: str) -> bool:
     """
     return path in (MESSAGES_PATH, COUNT_TOKENS_PATH, HELLO_PATH, *CODEX_PATHS)
 
-TICKET_REFRESH_LEAD_SECONDS = 120.0
+#: The desktop re-mints its 15-minute ticket 60 seconds early: a live 0.0.367
+#: install posts /v1/device/session every 14 minutes, idle or not.
+TICKET_REFRESH_LEAD_SECONDS = 60.0
+#: Before minting, the desktop renews an account token whose JWT ``exp`` is
+#: within this many seconds (``igo`` in server.cjs), so the mint never carries
+#: a token about to lapse.
+TOKEN_RENEW_LEAD_SECONDS = 30.0
 #: The desktop keeps one Claude Code process per session while it is warm and
 #: evicts it after this much idle time; a fresh process preconnects again.
 HELLO_IDLE_SECONDS = 30 * 60.0
@@ -329,6 +336,72 @@ def forwarded_codex_headers(
     if user_agent:
         _place_before_authorization(forwarded, "user-agent", user_agent)
     return forwarded
+
+
+#: Where Codex names its installation, thread and turns (live 0.0.367
+#: capture of Codex 0.155.1): the turn-metadata JSON, sent as a header and
+#: again inside the body's ``client_metadata``, plus these plain headers and
+#: the body's ``prompt_cache_key``.
+_CODEX_IDENTITY_HEADERS = ("x-codex-turn-metadata", "x-codex-window-id",
+                           "x-client-request-id", "session-id", "thread-id")
+_CODEX_IDENTITY_FIELDS = ("installation_id", "session_id", "thread_id", "turn_id",
+                          "root_turn_id", "window_id", "context_window_id")
+_UUID_TEXT = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+
+
+def _codex_alias_uuid(account: str, value: str, install_id: str) -> str:
+    """The id this account's own Codex would carry in place of ``value``.
+
+    Codex's thread, turn and context-window ids are UUIDv7: the caller's
+    time bits are kept so the id still says when the thread began, and the
+    random bits are drawn per account, so the same thread taken to two
+    accounts is two ids that never meet.  Its installation id is UUIDv4 and
+    names the box, so it becomes this account's own (``install_id``) rather
+    than a function of the caller's.
+    """
+    caller = uuid.UUID(value)
+    if caller.version == 4:
+        return install_id
+    digest = bytearray(hashlib.sha256(
+        ("%s\x00codex:%s" % (account, value)).encode("utf-8")).digest()[:16])
+    digest[0:6] = caller.bytes[0:6]
+    digest[6] = (digest[6] & 0x0F) | (caller.version << 4)
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def codex_identity_map(headers: Sequence[tuple[str, str]], body: bytes,
+                       account: str, device_id: str) -> dict[str, str]:
+    """Every id the caller's Codex put on this request, and what this
+    account's Codex says instead.  Applied as plain text: the ids are UUIDs
+    of fixed length, verbatim in the headers, the body and the JSON string
+    the body repeats the header in, so nothing else in the body moves."""
+    install_id = str(uuid.UUID(bytes=hashlib.sha256(
+        ("codex-install\x00" + device_id).encode("ascii")).digest()[:16], version=4))
+    found: set[str] = set()
+    for name, value in headers:
+        if name.lower() in _CODEX_IDENTITY_HEADERS:
+            found.update(_UUID_TEXT.findall(value))
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict):
+        key = payload.get("prompt_cache_key")
+        if isinstance(key, str):
+            found.update(_UUID_TEXT.findall(key))
+        client = payload.get("client_metadata")
+        if isinstance(client, dict):
+            for value in client.values():
+                if isinstance(value, str):
+                    found.update(_UUID_TEXT.findall(value))
+    return {value: _codex_alias_uuid(account, value, install_id) for value in sorted(found)}
+
+
+def _rewrite_codex_identity(text: str, mapping: dict[str, str]) -> str:
+    return _UUID_TEXT.sub(lambda match: mapping.get(match.group(0), match.group(0)), text) \
+        if mapping else text
 
 
 def _cookie_header(jar: httpx.Cookies, url: str) -> str:
@@ -708,6 +781,19 @@ def _parse_body(response: httpx.Response) -> Any:
         return {"_raw": response.text[:1000]}
 
 
+def _jwt_expiry(token: str) -> Optional[float]:
+    """The ``exp`` claim of a JWT, unverified, or None for anything else."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return None
+    try:
+        payload = base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4))
+        exp = json.loads(payload).get("exp")
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return float(exp) if isinstance(exp, (int, float)) else None
+
+
 def _json_bytes(payload: Optional[dict[str, Any]]) -> bytes:
     if payload is None:
         return b""
@@ -835,12 +921,42 @@ def _with_billing_header(payload: dict[str, Any], user_agent: str,
 
 
 def _prompt_text(content: Any) -> str:
+    """The user's own words in a prompt: a string, or its first text block
+    that is not a ``<system-reminder>`` attachment (those lead the block list
+    on the wire; the prompt follows them)."""
     if isinstance(content, str):
-        return content
+        return content.strip()
     if isinstance(content, list):
-        return "".join(block.get("text", "") for block in content
-                       if isinstance(block, dict) and isinstance(block.get("text"), str))
+        for block in content:
+            if isinstance(block, dict) and isinstance(block.get("text"), str) \
+                    and not block["text"].startswith("<system-reminder>"):
+                return block["text"].strip()
     return ""
+
+
+_SESSION_NAMING_PREFIX = "You are naming a coding session"
+_SESSION_NAMING_CONTENT = re.compile(r"\A<session>\n(.*)\n</session>\n", re.DOTALL)
+
+
+def _named_session_prompt(payload: dict[str, Any]) -> Optional[str]:
+    """The prompt Claude Code's session-naming call is about, or None.
+
+    Claude Code titles a new session with a side request whose system text
+    is the naming instruction and whose one user message wraps the prompt in
+    ``<session>`` tags.  The kernel runs it inside the same task as the
+    prompt's own call, so both carry one turn id.
+    """
+    system = payload.get("system")
+    if not isinstance(system, list) or not any(
+            isinstance(block, dict) and isinstance(block.get("text"), str)
+            and block["text"].startswith(_SESSION_NAMING_PREFIX) for block in system):
+        return None
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or len(messages) != 1 \
+            or not isinstance(messages[0], dict):
+        return None
+    match = _SESSION_NAMING_CONTENT.match(_prompt_text(messages[0].get("content")))
+    return match.group(1).strip() if match else None
 
 
 def relay_turn_id(session_id: str, payload: Any) -> str:
@@ -857,13 +973,18 @@ def relay_turn_id(session_id: str, payload: Any) -> str:
     The latest prompt's own text is in the hash as well as its ordinal: a
     compaction replaces the history with one summary message and the count
     starts over, and without the text the id would become the session's
-    first turn id again, which a kernel task id never does.
+    first turn id again, which a kernel task id never does.  Claude Code's
+    session-naming side call is keyed on the prompt it names, so it shares
+    the id of that prompt's own call as it does under the kernel.
     """
     prompts, latest = 0, ""
     if isinstance(payload, dict):
         messages = payload.get("messages")
         items = payload.get("input")
-        if isinstance(messages, list):
+        named = _named_session_prompt(payload)
+        if named is not None:
+            prompts, latest = 1, named
+        elif isinstance(messages, list):
             for message in messages:
                 if isinstance(message, dict) and message.get("role") == "user" \
                         and not _carries_tool_result(message.get("content")):
@@ -1646,6 +1767,15 @@ class Upstream:
                     return (cached.value if cached and now < cached.expires_at else None)
                 generation = self._credential_generations.get(alias, 0)
                 access, _ = self.store.credentials(alias)
+                expiry = _jwt_expiry(access)
+                if expiry is not None and expiry <= time.time() + TOKEN_RENEW_LEAD_SECONDS:
+                    # The desktop renews a lapsing token ahead of the mint
+                    # rather than letting the mint fail on it.
+                    try:
+                        access = await self.refresh_access(alias, access, proxy_url)
+                        generation = self._credential_generations.get(alias, 0)
+                    except RelayError:
+                        pass  # the mint below diagnoses the token as before
                 ticket: _DeviceTicket | None = None
                 for auth_attempt in range(2):
                     try:
@@ -2036,17 +2166,29 @@ class Upstream:
         Several local paths collapse onto each upstream endpoint.  The query is
         retained on the request URL but deliberately excluded from the signing
         pathname, matching the desktop MITM's canonicalization.
-        The caller derives the turn id from the body it already parsed; the
-        bytes are not re-read here.
+        The caller derives the turn id from the body it already parsed.  The
+        only bytes that change are the caller's own installation, thread and
+        turn ids, substituted in place by this account's (codex_identity_map).
         """
         if path not in CODEX_PATHS:
             raise RelayError("unsupported codex endpoint", 404)
         url_path = path + ("?" + query_string if query_string else "")
         relay_session = session_id or str(uuid.uuid4())
         jar = self._cookie_jar(alias, proxy_url)
+        caller_headers = forwarded_codex_headers(
+            request_headers, self.settings.codex_user_agent)
+        # The caller's Codex names its own installation, thread and turns in
+        # the headers and the body; one client taken to two accounts would
+        # announce the same ids from both.  Rewritten per account, in place.
+        identity = codex_identity_map(
+            caller_headers, body, alias, self._signer(alias).device_id)
+        if identity:
+            caller_headers = [(name, _rewrite_codex_identity(value, identity)
+                               if name.lower() in _CODEX_IDENTITY_HEADERS else value)
+                              for name, value in caller_headers]
+            body = _rewrite_codex_identity(body.decode("utf-8"), identity).encode("utf-8")
         for attempt in range(2):
-            extra_headers = forwarded_codex_headers(
-                request_headers, self.settings.codex_user_agent)
+            extra_headers = list(caller_headers)
             # Replay this account's Cloudflare cookies exactly where the bundled
             # Codex's cookie store puts them: after user-agent, before the
             # credential.  A caller's own cookie never survives (see

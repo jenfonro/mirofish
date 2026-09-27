@@ -411,6 +411,19 @@ class AccountService:
 
     # --- status ------------------------------------------------------------
 
+    async def ping_identity(self, alias: str,
+                            proxy_url: Optional[str] = None) -> None:
+        """The desktop's minute-by-minute ``GET /auth/me``.
+
+        Presents the account bearer and nothing else; ``authed_json`` renews
+        it once on a 401 as the desktop does. Nothing is stored — the daily
+        ``fetch_status`` keeps the profile — so a refusal is the only result.
+        """
+        status, _, me = await self.upstream.authed_json(
+            alias, "GET", self.settings.auth_base, "/auth/me", proxy_url=proxy_url)
+        if status < 200 or status >= 300:
+            raise RelayError("account identity check failed", status, me)
+
     async def fetch_status(self, alias: str, probe: bool = False,
                            proxy_url: Optional[str] = None) -> dict[str, Any]:
         row = self.store.row(alias)

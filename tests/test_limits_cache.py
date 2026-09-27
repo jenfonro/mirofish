@@ -1,9 +1,11 @@
-"""Quota limits are read from the cache; the upstream is asked once an hour.
+"""Quota limits are read from the cache; the upstream is polled the way the
+desktop polls it.
 
 Page loads read what the last read stored, never the upstream. The refresh
-button re-reads only the enabled accounts. In the background each enabled
-account is read once its last read — or last attempt — is an hour old, and a
-manual read resets that clock.
+button re-reads only the enabled accounts. In the background every enabled
+account is asked /auth/me and then /v1/limits once a minute, idle or not, as
+a signed-in 0.0.367 desktop does for as long as it is open; a 429 has the
+refused account read at once.
 """
 
 import datetime
@@ -56,6 +58,7 @@ def reads(state, monkeypatch):
         return 200, {}, limits_body()
 
     monkeypatch.setattr(state.upstream, "limits", limits)
+    monkeypatch.setattr(state.accounts, "ping_identity", AsyncMock())
     return calls, failing
 
 
@@ -100,58 +103,51 @@ async def test_the_refresh_button_reads_only_enabled_accounts_live(
     assert entries["off"] == {"alias": "off", "ok": True, "limits": {"windows": []}}
 
 
-async def test_the_sweep_reads_each_account_at_most_once_an_hour(state, clock, reads):
+async def test_the_sweep_polls_every_enabled_account_each_pass(state, clock, reads):
     calls, _ = reads
-    for alias in ("a", "b"):
+    for alias in ("a", "b", "off"):
         add_account(state, alias)
+    state.store.merge_metadata("off", {"disabled": True})
     start = clock[0]
 
     await state.refresh_all_limits()
     assert sorted(calls) == ["a", "b"]
-    for offset in (60, 1800, 3599):
+    for offset in (60, 120):
         clock[0] = start + offset
         await state.refresh_all_limits()
-    assert sorted(calls) == ["a", "b"]
-
-    # A manual read resets that account's clock; the other keeps its own.
-    clock[0] = start + 1800
+    assert sorted(calls) == ["a", "a", "a", "b", "b", "b"]
+    # A manual read does not exempt an account from the next poll.
     await state.accounts.fetch_limits("a")
     calls.clear()
-    clock[0] = start + 3601
+    clock[0] = start + 180
     await state.refresh_all_limits()
-    assert calls == ["b"]
-    clock[0] = start + 5401
-    await state.refresh_all_limits()
-    assert calls == ["b", "a"]
+    assert sorted(calls) == ["a", "b"]
 
 
-async def test_a_failed_background_read_waits_the_hour_too(state, clock, reads):
+async def test_each_pass_asks_auth_me_before_the_windows(state, clock, reads):
+    calls, _ = reads
+    add_account(state, "work")
+    order = []
+    state.accounts.ping_identity = AsyncMock(side_effect=lambda *a, **k: order.append("me"))
+    await state.refresh_all_limits()
+    assert order == ["me"] and calls == ["work"]
+
+
+async def test_a_failed_read_is_retried_at_the_next_pass(state, clock, reads):
     calls, failing = reads
     add_account(state, "flaky")
     failing.add("flaky")
-    start = clock[0]
-
     await state.refresh_all_limits()
-    clock[0] = start + 300
-    await state.refresh_all_limits()
-    assert calls == ["flaky"]
-    clock[0] = start + 3601
+    clock[0] += 60
     await state.refresh_all_limits()
     assert calls == ["flaky", "flaky"]
 
 
-async def test_a_new_login_is_read_at_the_next_sweep(state, clock, reads):
-    calls, failing = reads
-    add_account(state, "work")
-    failing.add("work")
-    await state.refresh_all_limits()
-    failing.clear()
-    # Fresh credentials: the previous login's attempt clock does not carry over.
-    add_account(state, "work")
-    state.reset_account_runtime("work")
-    clock[0] += 60
-    await state.refresh_all_limits()
-    assert calls == ["work", "work"]
+async def test_accounts_poll_at_their_own_second_of_the_minute(state):
+    phases = {alias: state._poll_phase(alias) for alias in ("a", "b", "c", "d")}
+    assert all(0 <= phase < 60 for phase in phases.values())
+    assert len(set(phases.values())) > 1
+    assert state._poll_phase("a") == phases["a"]
 
 
 def test_a_ban_recovery_probe_waits_an_hour(state, clock):
@@ -162,29 +158,6 @@ def test_a_ban_recovery_probe_waits_an_hour(state, clock):
     assert not state._park_probe_due("work")
     clock[0] = start + 3601
     assert state._park_probe_due("work")
-
-
-async def test_an_account_in_use_is_left_to_its_429s(state, clock, reads):
-    """The hourly read is for stale data on an idle account; one in use is
-    never read in the background."""
-    calls, _ = reads
-    add_account(state, "busy")
-    start = clock[0]
-    await state.refresh_all_limits()
-
-    async def upstream(alias):
-        return "ok"
-
-    for offset in (1800, 3000):
-        clock[0] = start + offset
-        await state.with_account_failover("", "", {"model": OPUS}, upstream)
-    for offset in (3600, 6599):
-        clock[0] = start + offset
-        await state.refresh_all_limits()
-    assert calls == ["busy"]
-    clock[0] = start + 6601  # an hour idle since its last call
-    await state.refresh_all_limits()
-    assert calls == ["busy", "busy"]
 
 
 async def test_a_429_has_the_refused_account_read_at_once(state, clock, monkeypatch):
@@ -214,9 +187,9 @@ async def test_a_429_has_the_refused_account_read_at_once(state, clock, monkeypa
     assert result == "served" and account != refused
     assert kicks, "the sweep was not woken"
     # A second refusal before the read collapses into the same read, and the
-    # healthy account, in use, is not read at all.
+    # kicked pass reads only the account the refusal named.
     state.refresh_limits_after_refusal(refused)
-    await state.refresh_all_limits()
+    await state.refresh_all_limits(forced_only=True)
     assert read == [refused]
     # A read this recent already answers the next refusal.
     kicks.clear()

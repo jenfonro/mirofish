@@ -158,7 +158,7 @@ async def test_near_expiry_ticket_is_kept_during_transient_refresh_failure(
     add_account(state, "work")
     key = state.upstream._ticket_key("work", None)
     state.upstream._ticket_cache[key] = _DeviceTicket(
-        "still-valid", time.monotonic() + 90.0)
+        "still-valid", time.monotonic() + 30.0)
     calls = 0
 
     async def unavailable(_alias, _access, _proxy_url=None):

@@ -80,24 +80,20 @@ URGENCY_HORIZON_HOURS = 48.0
 # Account ordering in both modes reads the cached /v1/limits windows (the
 # fable window has no response header to keep it fresh), so they are refreshed
 # in the background rather than on the request path: probing there would put
-# an upstream round-trip in front of every new conversation. The probe costs
-# no model tokens, and stale numbers only ever cost one extra attempt, since
-# the upstream 429 plus failover is what actually stops a request.
-# The sweep wakes every LIMITS_REFRESH_SECONDS, but re-reads an account only
-# once it is idle and its data stale: its last read, last attempt (failed or
-# not) and last model call are all LIMITS_CACHE_SECONDS old. So an idle account
-# costs one read an hour, a manual refresh resets its clock, and an account in
-# use is never read in the background — its account-scoped 429 asks for the
-# read instead (REFUSAL_REFRESH_MIN_AGE). A window whose reset time has passed
-# stops counting as load on its own (_window_utilization), so a long cache
-# never benches a refilled one.
-LIMITS_REFRESH_SECONDS = 300.0
-LIMITS_CACHE_SECONDS = 3600.0
-# However long the cache, a spent window can go unseen until the upstream says
-# so. An account-scoped 429 therefore re-reads that account at once, so the
-# scheduler learns which window is spent, or that the account is out
-# altogether, instead of waiting out the cache. Refusals that arrive before
-# the read collapse into it, and a read or attempt this recent already answers.
+# an upstream round-trip in front of every new conversation.
+# The cadence is the running desktop's own: a signed-in 0.0.367 desktop asks
+# /auth/me and then /v1/limits every 60 seconds for as long as it is open,
+# idle or not (live capture on two installs). The sweep therefore reads every
+# enabled account once a minute, each at its own second of the minute the way
+# separate installs never share a clock; the probe costs no model tokens. A
+# window whose reset time has passed stops counting as load on its own
+# (_window_utilization).
+LIMITS_REFRESH_SECONDS = 60.0
+# A spent window can still go unseen for most of a minute. An account-scoped
+# 429 therefore re-reads that account at once, so the scheduler learns which
+# window is spent, or that the account is out altogether, before the next
+# poll. Refusals that arrive before the read collapse into it, and a read or
+# attempt this recent already answers.
 REFUSAL_REFRESH_MIN_AGE = 60.0
 # Subscription profiles (plan tier, expiry, holder name) change on the scale
 # of billing periods, so the sweep only re-reads /auth/me + /auth/referral for
@@ -143,15 +139,13 @@ class AppState:
         # separately so neither a restart nor a lagging limits read lifts them.
         self._exhausted_until: dict[str, float] = {}
         # Last background limits attempt per account (success or failure), so
-        # a failing read waits out the cache interval instead of every sweep.
+        # a refusal right after a read does not ask for another.
         self._limits_attempted: dict[str, float] = {}
-        # Last model call handed to each account: an account in use is left to
-        # its 429s rather than read in the background.
-        self._last_called: dict[str, float] = {}
         # Accounts an upstream 429 asked the next sweep to re-read at once.
         self._limits_forced: set[str] = set()
         self._limits_task: Optional[asyncio.Task[None]] = None
         self._limits_wake: Optional[asyncio.Event] = None
+        self._sweeps: set[asyncio.Task[None]] = set()
         self.behavior = BehaviorReplayer(self)
 
     async def aclose(self) -> None:
@@ -162,22 +156,33 @@ class AppState:
 
     # --- background limits refresh -------------------------------------------
 
-    async def refresh_all_limits(self) -> None:
-        """Re-read the usage windows of every selectable account that is idle
-        with a stale cache (_limits_due), or that a 429 just asked to be read,
-        one failure at a time.
+    async def refresh_all_limits(self, forced_only: bool = False,
+                                 stagger: bool = False) -> None:
+        """The desktop's minute poll for every enabled account: /auth/me, then
+        the usage windows, one failure at a time; the daily profile read rides
+        along when the stored profile is stale.
 
         Scheduling only reads these numbers, so an account that cannot be
         probed keeps its previous values instead of dropping out of the
-        ordering. An account read within the interval — by a manual refresh,
-        or by its own last attempt — or called within it is left alone.
-        Accounts switched off in the panel are skipped: they never take part
-        in automatic selection, so keeping their windows warm would contact
-        the upstream for nothing. Parked accounts get no limits/profile
-        refresh either — only the low-frequency recovery probe below.
+        ordering. Accounts switched off in the panel are skipped: an app that
+        is not running polls nothing. Parked accounts get no poll either —
+        only the low-frequency recovery probe below. ``forced_only`` reads
+        just the accounts a 429 asked for; ``stagger`` gives each account its
+        own second of the minute (the timer passes it, callers wanting the
+        numbers now do not).
         """
-        async def one(alias: str) -> None:
+        async def one(alias: str, delay: float) -> None:
+            if delay:
+                await asyncio.sleep(delay)
             self._limits_attempted[alias] = time.time()
+            try:
+                await self.with_proxy(
+                    alias, lambda url: self.accounts.ping_identity(alias, proxy_url=url))
+            except RelayError as exc:
+                self.maybe_park_account(alias, exc)
+                logger.debug("identity poll failed: account=%s %s", alias, exc)
+            except Exception as exc:  # noqa: BLE001 - one account must not stop the sweep
+                logger.debug("identity poll failed: account=%s %s", alias, exc)
             try:
                 await self.with_proxy(
                     alias, lambda url: self.accounts.fetch_limits(alias, proxy_url=url))
@@ -198,27 +203,22 @@ class AppState:
                 continue
             if self.account_parked(alias):
                 parked.append(alias)
-            elif alias in forced or self._limits_due(alias):
-                serviceable.append(alias)
-        probes = [self._probe_parked(alias) for alias in parked
-                  if self._park_probe_due(alias)]
+            elif alias in forced:
+                serviceable.append((alias, 0.0))
+            elif not forced_only:
+                serviceable.append((alias, self._poll_phase(alias) if stagger else 0.0))
+        probes = [] if forced_only else [
+            self._probe_parked(alias) for alias in parked if self._park_probe_due(alias)]
         if serviceable or probes:
             await asyncio.gather(
-                *(one(alias) for alias in serviceable), *probes)
+                *(one(alias, delay) for alias, delay in serviceable), *probes)
 
-    def _limits_due(self, alias: str) -> bool:
-        """True when an account is idle and its windows stale: never read, or
-        its last read, last attempt and last model call are all
-        LIMITS_CACHE_SECONDS ago."""
-        try:
-            metadata = json.loads(self.store.row(alias)["metadata_json"])
-        except Exception:  # noqa: BLE001 - racing a concurrent account removal
-            return False
-        last = max((epoch for epoch in (
-            self._metadata_epoch(metadata, "limits_checked_at"),
-            self._limits_attempted.get(alias),
-            self._last_called.get(alias)) if epoch is not None), default=None)
-        return last is None or time.time() - last >= LIMITS_CACHE_SECONDS
+    @staticmethod
+    def _poll_phase(alias: str) -> float:
+        """The second of the minute this account polls at: fixed per account,
+        as each install's timer has its own start."""
+        digest = hashlib.sha256(alias.encode("utf-8")).digest()
+        return int.from_bytes(digest[:2], "big") % int(LIMITS_REFRESH_SECONDS)
 
     def refresh_limits_after_refusal(self, alias: str) -> None:
         """Have the sweep re-read an account the upstream just refused with an
@@ -319,28 +319,43 @@ class AppState:
         return time.time() - checked_epoch >= PROFILE_REFRESH_SECONDS
 
     def start_limits_refresh(self) -> None:
-        """Keep the cached windows warm: both schedule modes read them to keep
-        exhausted windows out of automatic selection, and the fable window has
-        no response header that could refresh it between probes."""
+        """Run the desktop's minute poll: both schedule modes read the cached
+        windows to keep exhausted ones out of automatic selection, and the
+        fable window has no response header that could refresh it between
+        polls. A kick between ticks reads only the accounts a 429 named."""
         if self._limits_task is not None:
             return
         wake = self._limits_wake = asyncio.Event()
 
+        async def sweep(**kwargs: bool) -> None:
+            try:
+                await self.refresh_all_limits(**kwargs)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001 - the loop must outlive a bad sweep
+                logger.warning("limits refresh sweep failed: %s", exc)
+
         async def loop() -> None:
+            next_tick = time.monotonic()
             while True:
-                # Clear before sweeping so a kick that lands mid-sweep still
-                # triggers a fresh pass instead of being swallowed.
-                wake.clear()
+                now = time.monotonic()
+                if now >= next_tick:
+                    # Clear before sweeping so a kick that lands mid-sweep
+                    # still triggers its read instead of being swallowed.
+                    wake.clear()
+                    # The tick keeps its schedule; accounts spread themselves
+                    # over the minute inside the sweep.
+                    next_tick = max(next_tick + LIMITS_REFRESH_SECONDS, now)
+                    task = asyncio.create_task(sweep(stagger=True))
+                    self._sweeps.add(task)
+                    task.add_done_callback(self._sweeps.discard)
+                    continue
                 try:
-                    await self.refresh_all_limits()
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:  # noqa: BLE001 - the loop must outlive a bad sweep
-                    logger.warning("limits refresh sweep failed: %s", exc)
-                try:
-                    await asyncio.wait_for(wake.wait(), LIMITS_REFRESH_SECONDS)
+                    await asyncio.wait_for(wake.wait(), next_tick - now)
                 except TimeoutError:
-                    pass
+                    continue
+                wake.clear()
+                await sweep(forced_only=True)
 
         self._limits_task = asyncio.create_task(loop())
 
@@ -353,6 +368,9 @@ class AppState:
     async def stop_limits_refresh(self) -> None:
         task, self._limits_task = self._limits_task, None
         self._limits_wake = None
+        for sweep in list(self._sweeps):
+            sweep.cancel()
+        self._sweeps.clear()
         if task is None:
             return
         task.cancel()
@@ -955,7 +973,6 @@ class AppState:
         self.model_cache.pop(alias, None)
         self._exhausted_until.pop(alias, None)
         self._limits_attempted.pop(alias, None)
-        self._last_called.pop(alias, None)
         self._limits_forced.discard(alias)
 
     def remove_account(self, alias: str) -> None:
@@ -1020,7 +1037,6 @@ class AppState:
                 raise last if last is not None else RelayError(
                     "account selection returned an already-failed account", 500)
             generation = self.store.account_generation(account)
-            self._last_called[account] = time.time()
             try:
                 return account, await run(account)
             except RelayError as exc:

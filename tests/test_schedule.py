@@ -384,16 +384,13 @@ async def test_the_sweep_refreshes_missing_or_dated_profiles(state, monkeypatch)
 
     monkeypatch.setattr(state, "with_proxy", fake_with_proxy)
     await state.refresh_all_limits()
-    assert calls.count("fresh") == 1  # limits probe only
-    assert calls.count("stale") == 2  # limits probe + profile refresh
+    assert calls.count("fresh") == 2  # identity ping + limits probe
+    assert calls.count("stale") == 3  # identity ping + limits probe + profile refresh
 
     calls.clear()
     state.store.merge_metadata("fresh", {"checked_at": "2020-01-01T00:00:00+00:00"})
-    # The next background read of "fresh" is an hour after its last attempt.
-    later = time.time() + 3601
-    monkeypatch.setattr("mirofish.api.state.time.time", lambda: later)
     await state.refresh_all_limits()
-    assert calls.count("fresh") == 2  # a dated profile is re-read too
+    assert calls.count("fresh") == 3  # a dated profile is re-read too
 
 
 async def test_the_sweep_runs_in_every_mode(state, monkeypatch):
@@ -402,7 +399,7 @@ async def test_the_sweep_runs_in_every_mode(state, monkeypatch):
     the sweep can no longer wait for reset-first to be switched on."""
     sweeps = []
 
-    async def fake_refresh():
+    async def fake_refresh(**kwargs):
         sweeps.append(time.time())
 
     monkeypatch.setattr(state, "refresh_all_limits", fake_refresh)

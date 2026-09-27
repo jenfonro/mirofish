@@ -196,7 +196,9 @@ h11 默认的 Host 前置写法（`mirofish/wire.py`），loopback 测试逐字�
 `tools/request_profile.py` 脱敏生成。桌面端的后台整机行为（gzipped `/events` 遥测、
 `/v1/model-roster` 探测、`cdn-assets` 更新检查）由 `mirofish/behavior.py` 按账号重放：每个
 账号一条带抖动的循环任务，面板关闭或进入共享额度冷却时暂停；`MIROFISH_BEHAVIOR_REPLAY=0`
-可关闭。
+可关闭。桌面端开着时每 60 秒的 `GET /auth/me` + 签名 `GET /v1/limits` 轮询（0.0.367 真机确认，
+空闲也一样）由后台额度刷新承担：每个启用且未封停的账号每分钟各在自己固定的那一秒轮询一次，
+429 会让被拒账号在下一次 tick 前立即多读一次。
 
 0.0.303 客户端的设备身份按**每账号**隔离：每个 alias 有自己的 Ed25519 密钥（首次使用时惰性
 创建，写入 vault，可通过 `POST /api/accounts/<alias>/reset-device` 轮换）。机器层面的字段

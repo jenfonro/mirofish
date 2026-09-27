@@ -16,7 +16,7 @@ import respx
 
 from mirofish.config import DEFAULT_CODEX_USER_AGENT
 from mirofish.upstream import (CLAUDE_AGENT_SYSTEM_MARKER, LIMITS_PATH,
-                               forwarded_codex_headers)
+                               codex_identity_map, forwarded_codex_headers)
 from tests.conftest import AUTH_BASE, RELAY_BASE, add_account
 from tests.mirasim_protocol import client_user_id, relay_metadata, verify_signature
 from tests.test_request_profile import _body as captured_messages_body
@@ -658,7 +658,14 @@ async def test_codex_relay_request_matches_the_official_capture(state):
     assert "__cf_bm" not in cookie  # scoped to chatgpt.com, not this host
     assert "caller-jar" not in cookie
     assert "codex-caller-secret" not in second.headers.values()
-    assert second.content == body
+    # Byte-identical but for the caller's own ids, which are this account's
+    # on the wire (tests/test_codex_identity.py).
+    identity = codex_identity_map(
+        codex_caller_headers(), body, alias, state.upstream._signer(alias).device_id)
+    expected = body.decode()
+    for original, replacement in identity.items():
+        expected = expected.replace(original, replacement)
+    assert identity and second.content == expected.encode()
     _verify_signature(state, second, "/v1/responses", alias=alias)
 
 

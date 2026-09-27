@@ -142,3 +142,20 @@ async def test_codex_relay_carries_the_turn(client, state, auth_headers):
     assert uuid.UUID(sealed["x-mirasim-turn"]).version == 4
     names = [name for name in sealed if name != "x-mirasim-client"]
     assert names.index("x-mirasim-turn") + 1 == names.index("x-mirasim-call")
+
+
+def test_claude_codes_session_naming_call_shares_the_prompts_turn():
+    """Claude Code titles a new session with a side call; under the kernel it
+    runs inside the prompt's task and carries the prompt's turn id."""
+    main = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "<system-reminder>\n# Environment\n</system-reminder>"},
+        {"type": "text", "text": "Reply with the single word: pong"}]}]}
+    naming = {"system": [
+        {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.278.d43; cc_entrypoint=mirasim;"},
+        {"type": "text", "text": "You are a Claude agent, built on Anthropic's Claude Agent SDK."},
+        {"type": "text", "text": "You are naming a coding session so the user can pick it out of a long list."}],
+        "messages": [{"role": "user", "content": [{"type": "text", "text":
+            "<session>\nReply with the single word: pong\n</session>\n\nWrite the title in the "
+            "predominant language of the session."}]}]}
+    assert relay_turn_id(SESSION, naming) == relay_turn_id(SESSION, main)
+    assert relay_turn_id(SESSION, naming) != relay_turn_id(SESSION, {"messages": [_user("other")]})
